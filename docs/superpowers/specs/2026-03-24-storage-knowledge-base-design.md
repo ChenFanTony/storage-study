@@ -8,8 +8,8 @@ Create a curated, navigable knowledge base for modern storage technologies with 
 
 ## Scope
 - Linux kernel storage stack (block layer, device mapper, filesystem internals, io_uring)
-- Distributed storage (Ceph, DRBD)
-- Broader ecosystem (NVMe-oF, SPDK, filesystems like ext4/xfs/btrfs/bcachefs/zfs)
+- Distributed storage (Ceph, DRBD, DAOS)
+- Broader ecosystem (NVMe-oF, SPDK, filesystems like ext4/xfs/btrfs/bcachefs/zfs/juicefs)
 - Tooling ecosystem (fio, blktrace, bpftrace, etc.)
 
 ## Architecture & Structure
@@ -20,6 +20,7 @@ Create a curated, navigable knowledge base for modern storage technologies with 
   - `kernel-storage.md`
   - `ceph.md`
   - `drbd.md`
+  - `daos.md`
   - `nvme-of.md`
   - `spdk.md`
   - `filesystems.md`
@@ -66,6 +67,9 @@ Monthly file `docs/updates/YYYY-MM.md`:
 - ...
 
 ## DRBD
+- ...
+
+## DAOS
 - ...
 
 ## NVMe-oF
