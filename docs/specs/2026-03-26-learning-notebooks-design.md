@@ -14,7 +14,7 @@ The repository already includes:
 
 This design adds a notebooks area without changing the existing category/update structure.
 
-Planning artifacts under `docs/superpowers/` remain separate from the notebooks content.
+Planning artifacts live under `docs/specs/` and `docs/plans/`, separate from the notebooks content.
 
 ## Proposed Structure
 ```
