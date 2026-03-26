@@ -10,9 +10,11 @@ Add a lightweight learning-notebook layer to the existing storage knowledge base
 The repository already includes:
 - `docs/categories/` for curated entries
 - `docs/updates/` for monthly updates
-- `README.md` as the main index (will be added in this iteration)
+- `README.md` as the main index (will be added/updated in this iteration)
 
 This design adds a notebooks area without changing the existing category/update structure.
+
+Planning artifacts under `docs/superpowers/` remain separate from the notebooks content.
 
 ## Proposed Structure
 ```
@@ -28,23 +30,23 @@ docs/
 ```
 
 ### Notebooks Index
-`docs/notebooks/index.md` will list notebooks and their status (e.g., draft/active), grouped by domain (Kernel, Ceph, NVMe-oF, Filesystems, Tools, etc.).
+`docs/notebooks/index.md` will list notebooks and their status (draft/active/archived), grouped by domain (Kernel, Ceph, NVMe-oF, Filesystems, Tools, etc.).
 
 ### Notebook Template
 `docs/notebooks/template.md` defines a standard layout for all topics:
-- **Status** (draft/active)
+- **Status** (draft/active/archived)
 - **Last Updated** (YYYY-MM-DD)
 - **Overview** (2–4 sentences)
 - **Key Concepts**
 - **Terminology**
-- **References** (authoritative links)
+- **References** (authoritative links; at least one authoritative source)
 - **Open Questions**
 - **Deep Dive (optional, by request)** — labs, commands, benchmarks, configs, traces
 
 ### Topic Notebooks
 Each notebook lives in `docs/notebooks/topics/` and follows the template. By default, notebooks stay concise. Deep Dive sections are added only when requested.
 
-When a notebook exists, add a link to it from the most relevant category entry (and optionally link back to the category from the notebook).
+When a notebook exists, add a link to it under a **Related Notebooks** subsection in the most relevant category entry (and optionally link back to the category from the notebook).
 
 ## README Integration
 Update `README.md` to include:
