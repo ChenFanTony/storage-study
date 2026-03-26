@@ -10,7 +10,7 @@ Add a lightweight learning-notebook layer to the existing storage knowledge base
 The repository already includes:
 - `docs/categories/` for curated entries
 - `docs/updates/` for monthly updates
-- `README.md` as the main index (planned)
+- `README.md` as the main index (will be added in this iteration)
 
 This design adds a notebooks area without changing the existing category/update structure.
 
@@ -32,6 +32,8 @@ docs/
 
 ### Notebook Template
 `docs/notebooks/template.md` defines a standard layout for all topics:
+- **Status** (draft/active)
+- **Last Updated** (YYYY-MM-DD)
 - **Overview** (2–4 sentences)
 - **Key Concepts**
 - **Terminology**
@@ -41,6 +43,8 @@ docs/
 
 ### Topic Notebooks
 Each notebook lives in `docs/notebooks/topics/` and follows the template. By default, notebooks stay concise. Deep Dive sections are added only when requested.
+
+When a notebook exists, add a link to it from the most relevant category entry (and optionally link back to the category from the notebook).
 
 ## README Integration
 Update `README.md` to include:
