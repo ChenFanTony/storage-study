@@ -12,3 +12,10 @@ Bcachefs is a modern Linux filesystem designed for performance, checksumming, an
 - ...
 **Links:**
 - <link title> — <url>
+
+## Curation Guidelines
+
+- Keep abstracts short and neutral.
+- Keep key points to 3–7 bullets.
+- Include at least one authoritative link.
+- Use descriptive link titles, not bare URLs.

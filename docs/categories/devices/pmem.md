@@ -12,3 +12,10 @@ Persistent memory provides byte-addressable non-volatile media with access seman
 - ...
 **Links:**
 - <link title> — <url>
+
+## Curation Guidelines
+
+- Keep abstracts short and neutral.
+- Keep key points to 3–7 bullets.
+- Include at least one authoritative link.
+- Use descriptive link titles, not bare URLs.
