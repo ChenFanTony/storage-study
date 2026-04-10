@@ -85,29 +85,52 @@ Fill in the sizing rules you learned this week:
 ## 3. Scenario: Architecture Design Review
 
 **Customer brief:**
-- Running a Ceph cluster: 24× HDD data OSDs + 3× NVMe for journals/WAL
-- Considering adding SSD caching in front of HDDs for hot data
-- 50TB total data, ~5TB hot working set
-- Write-heavy: 60% write, 40% read
-- Cannot tolerate data loss (financial data)
-- One team member has bcache experience; nobody has dm-cache experience
+A cloud provider is building a new storage tier for their VM fleet.
+The design under discussion:
+
+- 4× storage nodes, each with: 2× NVMe (fast tier) + 8× HDD (capacity tier)
+- Each storage node exports NVMe-oF/TCP namespaces to 40 compute nodes
+- Compute nodes run VMs with mixed workloads: OLTP databases, log ingestion,
+  and nightly bulk analytics jobs
+- Each storage node will run dm-cache: NVMe cache in front of HDD pool
+- dm-thin provides thin provisioning; snapshots used for VM backups
+- RPO: 1 hour (hourly snapshots) — NOT zero
+- RTO: 30 minutes
+- Total capacity per node: 64TB HDD, 4TB NVMe
 
 **Design questions:**
 
-1. Should they use bcache or dm-cache for SSD caching?
+1. **Cache mode:** RPO is 1 hour, not zero. Does this change your cache mode
+   recommendation from writethrough to writeback? What is the exact risk you
+   are accepting, and what mitigates it given the snapshot schedule?
 
-2. What cache mode is required given the RPO constraint?
+2. **dm-thin + dm-cache interaction:** The stack is:
+   `NVMe-oF namespace → dm-cache (NVMe cache / HDD origin) → dm-thin pool → thin LVs`
+   A compute node's VM is doing heavy random writes. Walk through exactly what
+   happens at each layer for a write that misses the cache. What is the
+   write amplification factor in the worst case?
 
-3. The NVMe journals are already handling WAL — the SSD cache would be
-   additional NVMe. Total SSD budget: 4TB. How would you size:
-   - Cache device per OSD
-   - Metadata device (if dm-cache)
-   - sequential_cutoff / SMQ configuration
+3. **Snapshot strategy:** Hourly thin snapshots are taken for backup.
+   After 24 hours there are 24 snapshots per thin LV. The analytics job
+   runs a full table scan at 02:00. What happens to the dm-thin COW overhead
+   during the scan, and how does this interact with dm-cache behavior?
 
-4. Ceph does a mix of 4MB sequential writes (replication) and 4KB random
-   reads (client reads). How does this affect your tiering recommendation?
+4. **Metadata sizing:** Each storage node has 200 thin LVs (VMs) with an
+   average of 300GB provisioned each. NVMe cache is 4TB with 512KB dm-cache
+   block size. Size both the dm-thin metadata device and the dm-cache
+   metadata device. What RAID level for each?
 
-5. What monitoring would you put in place for the tiering layer?
+5. **Failure scenario:** At 03:15, one NVMe device on a storage node fails.
+   - dm-cache is in writeback mode with 80GB dirty
+   - The failed NVMe was the cache device (not metadata)
+   - There are 24 snapshots and 200 active thin LVs
+   Walk through the complete failure impact and recovery sequence.
+   What is the actual RTO? Does it meet the 30-minute target?
+
+6. **Workload isolation:** The analytics job at 02:00 runs on the same storage
+   node as OLTP VMs. Without any isolation, the scan will thrash the NVMe
+   cache. Name three distinct mechanisms you would use to protect OLTP
+   latency during the analytics window, at different layers of the stack.
 
 **Reference answers at end of document.**
 
@@ -211,37 +234,100 @@ If not, Week 3 will answer these.
 
 ---
 
-## Reference Answers: Ceph Scenario
+## Reference Answers: Disaggregated NVMe-oF Storage Node
 
-**1. bcache or dm-cache?**
-dm-cache. Reasons: (a) Ceph is already LVM-managed — dm-cache integrates
-natively via lvmcache; (b) The team's bcache experience is a soft benefit
-offset by dm-cache's better operational tooling (lvmcache, lvs monitoring);
-(c) dm-cache's SMQ handles Ceph's mixed 4MB sequential + 4KB random better
-than bcache's manual sequential_cutoff tuning; (d) dm-cache supports separate
-metadata devices for protection.
+**1. Cache mode with RPO=1 hour:**
+Writeback is defensible here — but with explicit risk acceptance. The risk:
+if the NVMe cache fails between hourly snapshots, dirty data written since
+the last snapshot is lost. That's up to 1 hour of writes per VM. Mitigations:
+(a) RAID-1 the NVMe cache device — eliminates single-device failure risk;
+(b) Keep `dirty_data` monitored and ensure bcache/dm-cache writeback rate
+drains aggressively so dirty window is always small (target <5 minutes of
+dirty data, not 1 hour); (c) Document the risk explicitly in the design.
+With RAID-1 NVMe + aggressive writeback rate, writeback mode is reasonable.
+Without NVMe redundancy, writethrough is safer.
 
-**2. Cache mode for RPO=0?**
-Writethrough only. Writeback cannot guarantee RPO=0 — if the SSD fails while
-dirty data hasn't been written back to HDD, that data is lost. Writethrough
-ensures HDD always has the committed write before returning success.
+**2. Write path through the stack (cache miss):**
+```
+VM write → NVMe-oF TCP → storage node network stack
+  → dm-cache: cache miss
+    → dm-thin: virtual block → physical block lookup (B-tree)
+      → if new block: allocate from HDD pool (update B-tree)
+      → write to HDD (origin device) — slow
+    → dm-cache: promote block to NVMe (async migration)
+      → read from HDD → write to NVMe
+      → update cache map metadata
 
-**3. Sizing:**
-- Total SSD: 4TB across 24 HDDs = ~170GB per OSD cache (use 128GB, reserve some)
-- Cache block size: 512KB–1MB (matches Ceph's typical 4MB object size / 4MB replication writes being divisible by cache block)
-- Metadata: 128GB cache at 512KB blocks = ~256K blocks × 48 bytes = ~12MB metadata per OSD. Use 1GB per OSD metadata device (headroom + RAID-1)
-- sequential_cutoff: set to 4MB (matches Ceph's replication write size — sequential writes above 4MB bypass cache, protecting hot random-read data)
+Worst-case write amplification:
+  1× write to HDD (origin)
+  + 1× read from HDD for promotion
+  + 1× write to NVMe for promotion
+  + metadata updates (dm-thin B-tree COW + dm-cache metadata)
+  = WA of ~3× on HDD, 2× on NVMe for a promoted miss
+```
+In steady state (warm cache), cache hits eliminate HDD writes entirely.
+The WA is worst during cache warmup or after a cache flush.
 
-**4. Mixed 4MB sequential + 4KB random:**
-This is the archetypal bcache/dm-cache challenge. 4MB sequential writes (replication)
-will thrash the cache if not filtered. With dm-cache SMQ: SMQ's probabilistic
-promotion will naturally reduce promotion rate for the sequential writes.
-With bcache: set sequential_cutoff=4MB. Either way, the 4KB random reads are
-the hot tier you want in cache — verify hit rate is high for those specifically.
+**3. Analytics scan + snapshots + dm-thin COW:**
+24 snapshots × 200 LVs = 4,800 snapshot entries per thin pool. The analytics
+scan at 02:00 triggers massive COW: every block the scan touches that is shared
+with any of the 24 snapshots must be copied before being read (if it was
+written after the snapshot). In practice, analytics reads don't trigger COW
+(COW is for writes to shared blocks) — BUT if the analytics job writes results
+back to the same LV, every written block triggers COW × (number of snapshots
+sharing that block). Meanwhile, dm-cache SMQ sees the sequential scan as
+low-promotion-value traffic and reduces promotion. However, the HDD I/O from
+COW + sequential scan competes for HDD bandwidth. Mitigation: schedule snapshot
+rotation — keep only 6 snapshots (not 24) per LV to reduce COW overhead.
 
-**5. Monitoring:**
-- dm-cache dirty block count (alert if >10% of cache is dirty in writethrough — means something is wrong)
-- dm-cache hit rate (alert if drops >10% from baseline in 5-minute window)
-- dm-thin metadata usage (alert at 80% — if it fills, all thin LVs get errors)
-- SSD endurance: nvme smart-log wear indicator (alert at <20% remaining)
-- bpftrace GC frequency if using bcache (alert if GC runs >10×/minute under load)
+**4. Metadata sizing:**
+dm-thin metadata:
+- 200 VMs × 300GB / 512KB block size = 200 × ~600K blocks = 120M block mappings
+- 120M × 48 bytes = ~5.7GB minimum
+- With 24 snapshots: multiply by ~3 for snapshot overhead = ~17GB
+- Use 32GB dm-thin metadata device, RAID-1 (two small NVMe partitions)
+
+dm-cache metadata:
+- 4TB NVMe / 512KB cache block = ~8M cache blocks
+- 8M × 64 bytes (dm-cache metadata per block) = ~512MB
+- Use 2GB dm-cache metadata device (headroom), RAID-1
+
+Both metadata devices: RAID-1 mandatory. Metadata loss = all LVs inaccessible.
+
+**5. NVMe cache device failure recovery:**
+```
+Timeline:
+  03:15 — NVMe (cache device) fails
+  03:15 — dm-cache enters error mode; 80GB dirty data LOST
+  03:15 — dmsetup remove --force cached_device
+  03:16 — HDD origin devices accessible directly (200 thin LVs still on HDD)
+  03:16 — dm-thin pool still intact (metadata on separate RAID-1 NVMe)
+  03:17 — Mount thin LVs directly from HDD — I/O works but slow (no cache)
+  03:18 — VMs resume but with HDD-only performance (~150 IOPS vs 50K IOPS)
+  03:20 — Alert: restore from last hourly snapshot or accept dirty data loss
+  03:20–03:50 — Replace NVMe, rebuild RAID-1, reconfigure dm-cache
+  03:50 — dm-cache warm-up begins (cold cache on new NVMe)
+
+RTO assessment:
+  LVs accessible: ~3 minutes ✓
+  Full performance restored: 35+ minutes (device replace + RAID rebuild) ✗
+  Meets 30-minute RTO for accessibility, but NOT for performance recovery.
+  
+Recommendation: pre-stage a spare NVMe per node to cut replace time to <10min.
+```
+
+**6. Three isolation mechanisms for analytics vs OLTP:**
+1. **cgroup v2 `io.max`** on the analytics VM's cgroup: hard bandwidth cap on
+   HDD I/O (e.g., 200MB/s max). Prevents scan from saturating HDD, protecting
+   OLTP cache-miss latency. Works regardless of scheduler.
+
+2. **dm-cache SMQ + `migration_throttle`**: reduce `migration_throttle` during
+   the analytics window (e.g., `echo 64 > /sys/module/dm_cache/parameters/migration_throttle`).
+   Limits how aggressively the analytics scan promotes blocks into NVMe cache,
+   protecting OLTP working set from eviction.
+
+3. **NVMe-oF QoS / separate namespace**: if the storage node supports NVMe
+   namespace-level QoS (via `nvme set-feature` with I/O determinism), assign
+   analytics VMs to a separate namespace with lower I/O priority. Alternatively,
+   place analytics VMs on a dedicated dm-cache device (separate NVMe partition)
+   so their cache thrashing doesn't affect the OLTP cache pool at all.
