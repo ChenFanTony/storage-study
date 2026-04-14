@@ -92,6 +92,12 @@ worth noting before the deep dives:
 | blk-crypto | Inline hardware encryption at block layer | 5.8+ |
 | NVMe-oF | TCP transport added (no RDMA HW needed) | 5.0 |
 
+read/mmap: a_ops->read_folio: read_folio replace read_pages in older kernels, which is the glue
+between block layer and filesystem, when page cache miss, VFS triggers address_ops->read_folio to build
+a contiguous set of bytes(folio that represent the aligned pages which point to the head). and build bio
+submit to block layer. When a filesystem reads a large block, it can now use a large folio (e.g., 64KB)
+and avoid fragmented 4KB page chains. Reduces TLB pressure and page cache overhead for large I/Os.
+
 ---
 
 ## 3. Hands-On Audit (30 min)
@@ -134,14 +140,14 @@ Answer these quickly. Any "unsure" → add to your study notes for the relevant 
 
 | Question | Answer / Unsure |
 |----------|----------------|
-| What is a `struct folio` and why replace `struct page`? | |
-| Where exactly in blk-mq does a bio get a tag assigned? | |
-| What is the difference between `io.max` and `io.latency` in cgroup v2? | |
-| bcache operates as a block device — what does its `make_request_fn` do? | |
-| What NVMe queue model does virtio-blk approximate? | |
-| What does DAX mean for a filesystem — what does it bypass? | |
-| io_uring fixed buffers — what kernel cost do they eliminate? | |
-| What is ANA in NVMe-oF multipathing? | |
+| What is a `struct folio` and why replace `struct page`? | folio is lager page, good for fragile in page |
+| Where exactly in blk-mq does a bio get a tag assigned? | when a request is allocated from the hardware queue's tag set |
+| What is the difference between `io.max` and `io.latency` in cgroup v2? | io.max limits a cgroup's own I/O rate. io.latency protects a cgroup from other cgroups' interference |
+| bcache operates as a block device — what does its `make_request_fn` do? | lookup btree first, append data in bucket, insert meta to btree |
+| What NVMe queue model does virtio-blk approximate? | mq |
+| What does DAX mean for a filesystem — what does it bypass? | pagecache, block layer, filesystem's own data buffer, not bypass metadata(lookup) |
+| io_uring fixed buffers — what kernel cost do they eliminate? | eliminates: get_user_pages() on every I/O, which is overhead measurable. fixed buffer happen once at registration time |
+| What is ANA in NVMe-oF multipathing? | ANA(Asymmetric Namespace Access) is for HA multipath, host via the LOG page get ANA status, if target support ANA, host can get the optimize path to access the I/O |
 
 ---
 
