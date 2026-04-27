@@ -40,7 +40,7 @@ blk_finish_plug() → blk_flush_plug(plug, false)
 
 **Why this helps:**
 - Consecutive 4K writes to adjacent sectors → merged into single 64K request
-- One HW queue doorbell instead of N separate doorbells
+- One HW queue doorbell instead of N separate doorbells ( a MMIO write request to notify NVME/ssd)
 - Scheduler sees a batch → can sort more effectively
 
 **Why this can hurt:**

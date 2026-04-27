@@ -201,7 +201,7 @@ This is NOT the same as `nr_requests` in sysfs (that's the scheduler queue limit
 cat /sys/block/nvme0n1/queue/nr_requests
 
 # actual tag set depth is visible indirectly via:
-cat /sys/block/nvme0n1/queue/nr_hw_queues
+cat /sys/block/nvme0n1/mq/*/nr_tags  (* is the hardware ctx mapping to CPU)
 
 # io depth in flight at any moment:
 cat /sys/block/nvme0n1/inflight
