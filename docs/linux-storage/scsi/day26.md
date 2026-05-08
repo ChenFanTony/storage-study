@@ -1,134 +1,209 @@
-# Day 26 — NVMe-oF target fabric
+# Day 26 — NVMe-oF target fabric comparison
 
-**Week 4**: Deep Cuts — TMF, ALUA, configfs, NVMe-oF, Sense Data
-**Time**: 1–2 hours
-**Reference**: `drivers/nvme/target/core.c`, `drivers/nvme/target/io-cmd-bdev.c`, `drivers/nvme/target/fabrics-cmd.c`
+**Week 4**: Advanced Topics  
+**Time**: 1–2 hours  
+**Reference**: `drivers/nvme/target/`, `drivers/nvme/host/`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-NVMe-oF (NVMe over Fabrics) is the modern alternative to iSCSI for block storage. On the target
-side, Linux implements it in `drivers/nvme/target/`. Unlike iSCSI/LIO which uses `target_core_mod`
-as the common fabric abstraction, NVMe-oF target has its own command path — though it shares some
-concepts. Reading nvmet code reveals what LIO's abstraction costs and what a more direct path looks
-like. It also shows where NVMe-oF PR (TP4049 / NVMe 1.4) diverges from SCSI PR.
+NVMe over Fabrics (NVMe-oF) is the modern alternative to iSCSI. It carries NVMe commands over
+TCP, RDMA, or FC instead of SAS/PCIe. The kernel target lives at `drivers/nvme/target/` and is
+much smaller than LIO (no SCSI mid layer, simpler command set, no fabric-agnostic backend
+abstraction). For fencing it has a different philosophy: NVMe Reservations (NVMe spec §8.20)
+mirror SCSI PR but with subtle differences. Understanding the comparison is useful when designing
+storage that may run either fabric or both side-by-side.
 
 ---
 
 ## Architecture comparison
 
 ```
-iSCSI target stack:                    NVMe-oF target stack:
-─────────────────────────────          ─────────────────────────────
-TCP socket                             RDMA / TCP / FC transport
-    │                                       │
-iscsi_target_mod (fabric)              nvmet_tcp / nvmet_rdma (fabric)
-    │ se_cmd                                │ nvmet_req
-target_core_mod                        nvmet core (core.c)
-    │ se_device                             │ nvmet_ns
-target_core_iblock.c                   nvmet_bdev_execute_rw()
-    │                                       │
-blkdev (block layer)                   blkdev (block layer)
+LIO (iSCSI target)                         NVMe-oF target (nvmet)
+─────────────────                         ──────────────────────
+                       fabric layer
+iscsi_target.c                              nvmet_tcp.c / nvmet_rdma.c / nvmet_fc.c
+target_core_fabric_ops table                nvmet_fabric_ops
+
+                      target core
+target_core_transport.c                     nvmet_core.c
+se_cmd, se_session, se_lun                  nvmet_req, nvmet_ctrl, nvmet_ns
+
+                    backend abstraction
+target_backend_ops                          (none — direct to backend)
+iblock, fileio, ramdisk, pscsi              file_ns, bdev_ns
+
+                       command set
+SCSI (SBC, SPC, SPC-3 PR, ALUA)             NVMe (NVM Command Set, Reservations, ANA)
 ```
 
-The key difference: NVMe-oF target does NOT use `target_core_mod`. There is no `se_cmd`,
-no `target_submission_wq`, no fabric ops table. NVMe-oF has its own simpler dispatch path.
+Notable differences:
+
+- **No fabric-agnostic core**: `nvmet` has direct paths from each fabric module to the backend.
+  nvme-tcp talks to bdev_ns directly; there's no equivalent of LIO's
+  fabric → core → backend split.
+- **No SCSI mid layer involvement**: NVMe commands skip blk-mq's SCSI plumbing entirely. The
+  initiator side (nvme-host) maps NVMe commands directly to blk-mq requests.
+- **Simpler command structure**: every NVMe command is a 64-byte SQE (Submission Queue Entry).
+  No CDB lengths, no AHS, no immediate-data quirks.
 
 ---
 
-## struct nvmet_req — `drivers/nvme/target/nvmet.h`
-
-The NVMe-oF equivalent of `se_cmd`:
+## struct nvmet_req — equivalent to se_cmd
 
 ```c
+/* drivers/nvme/target/nvmet.h */
 struct nvmet_req {
-    struct nvme_command     *cmd;          /* NVMe command (64-byte capsule) */
-    struct nvme_completion  *cqe;          /* completion queue entry */
-    struct nvmet_sq         *sq;           /* submission queue */
-    struct nvmet_cq         *cq;           /* completion queue */
-    struct nvmet_ns         *ns;           /* namespace (= block device) */
+    struct nvme_command         *cmd;          /* the 64-byte SQE */
+    struct nvme_completion      *cqe;          /* the 16-byte CQE */
+    struct bio_vec              *sg;           /* data SGL */
+    unsigned int                sg_cnt;
+    size_t                      transfer_len;
 
-    /* data transfer */
-    struct scatterlist      *sg;           /* scatter-gather list */
-    int                     sg_cnt;        /* SGL entries */
-    size_t                  transfer_len;  /* bytes to transfer */
-    size_t                  data_len;      /* actual data length */
+    struct nvmet_port           *port;
+    void                        (*execute)(struct nvmet_req *req);
+    const struct nvmet_fabrics_ops *ops;
 
-    /* inline SGL for small transfers */
-    struct scatterlist      inline_sg[NVMET_MAX_INLINE_SGS];
+    struct nvmet_ns             *ns;           /* target namespace */
+    struct nvmet_ctrl           *ctrl;         /* target controller */
 
-    /* metadata (T10-DIF equivalent) */
-    struct scatterlist      *metadata_sg;
-    int                     metadata_sg_cnt;
-
-    /* execute function — set during parse */
-    void (*execute)(struct nvmet_req *req);
-
-    /* completion */
-    u16                     error_loc;     /* where in the command the error is */
-    u32                     error_slba;    /* starting LBA for range errors */
-
-    /* DMA mapping */
-    struct device           *p2p_client;
-    struct list_head        p2p_entry;
+    /*
+     * Error handling — points to the byte/bit offset in the command
+     * where the parser found a problem. Reported in CQE error_loc field.
+     */
+    u16                         error_loc;
 };
 ```
 
-`nvmet_req->execute` is set by `nvmet_parse_io_cmd()` to the appropriate handler:
-- `nvmet_bdev_execute_rw` for READ/WRITE on block namespaces
-- `nvmet_bdev_execute_flush` for FLUSH
-- `nvmet_bdev_execute_discard` for Dataset Management (TRIM/DISCARD)
-- `nvmet_execute_identify` for IDENTIFY controller/namespace
+`nvmet_req` is much smaller than LIO's `se_cmd` because there's less to track — no fabric-private
+state pointer, no per-command kref (kref is on the controller / queue), no abort-completion
+infrastructure (NVMe's abort is per-queue, not per-command).
 
 ---
 
-## nvmet_req_init — `drivers/nvme/target/core.c`
+## struct nvmet_ctrl — equivalent to se_session
 
 ```c
-bool nvmet_req_init(struct nvmet_req *req, struct nvmet_cq *cq,
-                    struct nvmet_sq *sq,
-                    const struct nvmet_fabrics_ops *ops)
-{
-    struct nvme_command *cmd = req->cmd;
-    u8 flags = cmd->common.flags;
-    u16 status;
-
-    req->sq  = sq;
-    req->cq  = cq;
-    req->ns  = NULL;
-    req->sg  = NULL;
-    req->sg_cnt = 0;
-    req->transfer_len = 0;
-    req->ops = ops;
-
-    /* initialise completion entry */
-    req->cqe->status         = 0;
-    req->cqe->sq_head        = 0;
-    req->cqe->sq_id          = sq->qid;
-    req->cqe->command_id     = cmd->common.command_id;
-    req->cqe->result.u64     = 0;
+struct nvmet_ctrl {
+    struct nvmet_subsys         *subsys;
+    struct nvmet_sq             **sqs;        /* submission queues — array */
 
     /*
-     * Lookup the namespace from the NSID in the command.
-     * NVMe uses NSID (Namespace ID) instead of SCSI LUN.
-     * Namespace = block device exposed by the controller.
+     * Controller identifier — assigned by target during connect.
      */
-    if (likely(nvme_is_write(cmd) || cmd->common.opcode == nvme_cmd_read)) {
-        req->ns = nvmet_find_namespace(sq->ctrl, cmd->rw.nsid);
-        if (unlikely(!req->ns)) {
-            status = NVME_SC_INVALID_NS | NVME_SC_DNR;
-            goto fail;
-        }
-        nvmet_check_ana_state(req);  /* ALUA equivalent for NVMe */
+    u16                         cntlid;
+
+    /*
+     * Host identifier — sent by host during connect, identifies a
+     * physical host (analogous to iSCSI initiator IQN).
+     */
+    uuid_t                      hostid;
+
+    /*
+     * Keep-alive — host sends Keep Alive command periodically.
+     * If kato (Keep Alive Timeout) elapses without one, target tears
+     * down the controller.
+     */
+    u32                         kato;
+    struct delayed_work         ka_work;
+
+    /*
+     * I/O queues this controller has set up (via Create I/O Submission
+     * Queue NVMe admin command).
+     */
+    u16                         max_qid;
+
+    /*
+     * Per-namespace state — for reservations and ANA.
+     */
+    struct list_head            reg_list;     /* reservation registrations */
+
+    struct work_struct          fatal_err_work;
+    struct work_struct          async_event_work;
+};
+```
+
+`cntlid` (controller ID) is the per-controller identifier; `hostid` identifies the host. One
+host may have multiple controllers (one per NVMe-oF connection), but the host ID is shared
+across them — used for reservation registration.
+
+---
+
+## NVMe vs iSCSI command flow
+
+```
+iSCSI Command PDU (48 BHS + data segment)         NVMe Submission Queue Entry (64 bytes)
+─────────────────────────────────────             ───────────────────────────────────────
+  opcode (1 byte)                                   opc (1 byte)
+  flags (RWFAttr)                                   flags (Fused, PSDT)
+  TotalAHSLength + DataSegmentLength                cid (command ID, 16 bits)
+  LUN (8 bytes)                                     nsid (namespace ID, 4 bytes)
+  ITT                                               metadata pointer
+  CmdSN, ExpStatSN                                  data pointer (PRP or SGL)
+  Data length                                       command-specific dwords (cdw10..cdw15)
+  CDB (16 bytes)                                    
+  [optional AHS for >16-byte CDB]                   
+
+  Response PDU: SCSI status + sense                 Completion Queue Entry (16 bytes):
+                                                      command-specific dwords (2)
+                                                      sq_head (flow control)
+                                                      sq_id, cid (correlation)
+                                                      status (16 bits — DNR + Phase + Status)
+```
+
+NVMe is denser. No separate CmdSN/ExpStatSN window — flow control is the SQ doorbell + CQE
+sq_head field. No AHS — large commands use SGL chains directly. No status separate from
+response — the CQE status is the only place errors live.
+
+---
+
+## The basic submit path
+
+```c
+/* Simplified — see drivers/nvme/target/core.c. */
+bool nvmet_req_init(struct nvmet_req *req, struct nvmet_cq *cq,
+                      struct nvmet_sq *sq, const struct nvmet_fabrics_ops *ops)
+{
+    u8 flags = req->cmd->common.flags;
+    u16 status;
+
+    req->cq = cq;
+    req->sq = sq;
+    req->ops = ops;
+    req->sg = NULL;
+    req->sg_cnt = 0;
+    req->transfer_len = 0;
+    req->cqe->status = 0;
+    req->cqe->sq_head = 0;
+    req->cqe->sq_id = cpu_to_le16(sq->qid);
+    req->cqe->command_id = req->cmd->common.command_id;
+    req->ns = NULL;
+    req->error_loc = NVMET_NO_ERROR_LOC;
+
+    /* Fused command not supported (rare anyway) */
+    if (unlikely(flags & NVME_CMD_FUSE_MASK)) {
+        req->error_loc = offsetof(struct nvme_common_command, flags);
+        status = NVME_SC_INVALID_FIELD | NVME_SC_DNR;
+        goto fail;
     }
 
     /*
-     * Parse the command and set req->execute function pointer.
-     * For I/O commands: nvmet_parse_io_cmd().
-     * For admin commands: nvmet_parse_admin_cmd().
+     * Look up the namespace, set up backend.
+     * For an admin command (sq->qid == 0): nvmet_parse_admin_cmd()
+     * For an I/O command (sq->qid != 0): nvmet_parse_io_cmd()
      */
-    status = nvmet_parse_io_cmd(req);
+    if (unlikely(!percpu_ref_tryget_live(&sq->ref))) {
+        status = NVME_SC_QP_NOT_READY | NVME_SC_DNR;
+        goto fail;
+    }
+
+    if (sq->qid)
+        status = nvmet_parse_io_cmd(req);
+    else
+        status = nvmet_parse_admin_cmd(req);
+
     if (status)
         goto fail;
 
@@ -140,62 +215,24 @@ fail:
 }
 ```
 
-Compare with `target_submit_cmd()` in LIO: both do namespace/LUN lookup, both check access state,
-both set a function pointer for the execute handler. The NVMe-oF version is much more direct —
-no workqueue at this point, no PR check (handled differently in NVMe).
+The `percpu_ref` on the submission queue is the equivalent of LIO's `lun_ref` — when the queue
+is being torn down, new commands get rejected.
 
 ---
 
-## nvmet_parse_io_cmd — `drivers/nvme/target/io-cmd-bdev.c`
+## Block device backend — `nvmet_bdev_execute_rw`
 
 ```c
-u16 nvmet_bdev_parse_io_cmd(struct nvmet_req *req)
+/* Simplified — see drivers/nvme/target/io-cmd-bdev.c. */
+void nvmet_bdev_execute_rw(struct nvmet_req *req)
 {
-    switch (req->cmd->common.opcode) {
-    case nvme_cmd_read:
-    case nvme_cmd_write:
-        req->execute = nvmet_bdev_execute_rw;
-        return 0;
-
-    case nvme_cmd_flush:
-        req->execute = nvmet_bdev_execute_flush;
-        return 0;
-
-    case nvme_cmd_dsm:  /* Dataset Management = TRIM/DISCARD */
-        req->execute = nvmet_bdev_execute_discard;
-        return 0;
-
-    case nvme_cmd_write_zeroes:
-        req->execute = nvmet_bdev_execute_write_zeroes;
-        return 0;
-
-    default:
-        pr_err("unhandled cmd %d on qid %d\n",
-               req->cmd->common.opcode, req->sq->qid);
-        return NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
-    }
-}
-```
-
----
-
-## nvmet_bdev_execute_rw — `drivers/nvme/target/io-cmd-bdev.c`
-
-The equivalent of `iblock_execute_rw()`. Notably simpler — no `se_device` indirection, no
-workqueue, executes directly:
-
-```c
-static void nvmet_bdev_execute_rw(struct nvmet_req *req)
-{
-    unsigned int i = req->sg_cnt;
-    struct bio *bio = NULL;
+    unsigned int sg_cnt = req->sg_cnt;
+    struct bio *bio;
     struct scatterlist *sg;
-    sector_t sector;
     blk_opf_t opf;
-    int rc;
-    struct bio_set *bs = &req->ns->bdev_bio_set;
+    int i, sector;
 
-    if (!nvmet_check_transfer_len(req, nvmet_rw_data_len(req)))
+    if (!nvmet_check_transfer_len(req, ...))
         return;
 
     if (!req->sg_cnt) {
@@ -205,215 +242,191 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 
     if (req->cmd->rw.opcode == nvme_cmd_write) {
         opf = REQ_OP_WRITE | REQ_SYNC | REQ_IDLE;
-        if (req->cmd->rw.control & cpu_to_le16(NVME_RW_FUA))
-            opf |= REQ_FUA;  /* Force Unit Access: flush after write */
+        if (req->cmd->rw.control & NVME_RW_FUA)
+            opf |= REQ_FUA;
     } else {
         opf = REQ_OP_READ;
     }
 
+    sector = le64_to_cpu(req->cmd->rw.slba) <<
+             (req->ns->blksize_shift - 9);
+
     /*
-     * Convert SLBA (Starting LBA from NVMe command) to sector number.
-     * NVMe uses 64-bit LBA, sector = slba * (ns->blksize_shift - 9)
+     * Build a chain of bios. Like iblock_execute_rw on LIO, but
+     * without the indirection through target_backend_ops.
      */
-    sector = nvmet_lba_to_sector(req->ns, req->cmd->rw.slba);
-
-    if (req->transfer_len <= NVMET_MAX_INLINE_DATA_LEN &&
-        req->sg == req->inline_sg) {
-        /* small I/O: use inline bio, no pool allocation needed */
-        bio = bio_alloc(req->ns->bdev, req->sg_cnt, opf, GFP_KERNEL);
-    } else {
-        bio = bio_alloc_bioset(req->ns->bdev, req->sg_cnt, opf,
-                               GFP_KERNEL, bs);
-    }
-
+    bio = bio_alloc(req->ns->bdev,
+                     min(sg_cnt, BIO_MAX_VECS), opf, GFP_KERNEL);
     bio->bi_iter.bi_sector = sector;
-    bio->bi_end_io         = nvmet_bio_done;
-    bio->bi_private        = req;
+    bio->bi_private = req;
+    bio->bi_end_io = nvmet_bio_done;
 
-    /*
-     * Map SGL entries into the bio.
-     * Same bio_add_page() loop as iblock_execute_rw().
-     */
     for_each_sg(req->sg, sg, req->sg_cnt, i) {
-        while (bio_add_page(bio, sg_page(sg), sg->length, sg->offset) != sg->length) {
+        while (bio_add_page(bio, sg_page(sg), sg->length, sg->offset)
+                != sg->length) {
             struct bio *prev = bio;
-
-            bio = bio_alloc_bioset(req->ns->bdev, req->sg_cnt - i,
-                                    opf, GFP_KERNEL, bs);
+            bio = bio_alloc(req->ns->bdev,
+                              min(sg_cnt, BIO_MAX_VECS), opf, GFP_KERNEL);
             bio->bi_iter.bi_sector = bio_end_sector(prev);
-            bio->bi_end_io  = nvmet_bio_done;
-            bio->bi_private = req;
-
-            bio_chain(prev, bio);  /* chain bios for single completion */
+            bio_chain(prev, bio);
             submit_bio(prev);
         }
+        sg_cnt--;
     }
 
-    submit_bio(bio);  /* last bio submission triggers the chain */
+    submit_bio(bio);
 }
-```
 
-`bio_chain()` is a NVMe-oF optimization not used in LIO/iblock: it links bios so only the last
-one calls the completion callback. This avoids the `pending` atomic counter approach that iblock
-uses — cleaner for the case of multiple chained bios.
-
----
-
-## nvmet_bio_done — completion
-
-```c
 static void nvmet_bio_done(struct bio *bio)
 {
     struct nvmet_req *req = bio->bi_private;
 
-    /*
-     * bio_chain: if this bio has a parent, just put it and let the
-     * parent's bi_end_io handle final completion.
-     * The last bio in the chain (no parent) calls nvmet_req_complete().
-     */
     nvmet_req_complete(req,
-                       bio->bi_status ? NVME_SC_INTERNAL | NVME_SC_DNR : 0);
+                        blk_to_nvme_status(req, bio->bi_status));
     bio_put(bio);
 }
 ```
 
+`bio_chain()` is the simpler approach used here — earlier bios link to later bios, only the
+final completion triggers `nvmet_req_complete()`. LIO's iblock uses an explicit pending counter
+(`ibr->pending`); both achieve the same effect.
+
 ---
 
-## nvmet_req_complete — `drivers/nvme/target/core.c`
+## NVMe Reservations — `drivers/nvme/target/pr.c`
+
+NVMe Reservations were added to the kernel target in the 6.x series (specific version varies —
+verify against your kernel). They mirror SCSI PR closely but with NVMe-style status codes:
 
 ```c
-void nvmet_req_complete(struct nvmet_req *req, u16 status)
-{
-    struct nvmet_sq *sq = req->sq;
+/* NVMe reservation types — analogous to PR_* but distinct values */
+#define NVME_PR_WRITE_EXCLUSIVE              1
+#define NVME_PR_EXCLUSIVE_ACCESS             2
+#define NVME_PR_WRITE_EXCLUSIVE_REG_ONLY     3
+#define NVME_PR_EXCLUSIVE_ACCESS_REG_ONLY    4
+#define NVME_PR_WRITE_EXCLUSIVE_ALL_REGS     5
+#define NVME_PR_EXCLUSIVE_ACCESS_ALL_REGS    6
 
-    if (!status)
-        status = nvmet_check_transfer_len(req, req->transfer_len);
-
-    req->cqe->status = cpu_to_le16(status << 1);
-
-    /*
-     * Call the transport-specific completion function.
-     * For TCP: nvmet_tcp_queue_response()
-     * For RDMA: nvmet_rdma_queue_response()
-     *
-     * This posts the NVMe completion queue entry (CQE) back to the initiator.
-     * 16 bytes: sq_head, sq_id, command_id, status.
-     *
-     * No workqueue involvement — completion goes directly back to
-     * the transport layer.
-     */
-    req->ops->queue_response(req);
-
-    /* release namespace reference */
-    if (req->ns)
-        nvmet_put_namespace(req->ns);
-}
-EXPORT_SYMBOL_GPL(nvmet_req_complete);
+/* Conflict status */
+#define NVME_SC_RESERVATION_CONFLICT         0x83  /* (status type bits prepended) */
 ```
 
-Compare with LIO's completion path:
-- LIO: `target_complete_cmd()` → `queue_work(target_completion_wq, ...)` → worker →
-  `target_complete_ok_work()` → `se_tfo->queue_status()` → fabric TX
-- NVMe-oF: `nvmet_req_complete()` → `req->ops->queue_response()` → transport TX directly
+The host kernel's `nvme/host/pr.c` implements `pr_ops` analogous to `sd_pr_ops`. So
+`/dev/nvme0n1` exposes the same PR ioctl interface as `/dev/sdX` — userspace tools (sg_persist
+in compatibility mode, custom code via `IOC_PR_*`) work uniformly.
 
-NVMe-oF has one fewer workqueue hop — the completion goes directly to the transport. This is a
-meaningful latency difference for high-IOPS NVMe workloads.
+For NVMe over Fabrics specifically, when an NVMe Reservation Acquire returns conflict, the host
+kernel's `nvme_complete_rq()` maps it to `BLK_STS_NEXUS` or `BLK_STS_RESV_CONFLICT` for the
+block layer. The exact mapping depends on kernel version; always verify against
+`drivers/nvme/host/core.c` for the kernel you target.
 
 ---
 
-## NVMe-oF PR — TP4049
+## ANA — Asymmetric Namespace Access
 
-```c
-/*
- * NVMe Persistent Reservations (TP4049, added in NVMe 1.4) are
- * implemented differently from SCSI PR:
- *
- * NVMe PR commands:
- *   RESERVATION REGISTER  (opcode 0x0D, action 0x0)
- *   RESERVATION ACQUIRE   (opcode 0x0D, action 0x1)
- *   RESERVATION RELEASE   (opcode 0x0D, action 0x2)
- *   RESERVATION REPORT    (opcode 0x0E)
- *   RESERVATION PREEMPT   (opcode 0x0D, action 0x3)
- *
- * In nvmet: handled by nvmet_execute_pr_*() functions in
- * drivers/nvme/target/pr.c (added in kernel 6.0).
- *
- * NVMe reservation types:
- *   1 = Write Exclusive
- *   2 = Exclusive Access
- *   3 = Write Exclusive - Registrants Only
- *   4 = Exclusive Access - Registrants Only
- *   5 = Write Exclusive - All Registrants
- *   6 = Exclusive Access - All Registrants
- *
- * Conflict response: NVME_SC_RESERVATION_CONFLICT (0x19)
- * vs SCSI: SAM_STAT_RESERVATION_CONFLICT (0x18)
- *
- * Key difference from SCSI PR:
- *   NVMe PR uses the host NQN (NVMe Qualified Name) as the I_T nexus
- *   identifier, not an IQN.
- *   Registration is per-controller, not per-I_T nexus.
- */
+The NVMe equivalent of ALUA is ANA (NVMe spec §8.20). Same idea — per-namespace state
+advertised to the host:
+
 ```
+NVMe ANA states                         SCSI ALUA states
+───────────────                         ─────────────────
+ANA Optimized           = 0x01            ACTIVE_OPTIMIZED         = 0x0
+ANA Non-Optimized       = 0x02            ACTIVE_NON_OPTIMIZED     = 0x1
+ANA Inaccessible        = 0x03            STANDBY/UNAVAILABLE      = 0x2/0x3
+ANA Persistent Loss     = 0x04            (no exact equivalent)
+ANA Change              = 0x0F            TRANSITION               = 0xF
+```
+
+The mapping is approximate; ANA is a redesign with cleaner semantics. The host's
+`nvme_mpath` (multipath) layer consumes ANA state directly — there's no equivalent of
+`scsi_dh_alua` because ANA processing is built into nvme-host.
 
 ---
 
-## NVMe-oF vs iSCSI/LIO for the fencing use case
+## Connection loss handling — kato vs replacement_timeout
 
-```
-Fencing via NVMe-oF PR:
-    Works similarly to SCSI PR.
-    RESERVATION ACQUIRE → reservation held.
-    Non-holder commands → NVME_SC_RESERVATION_CONFLICT returned immediately.
-    No workqueue involvement — direct path.
+NVMe-oF host's connection loss handling parameter is `--ctrl-loss-tmo` (controller loss
+timeout, set when connecting). It is the analog of iSCSI's `replacement_timeout`. The default
+is typically 600 seconds (10 minutes), much longer than iSCSI's 120s default.
 
-Fencing via NVMe-oF subsystem/controller removal (equivalent to session drop):
-    nvmet_subsys: target subsystem (equivalent to iSCSI target IQN)
-    nvmet_ctrl:   per-host controller (equivalent to iSCSI session)
+Other related timeouts:
+- `kato` (Keep Alive Timeout) — target's per-controller idle timeout. Default 120s.
+- `--reconnect-delay` — host's delay between reconnect attempts. Default 10s.
+- `--fast-io-fail-tmo` — how long the host queues I/O before failing it (similar in spirit to
+  `no_path_retry=N` count in dm-multipath).
 
-    Removing a host NQN from allowed_hosts:
-        echo "" > /sys/kernel/config/nvmet/subsystems/<subsys>/allowed_hosts/<nqn>
-        → nvmet_host_put() → controller becomes unauthorized
-        → new connections rejected (NVME_SC_CONNECT_CTRL_BUSY or AUTH_REQUIRED)
-        → existing controller: nvmet_ctrl_put() → controller teardown
-
-    Much faster than iSCSI fencing:
-        No replacement_timeout equivalent.
-        NVMe-oF controller teardown is immediate.
-        Host sees I/O errors within the fabric's timeout (seconds not minutes).
-```
+The NVMe host is more aggressive about retrying connections and slower to declare a host
+permanently dead. This is a different tradeoff from iSCSI's defaults — better suited for
+RDMA/datacenter where transient blips are common, less aggressive about visible failure for
+unattended fencing scenarios.
 
 ---
 
-## Key differences: nvmet vs target_core_mod
+## Why NVMe-oF target teardown is faster than iSCSI
 
-| Aspect | target_core_mod (LIO) | nvmet (NVMe-oF) |
+```
+NVMe-oF subsystem teardown                 iSCSI session teardown (day 25)
+──────────────────────────                 ─────────────────────────────
+nvmet_subsys_disconnect_ctrl()              iscsit_close_session()
+    │                                          │
+    ▼                                          ▼
+percpu_ref_kill on all sqs                  iscsit_cause_connection_reinstatement
+    │                                          │  socket forced error
+    │  in-flight cmds drained via              │  kthread_stop on RX/TX
+    │  percpu_ref drain                        ▼
+    ▼                                       iscsit_release_commands_from_conn
+nvme_transport->delete_ctrl()                  CMD_T_FABRIC_STOP per cmd
+    │  close fabric connection                 ▼
+    ▼                                       target_wait_for_sess_cmds
+nvmet_ctrl_free                                kref drain
+    │
+    ▼
+done
+```
+
+NVMe-oF target benefits from a simpler model:
+- No `target_tmr_wq` ordering constraints (NVMe abort is per-queue, not per-cmd).
+- No per-fabric callbacks like `queue_data_in`/`queue_status` to coordinate during teardown.
+- `percpu_ref` on the SQ handles the "drain in-flight" step cleanly.
+
+In practice, NVMe-oF target teardown completes in tens of milliseconds vs LIO's hundreds of
+milliseconds to seconds.
+
+---
+
+## When to use NVMe-oF vs iSCSI
+
+| Aspect | iSCSI | NVMe-oF |
 |---|---|---|
-| Command struct | `se_cmd` (generic) | `nvmet_req` (NVMe-specific) |
-| Workqueue | `target_submission_wq` + `target_completion_wq` | None — direct dispatch |
-| Completion path | se_tfo->queue_status() → TX thread | req->ops->queue_response() → transport |
-| PR | target_core_pr.c (SCSI SPC-4) | pr.c (NVMe TP4049) |
-| Backend | target_backend_ops (iblock/fileio/pscsi) | Direct blkdev_issue_* |
-| TMF | target_tmr_wq (ordered) | No TMF equivalent (abort via CID) |
-| Config | configfs target/ tree | configfs nvmet/ tree |
-| Fabric abstraction | se_tfo ops table | nvmet_fabrics_ops |
+| Latency | 100µs–1ms | 10µs–100µs |
+| Throughput | bound by TCP | TCP, RDMA, or FC |
+| CPU overhead | high (SCSI mid layer + iscsi_tcp) | lower |
+| Tooling maturity | very mature | improving |
+| Fencing options | PR, ALUA, ACL, session drop | Reservations, ANA, ACL, ctrl drop |
+| Hardware needs | ethernet | RDMA (RoCE/iWARP) for best perf |
+| Multi-path | dm-multipath | nvme_mpath built-in |
+
+For new deployments, NVMe-oF over TCP (`nvme-tcp`) gives most of the latency benefit without
+needing RDMA. Most modern storage appliances support both fabrics simultaneously.
 
 ---
 
 ## Key takeaways
 
-- NVMe-oF target does NOT use `target_core_mod`. It has its own `nvmet_req` struct and dispatch.
-- `nvmet_req_init()` does NSID lookup (like LUN lookup), sets `req->execute` function pointer.
-- `nvmet_bdev_execute_rw()` maps SGL to bios (same pattern as iblock) using `bio_chain()` for
-  multi-bio chains — cleaner than iblock's pending counter.
-- `nvmet_req_complete()` calls `req->ops->queue_response()` directly — no workqueue hop. One
-  fewer latency step than LIO's `target_completion_wq`.
-- NVMe PR (TP4049) uses similar concepts to SCSI PR but different command opcodes, conflict
-  status code (`0x19`), and NQN-based I_T nexus identification.
-- NVMe-oF controller teardown is faster than iSCSI session teardown — no `replacement_timeout`
-  equivalent means fencing completes in seconds rather than up to 120s.
-- The trade-off: nvmet's directness makes it faster but less general. LIO's abstraction (se_tfo,
-  target_core_mod) means the same backend logic works for iSCSI, FC, SRP, and NVMe-oF fabrics.
+- NVMe-oF target (`drivers/nvme/target/`) is structurally simpler than LIO: no fabric-agnostic
+  core, no SCSI mid-layer involvement, direct fabric → backend paths.
+- `nvmet_req` ≈ LIO's `se_cmd`. `nvmet_ctrl` ≈ `se_session`. `nvmet_ns` ≈ `se_lun`.
+- NVMe Reservations mirror SCSI PR with similar semantics but distinct values
+  (`NVME_PR_*`) and a different status code (`NVME_SC_RESERVATION_CONFLICT`, value depends on
+  status-type bits). The host's `pr_ops` interface unifies both back to userspace.
+- ANA (Asymmetric Namespace Access) is the NVMe equivalent of ALUA. The host's `nvme_mpath`
+  consumes ANA state directly — no separate device handler.
+- Connection loss handling: NVMe-oF host's `ctrl-loss-tmo` (default 600s) is the analog of
+  iSCSI `replacement_timeout` (default 120s); NVMe is configured for longer retry tolerance.
+- NVMe-oF target teardown is faster than LIO's because the model is simpler — `percpu_ref` on
+  the SQ replaces LIO's multi-step kref drain.
+- For new deployments needing fencing semantics: PR/Reservations work uniformly via `pr_ops`
+  on either fabric.
 
 ---
 

@@ -1,405 +1,480 @@
 # Day 14 — dm-multipath PR ops and path management
 
-**Week 2**: iSCSI Initiator Kernel Code
-**Time**: 1–2 hours
+**Week 2**: iSCSI Initiator Kernel Code  
+**Time**: 1–2 hours  
 **Reference**: `drivers/md/dm-mpath.c`, `drivers/md/dm.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-This day ties together the multipath path management code with the PR ops picture from day 13.
-The focus is: why PR goes through `dm_pr_ops` and NOT through the normal multipath dispatch;
-how `fail_path()` and `reinstate_path()` manage the path set; and how `queue_if_no_path` interacts
-with path failure to produce the indefinite hang — and what the clean alternatives are.
+Day 13 covered the initiator-side PR slow path. Today: how dm-multipath manages the *interaction*
+between PR operations, path failures, and the `queued_bios` list. This is where many subtle
+fencing bugs live — wrong assumptions about which thread holds which lock, when paths get
+reinstated, or how PR ops coexist with hung normal I/O.
 
 ---
 
-## dm_pr_ops — registered on the dm device — `drivers/md/dm.c`
+## The two layers of dm
+
+dm-core (`drivers/md/dm.c`) implements:
+- `pr_ops` table (`dm_pr_ops`)
+- `dm_call_pr()` iterator that walks paths
+- `dm_blk_ioctl()` general ioctl pass-through
+
+dm-mpath (`drivers/md/dm-mpath.c`) implements:
+- `multipath_map_bio()` — bio interception
+- `m->queued_bios` and `process_queued_bios` — the queue and its drain
+- `fail_path()` / `reinstate_path()` — path state changes
+- Admin messages (`fail_if_no_path`, `queue_if_no_path`)
+
+PR ops go through dm-core; bio I/O goes through dm-mpath. They share `struct multipath` state but
+operate on different code paths.
+
+---
+
+## dm_call_pr — the PR fan-out — `drivers/md/dm.c`
 
 ```c
-/*
- * dm_pr_ops is set as disk->fops->pr_ops when a dm device is created.
- * It is the ONLY way PR commands reach the underlying paths from a dm device.
- * multipath_map_bio() is NEVER called for PR commands.
- */
-static const struct pr_ops dm_pr_ops = {
-    .pr_register  = dm_pr_register,
-    .pr_reserve   = dm_pr_reserve,
-    .pr_release   = dm_pr_release,
-    .pr_preempt   = dm_pr_preempt,
-    .pr_clear     = dm_pr_clear,
+/* Simplified — see drivers/md/dm.c. */
+struct dm_pr {
+    u64     old_key;
+    u64     new_key;
+    u32     flags;
+    bool    fail_early;
+    int     ret;
+    enum pr_type type;
 };
 
-/*
- * dm_pr_register — registers a key on all paths.
- * Must be called before dm_pr_reserve.
- *
- * PERSISTENT RESERVE workflow:
- *   1. dm_pr_register(key)   — each path: PERSISTENT RESERVE OUT / REGISTER
- *   2. dm_pr_reserve(key)    — each path: PERSISTENT RESERVE OUT / RESERVE
- *   3. I/O proceeds normally
- *   4. dm_pr_release(key)    — each path: PERSISTENT RESERVE OUT / RELEASE
- */
-static int dm_pr_register(struct block_device *bdev,
-                            u64 old_key, u64 new_key, u32 flags)
+static int dm_call_pr(struct block_device *bdev, iterate_devices_callout_fn fn,
+                       void *data)
 {
     struct mapped_device *md = bdev->bd_disk->private_data;
-    struct dm_pr pr = {
-        .old_key   = old_key,
-        .new_key   = new_key,
-        .flags     = flags,
-        .fail_early = false,
-    };
-    int r;
-
-    r = dm_pr_call_all(md, dm_pr_register_fn, &pr);
-    return r;
-}
-
-/* helper that calls a PR function on each path via iterate_devices */
-static int dm_pr_call_all(struct mapped_device *md,
-                            iterate_devices_callout_fn fn,
-                            struct dm_pr *pr)
-{
     struct dm_table *table;
     struct dm_target *ti;
-    int r, srcu_idx;
+    int ret = -ENOTTY;
+    int srcu_idx;
 
     table = dm_get_live_table(md, &srcu_idx);
-    if (!table)
-        return -ENOTTY;
+    if (!table || !table->num_targets)
+        goto out;
 
-    /*
-     * Iterate all targets (usually just one for multipath).
-     * For each target, iterate all devices (paths).
-     */
-    for (int i = 0; i < dm_table_get_num_targets(table); i++) {
-        ti = dm_table_get_target(table, i);
-        if (ti->type->iterate_devices) {
-            r = ti->type->iterate_devices(ti, fn, pr);
-            if (r && pr->fail_early) {
-                dm_put_live_table(md, srcu_idx);
-                return r;
-            }
-        }
+    /* Multipath devices have one target spanning the whole LUN */
+    ti = dm_table_get_target(table, 0);
+    if (!ti->type->iterate_devices) {
+        ret = -EINVAL;
+        goto out;
     }
 
+    /*
+     * iterate_devices walks every pgpath in every priority group.
+     * For each: calls our `fn` with the pgpath's underlying bdev.
+     */
+    ret = ti->type->iterate_devices(ti, fn, data);
+
+out:
     dm_put_live_table(md, srcu_idx);
-    return pr->fail_early ? -EINVAL : 0;
+    return ret;
 }
 ```
 
----
-
-## multipath_iterate_devices — `drivers/md/dm-mpath.c`
-
-The `iterate_devices` function registered by the multipath target. Called by `dm_pr_call_all()`:
+For dm-multipath, `iterate_devices` is `multipath_iterate_devices()`:
 
 ```c
 static int multipath_iterate_devices(struct dm_target *ti,
-                                      iterate_devices_callout_fn fn,
-                                      void *data)
+                                       iterate_devices_callout_fn fn,
+                                       void *data)
 {
     struct multipath *m = ti->private;
     struct priority_group *pg;
     struct pgpath *p;
     int ret = 0;
 
-    /*
-     * Walk every priority group, every path within each group.
-     * Call fn(ti, path_dev, start, len, data) for each.
-     *
-     * For PR: fn = dm_pr_reserve_fn (or register_fn, release_fn, etc.)
-     * This calls blk_pr_reserve(path->path.dev->bdev) for each /dev/sdX.
-     *
-     * Important: this iterates ALL paths, not just active ones.
-     * PR must be registered on every path — even currently-failed ones —
-     * so that when they come back, they already have the reservation.
-     */
     list_for_each_entry(pg, &m->priority_groups, list) {
         list_for_each_entry(p, &pg->pgpaths, list) {
-            ret = fn(ti, p->path.dev, ti->begin, ti->len, data);
-            if (ret && data && ((struct dm_pr *)data)->fail_early)
-                return ret;
+            ret = fn(ti, p->path.dev,
+                     ti->begin, ti->len, data);
+            if (ret)
+                break;
         }
+        if (ret)
+            break;
     }
 
     return ret;
 }
 ```
 
-This is why PR is issued per-path — the `iterate_devices` callback visits every `pgpath`. Each
-call to `blk_pr_reserve(path_dev->bdev)` blocks synchronously (day 13). PR is registered/reserved
-on all paths before `dm_pr_reserve()` returns.
+So `dm_pr_register()` ends up calling `__dm_pr_register()` once per path, once per priority
+group. Each call:
+1. Looks up the path's `sd_pr_ops`.
+2. Calls `sd_pr_register()` with the same `(old_key, new_key, flags)`.
+3. The session for that path sends a `PERSISTENT RESERVE OUT REGISTER` PDU.
+4. Target's `core_scsi3_pro_register()` records the key for that I_T nexus.
+
+After registration completes on all paths, every path has the same registered key from this
+initiator's perspective. Each I_T nexus on the target has an entry with that key.
+
+`fail_early=true` (the default for register) means stop on first failure — useful when one path
+has a stale ACL or other auth issue. `fail_early=false` lets the loop attempt every path even if
+some fail.
 
 ---
 
-## fail_path — `drivers/md/dm-mpath.c` (full detail)
+## dm_pr_reserve — only the active path
+
+Unlike register, reserve only needs to fire once. The dm layer uses the active path:
 
 ```c
-static void fail_path(struct pgpath *pgpath)
+/* Simplified. */
+static int dm_pr_reserve(struct block_device *bdev,
+                          u64 key,
+                          enum pr_type type,
+                          u32 flags)
 {
-    struct multipath *m = pgpath->pg->m;
-
-    spin_lock_irq(&m->lock);
-
-    if (!pgpath->is_active)
-        goto out;   /* already marked failed — idempotent */
-
-    DMWARN("Failing path %s.", pgpath->path.dev->name);
-
-    pgpath->path.is_active = 0;
-    pgpath->is_active      = 0;
-    pgpath->fail_count++;
+    struct mapped_device *md = bdev->bd_disk->private_data;
+    struct block_device *path_bdev;
+    int ret;
 
     /*
-     * Decrement valid path counter.
-     *
-     * When nr_valid_paths hits 0:
-     *   - choose_pgpath() returns NULL
-     *   - multipath_map_bio() queues bios (if queue_if_no_path=1)
-     *     or fails them immediately (if queue_if_no_path=0)
+     * Get the currently active path's bdev.
+     * dm_get_active_pgpath_bdev() walks the path selectors to find
+     * a usable path. If no path is active, returns -ENOTTY.
      */
-    atomic_dec(&m->nr_valid_paths);
-
-    if (pgpath == m->current_pgpath)
-        m->current_pgpath = NULL;
+    ret = dm_prepare_ioctl(md, &path_bdev);
+    if (ret < 0)
+        return ret;
 
     /*
-     * If pg_init (e.g. ALUA state query) was running for this path,
-     * cancel it — path is gone.
+     * Issue PR RESERVE on this path's bdev.
+     * sd_pr_reserve() builds the CDB and calls scsi_execute_cmd().
      */
-    if (pgpath->pg->nr_pgpaths == 1 && pgpath->pg == m->current_pg)
-        m->current_pg = NULL;
+    ret = path_bdev->bd_disk->fops->pr_ops->pr_reserve(path_bdev, key,
+                                                        type, flags);
 
-    /* udev event → multipathd sees path failure */
-    dm_path_uevent(DM_UEVENT_PATH_FAILED, m->ti,
-                   pgpath->path.dev->name,
-                   atomic_read(&m->nr_valid_paths));
-
-    /* schedule_work: let multipathd poll and potentially re-enable */
-    schedule_work(&m->trigger_event);
-
-out:
-    spin_unlock_irq(&m->lock);
+    dm_unprepare_ioctl(md);
+    return ret;
 }
+```
+
+The reservation is held by the I_T_L nexus on the target. With `PR_*_ALL_REGS` types, ALL
+registered nexuses share write access — exactly the "all paths active, one key, can write"
+semantics multipath wants.
+
+---
+
+## What happens when a path fails during PR
+
+Scenario: PR REGISTER is fanning out across 4 paths. Path 2 has just lost its TCP session.
+
+```
+__dm_pr_register on path 0      → success
+__dm_pr_register on path 1      → success
+__dm_pr_register on path 2      → ?
+    │
+    ▼
+sd_pr_register(path 2's bdev)
+    │
+    ▼
+sd_pr_out_command()
+    │
+    ▼
+scsi_execute_cmd()
+    │  REQ_OP_DRV_OUT (passthrough)
+    ▼
+blk_execute_rq(at_head=true)
+    │  inserted at hctx->dispatch HEAD
+    ▼
+blk_mq_run_hw_queue() → iscsi_queuecommand()
+    │  Gate 1: iscsi_session_chkready()
+    │  session->state == ISCSI_STATE_FAILED
+    │  → return DID_TRANSPORT_DISRUPTED << 16
+    ▼
+sc->result set, scsi_done(sc)
+    │  blk_rq_is_passthrough → scsi_complete()
+    │  → wakes blk_execute_rq()
+    ▼
+sd_pr_out_command() returns -EIO
+    │
+    ▼
+__dm_pr_register returns -EIO
+    │
+    ▼  (with fail_early=true: stop and return)
+dm_pr_register returns -EIO to userspace
+```
+
+If `fail_early=false`, the loop continues to paths 3 and 4. `multipathd` sees per-path errors and
+typically retries the failed path later (often via its path checker triggering a reinstate).
+
+---
+
+## Path failure during normal I/O — the fencing scenario
+
+Now the same path failure but during normal `submit_bio()` (not PR):
+
+```
+application: write(fd, buf, len)
+    │
+    ▼
+submit_bio() / blk_mq_submit_bio()
+    │
+    ▼
+multipath_map_bio()
+    │  choose_pgpath() — picks current_pgpath (say path 2)
+    ▼
+bio_set_dev(bio, path2 bdev)
+DM_MAPIO_REMAPPED
+    │
+    ▼  (re-submit on path 2)
+iscsi_queuecommand() on path 2
+    │  session->state == ISCSI_STATE_FAILED
+    ▼
+... bio eventually completes with BLK_STS_TRANSPORT
+    │
+    ▼
+multipath_end_io_bio()
+    │  blk_path_error(BLK_STS_TRANSPORT) = true
+    │  fail_path(path 2)
+    │  atomic_dec(&m->nr_valid_paths)
+    ▼
+return DM_ENDIO_REQUEUE
+    │  bio resubmitted via blk_mq_requeue_request
+    ▼
+multipath_map_bio() — try again
+    │  choose_pgpath() picks path 3
+    ▼
+... bio remapped to path 3, eventually succeeds
+```
+
+If all paths are failed (`nr_valid_paths == 0`):
+```
+multipath_map_bio()
+    │  choose_pgpath() returns NULL
+    │  if m->queue_if_no_path:
+    │      bio_list_add(&m->queued_bios, bio)  ← HANG
+    │      return DM_MAPIO_SUBMITTED
+```
+
+But PR ops in flight at the same time:
+```
+dm_pr_reserve()
+    │  takes a different code path entirely
+    │  calls underlying bdev's pr_ops directly
+    │  blk_execute_rq() injects at hctx->dispatch HEAD
+    ▼
+If at least one path's session is still alive:
+    PR command succeeds → caller wakes → returns 0
 ```
 
 ---
 
-## reinstate_path — `drivers/md/dm-mpath.c`
+## queue_if_no_path messages
 
-Called by multipathd (via sysfs) or `pg_init_done()` when a path comes back:
+Userspace controls `queue_if_no_path` via dmsetup messages:
+
+```bash
+# Pause queueing — bios will fail with -EIO when no path
+dmsetup message dm-0 0 fail_if_no_path
+
+# Resume queueing — new bios will queue when no path
+dmsetup message dm-0 0 queue_if_no_path
+```
 
 ```c
-static int reinstate_path(struct pgpath *pgpath)
+/* Simplified — drivers/md/dm-mpath.c. */
+static int multipath_message(struct dm_target *ti, unsigned argc, char **argv,
+                              char *result, unsigned maxlen)
 {
-    int r = 0, run_queue = 0;
-    struct multipath *m = pgpath->pg->m;
-    unsigned int nr_valid_paths;
+    struct multipath *m = ti->private;
 
-    spin_lock_irq(&m->lock);
+    if (!strcasecmp(argv[0], "queue_if_no_path"))
+        return queue_if_no_path(m, true, false);
 
-    if (pgpath->is_active) {
-        DMWARN("Attempting to reinstate active path %s",
-               pgpath->path.dev->name);
-        r = -EINVAL;
-        goto out;
+    if (!strcasecmp(argv[0], "fail_if_no_path"))
+        return queue_if_no_path(m, false, false);
+
+    /* ... other messages ... */
+}
+
+static int queue_if_no_path(struct multipath *m, bool queue_if_no_path,
+                              bool save_old_value)
+{
+    unsigned long flags;
+    bool queue_if_no_path_bit, saved_queue_if_no_path_bit;
+
+    spin_lock_irqsave(&m->lock, flags);
+
+    saved_queue_if_no_path_bit = m->saved_queue_if_no_path;
+    queue_if_no_path_bit       = m->queue_if_no_path;
+
+    if (save_old_value) {
+        if (unlikely(!queue_if_no_path_bit && saved_queue_if_no_path_bit)) {
+            DMERR("saved_queue_if_no_path_bit out of sync");
+        } else {
+            m->saved_queue_if_no_path = queue_if_no_path_bit;
+        }
+    } else if (!queue_if_no_path && saved_queue_if_no_path_bit) {
+        m->saved_queue_if_no_path = false;
     }
 
-    nr_valid_paths = atomic_inc_return(&m->nr_valid_paths);
+    m->queue_if_no_path = queue_if_no_path;
 
-    pgpath->is_active     = 1;
-    pgpath->path.is_active = 1;
-
-    if (!m->current_pgpath)
-        m->current_pgpath = pgpath;
+    spin_unlock_irqrestore(&m->lock, flags);
 
     /*
-     * If bios were queued while no path was available,
-     * set run_queue=1 to drain them after releasing the lock.
+     * If we cleared queue_if_no_path while bios were queued, drain them.
+     * They will be failed with -EIO since there's no path.
      */
-    if (!bio_list_empty(&m->queued_ios))
-        run_queue = 1;
-
-    dm_path_uevent(DM_UEVENT_PATH_REINSTATED, m->ti,
-                   pgpath->path.dev->name, nr_valid_paths);
-
-    schedule_work(&m->trigger_event);
-
-out:
-    spin_unlock_irq(&m->lock);
-
-    if (run_queue) {
-        /*
-         * Drain queued_ios — resubmit each bio through multipath_map_bio().
-         * Now that a path is available, choose_pgpath() will succeed.
-         */
+    if (!queue_if_no_path) {
         dm_table_run_md_queue_async(m->ti->table);
         process_queued_io_list(m);
     }
 
-    return r;
+    return 0;
 }
 ```
 
-`process_queued_io_list()` drains `m->queued_ios`:
+`fail_if_no_path` is the standard "stop the hang" lever. After issuing:
+- `m->queue_if_no_path = 0`
+- Next `multipath_map_bio()` call with no paths returns `DM_MAPIO_KILL` instead of queuing
+- `process_queued_bios` drains the queue, but with `queue_if_no_path=0` and no paths, those bios
+  fail with `-EIO`
 
-```c
-static void process_queued_io_list(struct multipath *m)
-{
-    if (m->queue_mode == DM_TYPE_REQUEST_BASED)
-        dm_mq_kick_requeue_list(m->md);
-    else
-        dm_table_run_md_queue_async(m->ti->table);
-}
-```
+This is the manual recovery path. `multipathd` can also be configured to do it automatically
+after `no_path_retry` retries.
 
 ---
 
-## queue_if_no_path control — the no_path_retry knob
+## fail_path side effects
 
-`queue_if_no_path` is set by multipath during device table loading based on `no_path_retry`:
+Beyond decrementing `nr_valid_paths`, `fail_path()` triggers:
 
 ```c
-/*
- * Parsing of no_path_retry= from /etc/multipath.conf:
- *
- * no_path_retry = queue  → queue_if_no_path = 1, pg_init_retries = INT_MAX
- * no_path_retry = fail   → queue_if_no_path = 0
- * no_path_retry = N      → queue_if_no_path = 1, pg_init_retries = N
- *                           after N retries: queue_if_no_path = 0 (fail)
- */
-static int multipath_ctr(struct dm_target *ti, unsigned argc, char **argv)
+static void fail_path(struct pgpath *pgpath)
 {
-    /* ... parsing ... */
-    if (!strcasecmp(arg, "queue"))
-        m->queue_if_no_path = 1;
-    else if (!strcasecmp(arg, "fail"))
-        m->queue_if_no_path = 0;
-    else {
-        m->nr_priority_groups = simple_strtoul(arg, NULL, 10);
-        m->queue_if_no_path = 1; /* queue initially, fail after N */
-    }
+    /* ... lock, mark inactive, atomic_dec ... */
+
+    /*
+     * Send a uevent — multipathd is listening.
+     */
+    dm_path_uevent(DM_UEVENT_PATH_FAILED, m->ti,
+                   pgpath->path.dev->name,
+                   atomic_read(&m->nr_valid_paths));
+
+    /*
+     * trigger_event work item — runs in process context to send
+     * userspace notification.
+     */
+    schedule_work(&m->trigger_event);
+
+    /*
+     * If a path-group ALUA initialization is in progress, signal it
+     * (the path is gone, no point waiting).
+     */
+    if (pgpath->is_active)
+        pgpath->pg->ps.type->fail_path(&pgpath->pg->ps, &pgpath->path);
 }
 ```
 
-You can change it at runtime via:
+`multipathd` receives the uevent and:
+- Updates its internal path map.
+- May schedule a path-checker re-test.
+- Logs the failure.
+- May trigger a reinstate attempt later.
 
-```bash
-# switch from queue to fail immediately (clears queued_ios with -EIO)
-dmsetup message dm-0 0 "fail_if_no_path"
-# or via multipathd:
-multipathd -k "fail_path dm-0 8:16"
-```
+---
 
-The message handler:
+## reinstate_path — recovery
 
 ```c
-static int multipath_message(struct dm_target *ti, unsigned argc, char **argv)
+static int reinstate_path(struct pgpath *pgpath)
 {
-    struct multipath *m = ti->private;
+    struct multipath *m = pgpath->pg->m;
+    int run_queue = 0;
+    unsigned long flags;
 
-    if (!strcasecmp(argv[0], "fail_if_no_path")) {
-        /*
-         * Immediately switch from queue mode to fail mode.
-         * All bios queued in m->queued_ios are failed with -EIO.
-         * Application sees write() return -EIO immediately.
-         */
-        m->queue_if_no_path = 0;
-        if (!atomic_read(&m->nr_valid_paths))
-            dm_table_run_md_queue_async(m->ti->table);
+    spin_lock_irqsave(&m->lock, flags);
+
+    if (pgpath->is_active) {
+        /* already active — idempotent */
+        spin_unlock_irqrestore(&m->lock, flags);
         return 0;
     }
-    /* ... reinstate_path, fail_path messages ... */
+
+    pgpath->is_active = 1;
+    atomic_inc(&m->nr_valid_paths);
+
+    if (atomic_read(&m->nr_valid_paths) == 1) {
+        /* this was the first path back — drain queued_bios */
+        run_queue = 1;
+        m->current_pgpath = pgpath;
+    }
+
+    dm_path_uevent(DM_UEVENT_PATH_REINSTATED, m->ti,
+                   pgpath->path.dev->name,
+                   atomic_read(&m->nr_valid_paths));
+
+    schedule_work(&m->trigger_event);
+
+    spin_unlock_irqrestore(&m->lock, flags);
+
+    if (run_queue) {
+        dm_table_run_md_queue_async(m->ti->table);
+        process_queued_io_list(m);   /* runs process_queued_bios */
+    }
+
+    return 0;
 }
 ```
 
----
+After `reinstate_path()` runs and returns, `process_queued_bios` (the `m->process_queued_bios`
+work item) drains `m->queued_bios`. Each bio re-enters `multipath_map_bio()`, where
+`choose_pgpath()` now finds the newly-reinstated path and returns it. The bio gets remapped to
+the path's bdev and submitted.
 
-## Path management summary: the states a pgpath goes through
-
-```
-pgpath.is_active states:
-    1 (active) → fail_path() → 0 (failed)
-    0 (failed) → reinstate_path() → 1 (active)
-
-nr_valid_paths:
-    start: N (number of configured paths)
-    fail_path(): atomic_dec → N-1, N-2, ... 0
-    reinstate_path(): atomic_inc → 1, 2, ... N
-
-queue_if_no_path interaction with nr_valid_paths:
-    nr_valid_paths > 0: choose_pgpath() returns a path → I/O proceeds
-    nr_valid_paths == 0 AND queue_if_no_path=1: bio_list_add(queued_ios) → HANG
-    nr_valid_paths == 0 AND queue_if_no_path=0: DM_MAPIO_KILL → -EIO
-
-Recovery:
-    reinstate_path() → nr_valid_paths++ → process_queued_io_list() → drain queued_ios
-```
+The application's `write()` call — which has been blocked since the bio went into
+`m->queued_bios` — now returns success.
 
 ---
 
-## Why session-drop fencing avoids the queue hang
+## The key invariant
 
-```
-Scenario: no_path_retry=queue, fencing via session drop + ACL removal
+The PR slow path and the multipath bio path share `struct multipath` state but never share code:
 
-Path A dropped by target (TCP RST or FIN):
-    │  iscsi_conn_failure() → ISCSI_STATE_FAILED
-    │  replacement_timeout = 120s starts
-    │  iscsid tries to reconnect: Login → REJECT (ACL removed)
-    │  reconnect fails → replacement_timeout counts down
-    │  120s → RECOVERY_FAILED → DID_TRANSPORT_FAILFAST
-    ▼
-fail_path(path_A) → nr_valid_paths--
+| Aspect | Bio I/O | PR ioctl |
+|---|---|---|
+| Entry | `submit_bio()` / `multipath_map_bio()` | `blkdev_pr_ioctl()` / `dm_pr_*` |
+| Path selection | `choose_pgpath()` | `iterate_devices()` (register) or current_pgpath (reserve) |
+| Failure handling | `m->queued_bios` if no_path_retry=queue | returns -EIO immediately |
+| Tag | regular blk-mq tag | reserved tag (`BLK_MQ_REQ_RESERVED`) |
+| Insert position | scheduler / normal queue | `BLK_MQ_INSERT_AT_HEAD` |
+| Underlying call | `iscsi_queuecommand()` for I/O | `iscsi_queuecommand()` for passthrough — but on a passthrough request |
 
-Path B dropped by target (same fencing action):
-    │  same sequence as A
-    ▼
-fail_path(path_B) → nr_valid_paths = 0
-
-Now: queue_if_no_path = 1, nr_valid_paths = 0
-    New I/O → queued_ios (HANG until replacement_timeout * num_paths passes)
-
-To avoid the hang:
-    Option 1: no_path_retry = fail      → DM_MAPIO_KILL → -EIO immediately
-    Option 2: no_path_retry = 2         → after 2 retries, switch to fail
-    Option 3: reduce replacement_timeout (e.g. 10s)
-              → fail_path() fires in 10s per path → faster -EIO
-    Option 4: use dmsetup message "fail_if_no_path" explicitly after fencing
-```
+PR commands do hit `iscsi_queuecommand()` like any other command. But the request they're
+attached to has `REQ_OP_DRV_OUT`, was inserted via `BLK_MQ_INSERT_AT_HEAD`, will skip
+`scsi_decide_disposition()` retry/EH on failure (passthrough short-circuit), and is waited on
+synchronously by `blk_execute_rq()`. None of `multipath_map_bio`'s queueing logic is involved.
 
 ---
 
 ## Key takeaways
 
-- `dm_pr_ops.pr_reserve()` = `dm_pr_reserve()` uses `iterate_devices()` to call
-  `blk_pr_reserve()` on EACH path. PR is issued per I_T nexus — every path gets it.
-- `multipath_iterate_devices()` walks ALL paths (active and inactive). PR must be on all paths.
-- `fail_path()` decrements `nr_valid_paths`. When 0: `choose_pgpath()` returns NULL.
-- `reinstate_path()` increments `nr_valid_paths` and drains `queued_ios` via
-  `process_queued_io_list()`.
-- `queue_if_no_path=1` (no_path_retry=queue) + `nr_valid_paths=0` = indefinite bio queue.
-- `queue_if_no_path=0` (no_path_retry=fail) = immediate `-EIO` when all paths gone.
-- The queue hang with session-drop fencing is caused by `replacement_timeout=120s` delay before
-  `fail_path()` fires. Reduce timeout or use `no_path_retry=fail` to avoid this.
-- `dmsetup message dm-X 0 "fail_if_no_path"` switches to fail mode at runtime, draining the
-  queue immediately.
-
----
-
-## Week 2 complete
-
-You now have the full initiator stack: session/connection structs (day 8) → queuecommand and BHS
-building (day 9) → TCP TX path (day 10) → TCP RX path and PDU dispatch (day 11) → session failure
-and EH (day 12) → PR slow path (day 13) → multipath PR and path management (day 14).
-
-Ready to continue with **Week 3: LIO target core internals**.
+- `dm_pr_ops` provides PR for `/dev/mapper/mpathN`. PR REGISTER fans out via `dm_call_pr()` →
+  `iterate_devices()` → `__dm_pr_register()` → `sd_pr_register()` per path.
+- `dm_pr_reserve` only reserves on the active path. With `PR_*_ALL_REGS` types, all registered
+  initiators retain write access.
+- `multipath_map_bio()` is for normal bio I/O only. PR ops never touch it.
+- `m->queued_bios` is the bio hold queue. PR ops never see it.
+- `fail_path()` decrements `nr_valid_paths` and sends a udev event; `multipathd` listens.
+- `reinstate_path()` triggers `process_queued_bios` to drain queued I/O when a path returns.
+- `dmsetup message dm-0 0 fail_if_no_path` is the manual lever to stop the hang — clears
+  `queue_if_no_path` and drains queued bios with -EIO.
+- The two layers (dm-core for PR, dm-mpath for bio) share state but never share code paths —
+  this is what makes PR-based fencing work even when normal I/O is hung.
 
 ---
 
 ## Previous / Next
 
-[Day 13 — PR slow path initiator side](day13.md) | [Day 15 — target core structs](day15.md)
+[Day 13 — PR slow path: initiator side](day13.md) | [Day 15 — target core structs](day15.md)

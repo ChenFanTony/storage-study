@@ -1,98 +1,260 @@
 # Day 25 — session teardown path
 
-**Week 4**: Deep Cuts — TMF, ALUA, configfs, NVMe-oF, Sense Data
-**Time**: 1–2 hours
+**Week 4**: Advanced Topics  
+**Time**: 1–2 hours  
 **Reference**: `drivers/target/iscsi/iscsi_target.c`, `drivers/target/target_core_transport.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-Session teardown is the mechanism by which a target closes a connection and drains all in-flight
-commands safely. It is central to both planned shutdown and fencing. The key requirement: no
-command must be completed after the session memory is freed, and no command must be lost without
-a response. `sess_tearing_down` and `sess_cmd_list` drain are the mechanisms that guarantee this.
+Session teardown is the operation triggered by ACL removal (day 24), TPG disable, or unmounting
+the target stack. It must:
+
+1. Stop accepting new commands on the session.
+2. Drain in-flight commands cleanly (let backend I/O finish, send any pending responses).
+3. Close the TCP socket(s).
+4. Free per-session memory.
+
+Doing this without races against in-flight TMFs, completions, and configfs operations is what
+makes the session-drop-based fencing approach reliable. The session must be GONE — not "going
+away" — by the time the configfs `rmdir` returns, otherwise an admin script that reads
+`/sys/.../sessions` after fencing could see stale state.
+
+---
+
+## Entry points
+
+```
+ACL rmdir → core_tpg_del_initiator_node_acl()
+    └── for each session: iscsit_close_session(sess, force=1)
+
+TPG disable (force=1) → iscsit_tpg_disable_portal_group()
+    └── for each session in TPG: iscsit_close_session()
+
+Connection failure (RX/TX error)
+    └── iscsit_take_action_for_connection_exit()
+        └── iscsit_close_connection()
+            └── if last connection: iscsit_close_session()
+
+Logout PDU received from initiator
+    └── iscsit_logout_post_handler() → iscsit_close_session()
+```
+
+All paths converge on `iscsit_close_session()` for full session teardown, or
+`iscsit_close_connection()` for per-connection teardown when MC/S has more connections.
 
 ---
 
 ## iscsit_close_session — `drivers/target/iscsi/iscsi_target.c`
 
 ```c
-void iscsit_close_session(struct se_session *se_sess)
+/* Simplified — see drivers/target/iscsi/iscsi_target.c. */
+void iscsit_close_session(struct iscsi_session *sess)
 {
-    struct iscsi_session *sess = se_sess->fabric_sess_ptr;
+    struct iscsi_portal_group *tpg = sess->tpg;
+    struct se_session *se_sess = sess->se_sess;
+    struct iscsit_conn *conn, *tmp;
 
     /*
-     * Step 1: Mark session as being torn down.
-     * New commands arriving after this point are rejected:
-     * transport_lookup_cmd_lun() checks sess_tearing_down and returns
-     * TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE for new commands.
+     * Step 1: mark session as terminating.
+     * Block new logins on additional connections (MC/S).
      */
-    spin_lock_bh(&se_sess->sess_cmd_lock);
-    se_sess->sess_tearing_down = 1;
-    spin_unlock_bh(&se_sess->sess_cmd_lock);
+    spin_lock_bh(&sess->session_lock);
+    sess->session_state = TARG_SESS_STATE_LOGGED_IN;
+    sess->session_state = TARG_SESS_STATE_FREE;
+    spin_unlock_bh(&sess->session_lock);
 
     /*
-     * Step 2: Close all connections on this session.
+     * Step 2: close all connections in this session. In MC/S=1 (the
+     * common case) there's just sess->leadconn; with MC/S>1 the kernel
+     * walks sess->sess_conn_list. Connection close stops the RX/TX
+     * threads and closes sockets.
      */
-    iscsit_close_connection(sess->leadconn);
+    list_for_each_entry_safe(conn, tmp, &sess->sess_conn_list, conn_list) {
+        iscsit_cause_connection_reinstatement(conn, 1 /* sleep */);
+        /* This signals the RX kthread to exit. The TX kthread sees
+         * the wait_event condition flip and also exits. */
+    }
 
     /*
-     * Step 3: Wait for all in-flight commands to drain.
-     * Blocks until sess_cmd_list is empty.
+     * Step 3: wait for all in-flight commands to release.
+     * target_wait_for_sess_cmds() walks se_sess->sess_cmd_list and
+     * blocks until every cmd's kref drops to zero (commands completing
+     * normally, or being aborted by TMR).
      */
     target_wait_for_sess_cmds(se_sess);
 
     /*
-     * Step 4: Release the session memory.
+     * Step 4: free per-session resources.
      */
-    iscsit_dec_session_usage_count(sess);
-    target_put_session(se_sess);
+    iscsit_release_commands_from_conn(NULL, sess);
+    transport_free_session(se_sess);
+    kfree(sess);
 }
 ```
 
 ---
 
-## iscsit_close_connection — `drivers/target/iscsi/iscsi_target.c`
+## iscsit_cause_connection_reinstatement — kicking the threads out
 
 ```c
-int iscsit_close_connection(struct iscsi_conn *conn)
+/* Simplified. */
+void iscsit_cause_connection_reinstatement(struct iscsit_conn *conn, int sleep)
 {
-    struct iscsi_session *sess = conn->sess;
+    /* signal RX/TX threads */
+    spin_lock_bh(&conn->state_lock);
+    conn->conn_state = TARG_CONN_STATE_IN_LOGOUT;
+    spin_unlock_bh(&conn->state_lock);
 
     /*
-     * Optional: send Async PDU requesting logout before closing.
-     * ISCSI_ASYNC_MSG_REQUEST_LOGOUT:
-     *   Tells initiator: logout gracefully, Time2Wait=0, Time2Retain=0.
-     *   Cleaner than abrupt TCP RST — gives initiator a chance to
-     *   complete in-flight commands before the connection closes.
-     *
-     * If the connection is already broken (TCP error), this is skipped.
+     * Force socket-level errors so RX thread's recv returns -EINTR
+     * and TX thread's send returns -EPIPE.
+     * sk_state_change → wakes any blocked socket calls.
      */
-    if (!conn->conn_logout_reason &&
-        sess->sess_ops->SessionType == NORMAL_SESSION) {
-        iscsit_send_async_msg(conn, conn->cid,
-                               ISCSI_ASYNC_MSG_REQUEST_LOGOUT, 0);
+    if (conn->sock) {
+        struct sock *sk = conn->sock->sk;
+
+        sk->sk_err = ECONNRESET;
+        sk->sk_state_change(sk);
     }
 
     /*
-     * Stop the TX kthread.
-     * kthread_stop() + flush_work() drains any pending PDU sends.
-     * No more data is sent to the initiator after this.
+     * If sleep=1, wait for both threads to exit.
      */
-    iscsit_stop_tx_thread(conn);
+    if (sleep) {
+        if (conn->tx_thread)
+            kthread_stop(conn->tx_thread);
+        if (conn->rx_thread)
+            kthread_stop(conn->rx_thread);
+    }
+}
+```
+
+The forced socket error ensures the threads wake up promptly. Without it, an idle RX thread
+blocked in `tcp_read_sock()` would never notice that the session is being torn down.
+
+---
+
+## iscsit_release_commands_from_conn — flagging in-flight commands
+
+```c
+/* Simplified — see drivers/target/iscsi/iscsi_target.c. */
+void iscsit_release_commands_from_conn(struct iscsit_conn *conn,
+                                          struct iscsi_session *sess)
+{
+    struct iscsit_cmd *cmd, *tmp;
+    struct se_session *se_sess = sess->se_sess;
+    struct se_cmd *se_cmd;
 
     /*
-     * Stop the RX kthread.
-     * Any partially-received PDU is abandoned.
+     * Walk the session's in-flight commands. For each:
+     *   1. Take a kref (so cmd can't free under us).
+     *   2. Set CMD_T_FABRIC_STOP — tells target core "fabric is going,
+     *      don't send any more responses for this command."
+     *   3. Drop kref.
+     *
+     * The actual completion drainage happens via
+     * target_wait_for_sess_cmds() called next.
      */
-    iscsit_stop_rx_thread(conn);
+    spin_lock(&se_sess->sess_cmd_lock);
+    list_for_each_entry_safe(se_cmd, tmp, &se_sess->sess_cmd_list,
+                              se_cmd_list) {
+        if (!target_get_sess_cmd_kref(se_cmd))
+            continue;
+
+        spin_lock(&se_cmd->t_state_lock);
+        se_cmd->transport_state |= CMD_T_FABRIC_STOP;
+        spin_unlock(&se_cmd->t_state_lock);
+
+        spin_unlock(&se_sess->sess_cmd_lock);
+
+        /*
+         * Wake any backend thread waiting for fabric to do something
+         * (e.g., write_pending data delivery).
+         */
+        complete(&se_cmd->t_transport_stop_comp);
+
+        target_put_sess_cmd(se_cmd);
+        spin_lock(&se_sess->sess_cmd_lock);
+    }
+    spin_unlock(&se_sess->sess_cmd_lock);
+}
+```
+
+`CMD_T_FABRIC_STOP` (added around 2017) is the marker that distinguishes "fabric is going away,
+let in-flight I/O drain naturally" from `CMD_T_ABORTED` (per-command TMF abort). Backend
+completion paths check this flag and skip fabric callbacks like `queue_data_in` /
+`queue_status` — there's no point sending PDUs on a closed socket.
+
+---
+
+## target_wait_for_sess_cmds — the drain
+
+```c
+/* Simplified — see drivers/target/target_core_transport.c. */
+void target_wait_for_sess_cmds(struct se_session *se_sess)
+{
+    struct se_cmd *se_cmd, *tmp_cmd;
+    bool rc = false;
+    unsigned long flags;
+
+    spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
+    list_for_each_entry_safe(se_cmd, tmp_cmd,
+                              &se_sess->sess_cmd_list, se_cmd_list) {
+        list_del_init(&se_cmd->se_cmd_list);
+        spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+
+        /*
+         * Wait for this command's kref to drop to zero.
+         * Backend completion / TMR processing decrements the kref
+         * (via target_release_cmd_kref) — eventually it hits zero.
+         *
+         * For commands stuck in backend (e.g., a long-running write to
+         * a slow-responding iblock device), this can take a while.
+         * The original wait used a 20-second warning loop; modern code
+         * uses wait_event() on a session-wide predicate, with a periodic
+         * pr_warn loop if drainage takes too long.
+         */
+        rc = wait_event_timeout(se_cmd->free_wait,
+                                  kref_read(&se_cmd->cmd_kref) == 0,
+                                  msecs_to_jiffies(20 * 1000));
+        if (!rc)
+            pr_warn("se_cmd %p still has refs after 20s\n", se_cmd);
+
+        spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
+    }
+    spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+}
+```
+
+This is the key drain function. By the time `target_wait_for_sess_cmds()` returns, every command
+that was on `sess_cmd_list` has been freed via `target_release_cmd_kref()`. The session is
+quiescent.
+
+---
+
+## Connection close — sockets and threads
+
+```c
+/* Simplified. */
+int iscsit_close_connection(struct iscsit_conn *conn)
+{
+    /* stop RX thread */
+    if (conn->rx_thread)
+        kthread_stop(conn->rx_thread);
+    /* stop TX thread */
+    if (conn->tx_thread)
+        kthread_stop(conn->tx_thread);
 
     /*
-     * Close the TCP socket.
-     * sock_release() sends TCP FIN (graceful) or RST (if send buffer has data).
-     * On initiator: sk_state_change callback fires ->
-     *   iscsi_sw_tcp_state_change() -> iscsi_conn_failure(ISCSI_ERR_CONN_FAILED).
+     * Release the socket. sock_release calls sock->ops->release which
+     * for TCP issues either a graceful close (FIN) or an abrupt close
+     * (RST) depending on socket state — if the send buffer has data
+     * outstanding and SO_LINGER is not set, it tends to FIN; under
+     * load with unsent data it may RST. The choice depends on the
+     * exact socket state and configuration.
      */
     if (conn->sock) {
         sock_release(conn->sock);
@@ -100,287 +262,148 @@ int iscsit_close_connection(struct iscsi_conn *conn)
     }
 
     /*
-     * Abort all commands on this connection.
-     * Sets CMD_T_ABORTED | CMD_T_FABRIC_STOP on each se_cmd.
-     * Backend I/O continues to completion, but no response PDU is sent.
-     * Each completed command calls target_put_sess_cmd() which drains
-     * from sess_cmd_list, eventually completing the wait in
-     * target_wait_for_sess_cmds().
+     * Drop conn from session's connection list.
      */
-    iscsit_release_commands_from_conn(conn);
+    spin_lock_bh(&conn->sess->conn_lock);
+    list_del(&conn->conn_list);
+    conn->sess->nconn--;
+    spin_unlock_bh(&conn->sess->conn_lock);
+
+    /* Free per-conn buffers, login state, etc. */
+    iscsit_free_conn(conn);
 
     return 0;
 }
 ```
 
----
+The TCP RST vs FIN distinction matters for the initiator's experience:
 
-## iscsit_release_commands_from_conn — aborting in-flight commands
+- **FIN (graceful close)**: initiator's RX gets `read() = 0`, treated as clean disconnect.
+  `iscsi_conn_failure(ISCSI_ERR_CONN_FAILED)` runs. Session enters recovery.
+- **RST (abrupt close)**: initiator's RX gets `-ECONNRESET`. Same `iscsi_conn_failure()` runs,
+  same recovery.
 
-```c
-static void iscsit_release_commands_from_conn(struct iscsi_conn *conn)
-{
-    struct iscsit_cmd *cmd, *cmd_tmp;
-    struct se_cmd *se_cmd;
-
-    spin_lock_bh(&conn->cmd_lock);
-
-    list_for_each_entry_safe(cmd, cmd_tmp,
-                              &conn->conn_cmd_list, i_conn_node) {
-        se_cmd = &cmd->se_cmd;
-
-        spin_lock(&se_cmd->t_state_lock);
-
-        if (se_cmd->transport_state & CMD_T_COMPLETE) {
-            spin_unlock(&se_cmd->t_state_lock);
-            continue;  /* already done — nothing to do */
-        }
-
-        /*
-         * CMD_T_ABORTED: checked in target_execute_cmd() before dispatch.
-         * If set before the command reaches the backend:
-         *   command is skipped entirely (not submitted to iblock/fileio).
-         *
-         * CMD_T_FABRIC_STOP: tells target_complete_cmd() not to call
-         *   se_tfo->queue_status() — no response PDU is sent.
-         *   The fabric (iSCSI) layer is already gone.
-         */
-        se_cmd->transport_state |= CMD_T_ABORTED | CMD_T_FABRIC_STOP;
-
-        spin_unlock(&se_cmd->t_state_lock);
-    }
-
-    spin_unlock_bh(&conn->cmd_lock);
-}
-```
+In practice the path is nearly identical from the initiator's perspective. What matters more is
+whether the target sent an Async PDU `REQUEST_LOGOUT` (day 19) BEFORE closing the socket —
+that's the difference between "fenced cleanly" and "session just dropped".
 
 ---
 
-## target_wait_for_sess_cmds — `drivers/target/target_core_transport.c`
+## The clean fencing protocol (target-driven)
 
-```c
-void target_wait_for_sess_cmds(struct se_session *se_sess)
-{
-    struct se_cmd *se_cmd;
-    unsigned long flags;
+A well-behaved fencing implementation on the target side does this:
 
-    /*
-     * Walk sess_cmd_list and identify any commands needing TAS
-     * (Task Aborted Status). TAS commands get SAM_STAT_TASK_ABORTED
-     * sent to the initiator to inform it the command was aborted.
-     *
-     * For fencing teardown: CMD_T_FABRIC_STOP is set, so queue_status()
-     * is not called. TAS is only relevant for planned shutdowns where
-     * the fabric is still alive.
-     */
-    spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
-    list_for_each_entry(se_cmd, &se_sess->sess_cmd_list, se_cmd_list) {
-        bool aborted = !!(se_cmd->transport_state & CMD_T_ABORTED);
-        pr_debug("Waiting for se_cmd %p (aborted=%d)\n",
-                 se_cmd, aborted);
-    }
-    spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
-
-    /*
-     * The actual wait.
-     * sess_wait_comp is completed in target_release_cmd_kref()
-     * when the last se_cmd is removed from sess_cmd_list.
-     *
-     * This may take up to the maximum backend I/O latency:
-     * for spinning disks, potentially seconds.
-     * For fast NVMe backends: microseconds to milliseconds.
-     */
-    wait_for_completion(&se_sess->sess_wait_comp);
-}
-EXPORT_SYMBOL(target_wait_for_sess_cmds);
+```
+1. Cluster decides node A is fenced.
+2. Target admin runs:
+     a. iscsit_send_async_msg(conn, ASYNC_MSG_REQUEST_LOGOUT)
+        Initiator sees the Async PDU, calls iscsi_conn_failure() to
+        start clean session recovery. open-iscsi userspace would attempt
+        to log back in, but ACL is gone, login rejected.
+     b. (after small delay)
+        rmdir /sys/.../acls/iqn.client.A
+        Forcibly closes session if still up. Future logins from this
+        IQN are rejected at LoginRequest with status class 0x02.
+3. Initiator's recovery_tmo (replacement_timeout, default 120s from
+   open-iscsi userspace, pushed to kernel via sysfs) expires.
+4. ISCSI_STATE_RECOVERY_FAILED → all I/O fails with
+   DID_TRANSPORT_FAILFAST → BLK_STS_TRANSPORT.
+5. dm-multipath fail_path() per path → nr_valid_paths reaches 0.
+6. With no_path_retry=queue: bios queue in m->queued_bios → application
+   hangs forever (the desired fenced state).
+   Without queue_if_no_path: bios fail with -EIO → application sees
+   immediate error (hot-fence semantics).
 ```
 
-The completion is triggered in `target_release_cmd_kref()` (called from `target_put_sess_cmd()`
-when the command reference reaches zero):
-
-```c
-static void target_release_cmd_kref(struct kref *kref)
-{
-    struct se_cmd *se_cmd = container_of(kref, struct se_cmd, cmd_kref);
-    struct se_session *se_sess = se_cmd->se_sess;
-    struct completion *compl = NULL;
-    unsigned long flags;
-
-    spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
-
-    /* remove from sess_cmd_list */
-    list_del_init(&se_cmd->se_cmd_list);
-
-    /*
-     * If session teardown is waiting AND the list is now empty:
-     * signal the waiter in target_wait_for_sess_cmds().
-     */
-    if (se_sess->sess_tearing_down && list_empty(&se_sess->sess_cmd_list))
-        compl = &se_sess->sess_wait_comp;
-
-    spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
-
-    /* release LUN reference */
-    if (se_cmd->lun_ref_active)
-        percpu_ref_put(&se_cmd->se_lun->lun_ref);
-
-    /* free SGL pages */
-    transport_free_pages(se_cmd);
-
-    /* fabric-specific cleanup */
-    se_cmd->se_tfo->release_cmd(se_cmd);
-
-    /* wake teardown waiter — after all cleanup is done */
-    if (compl)
-        complete(compl);
-}
-```
-
-Memory safety is guaranteed: `complete(compl)` is called only AFTER `se_cmd->se_tfo->release_cmd()`
-— which frees the `iscsit_cmd` embedding the `se_cmd`. The waiter in `target_wait_for_sess_cmds()`
-wakes after all commands are freed, not before.
+The Async PDU step is courtesy. Without it, the initiator's first hint of trouble is the TCP
+disconnect — same end result, just less friendly.
 
 ---
 
-## sess_tearing_down as a gate for new commands
+## Why MC/S complicates the picture
 
-```c
-/* transport_lookup_cmd_lun() in target_core_transport.c */
-sense_reason_t transport_lookup_cmd_lun(struct se_cmd *se_cmd, u64 unpacked_lun)
-{
-    struct se_session *se_sess = se_cmd->se_sess;
-    unsigned long flags;
+Multiple Connections per Session lets one iSCSI session span multiple TCP connections — useful
+for bandwidth aggregation. For session teardown:
 
-    spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
+- `iscsit_close_connection()` only closes one connection.
+- If other connections still exist, the session stays alive (degraded) — initiator may keep
+  using it via the surviving connection.
+- For fencing, you must close ALL connections OR force `iscsit_close_session()` which iterates
+  the whole list.
 
-    if (se_sess->sess_tearing_down) {
-        /*
-         * Session is closing. Reject new commands immediately.
-         * The se_cmd is NOT added to sess_cmd_list.
-         * transport_generic_request_failure() will be called,
-         * which calls target_complete_cmd() with COMMUNICATION_FAILURE.
-         * Since CMD_T_FABRIC_STOP is set, no response PDU is sent.
-         */
-        spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
-        return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
-    }
+`rmdir` of an ACL takes the second path: it iterates all sessions of all connections.
 
-    /*
-     * Add to sess_cmd_list for teardown tracking.
-     * This reference is dropped by target_put_sess_cmd().
-     */
-    list_add_tail(&se_cmd->se_cmd_list, &se_sess->sess_cmd_list);
-
-    spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
-
-    /* proceed with LUN resolution */
-    return TCM_NO_SENSE;
-}
-```
+In practice, MC/S is rarely deployed (most iSCSI uses dm-multipath instead, with one connection
+per session per path). The kernel supports it but most production setups have `nconn=1`.
 
 ---
 
-## Complete fencing teardown timeline
+## Race analysis: rmdir vs in-flight TMF
+
+Consider:
+- Thread A: configfs `rmdir` of node A's ACL.
+- Thread B: TMF (LUN_RESET) sent by node A still in flight.
 
 ```
-Admin: targetcli acls delete wwn=<initiator_iqn>
-    │
-    ▼  core_tpg_del_initiator_node_acl()
-    │   list_del(&acl->acl_list)     ← login check returns NULL immediately
-    │   se_tfo->close_session()      ← for each active session
-    │
-    ▼  iscsit_close_session(se_sess)
-    │   sess_tearing_down = 1        ← new commands rejected
-    │
-    ▼  iscsit_close_connection(conn)
-    │   iscsit_send_async_msg(REQUEST_LOGOUT)  ← clean signal to initiator
-    │   iscsit_stop_tx_thread()
-    │   iscsit_stop_rx_thread()
-    │   sock_release()               ← TCP FIN/RST sent
-    │   iscsit_release_commands_from_conn()
-    │       CMD_T_ABORTED | CMD_T_FABRIC_STOP set on all in-flight cmds
-    │
-    ▼  target_wait_for_sess_cmds(se_sess)
-    │   [blocks until sess_cmd_list is empty]
-    │
-    │   [parallel: in-flight backend I/O completes]
-    │   iblock_bio_done() -> target_complete_cmd()
-    │     CMD_T_ABORTED set: route to aborted path
-    │     CMD_T_FABRIC_STOP set: no response PDU
-    │     target_put_sess_cmd() -> kref drops to 0
-    │     target_release_cmd_kref()
-    │       list_del(&se_cmd->se_cmd_list)
-    │       if list_empty: complete(&sess_wait_comp)
-    │
-    ▼  target_wait_for_sess_cmds() returns
-    │   target_put_session(se_sess) ← free session memory
-    │   target_put_nacl(acl)        ← free ACL
-    │
-    [On initiator — parallel timeline]
-    TCP FIN/RST -> iscsi_conn_failure(ISCSI_ERR_CONN_FAILED)
-    session->state = ISCSI_STATE_FAILED
-    iscsid reconnect loop begins:
-        Login PDU sent to target
-        target: core_tpg_check_initiator_node_acl() returns NULL
-        target sends Login Response: ISCSI_STATUS_CLS_INITIATOR_ERR
-        iscsid: login failed -> wait and retry (iscsi_session_recovery_timedout)
-    [120 seconds later, replacement_timeout fires]
-    session->state = ISCSI_STATE_RECOVERY_FAILED
-    iscsi_session_chkready() returns DID_TRANSPORT_FAILFAST
-    SCSI EH: DID_NO_CONNECT on all held commands
-    blk_mq_complete_request() -> dm-multipath multipath_end_io()
-    blk_path_error() = true -> fail_path(pgpath)
-    atomic_dec(&m->nr_valid_paths)
-    [if last path]: nr_valid_paths = 0
-    Application I/O: queued (no_path_retry=queue) or -EIO (no_path_retry=fail)
+Time   Thread A (rmdir)                       Thread B (TMR work)
+─────  ──────────────────────                ──────────────────────
+T0     core_tpg_del_initiator_node_acl()     in core_tmr_lun_reset()
+T1     walks sess_conn_list                  walking sess_cmd_list
+T2     finds active session                   takes krefs on commands
+T3     starts iscsit_close_session()
+T4                                            calls target_handle_aborted_cmd
+T5     calls iscsit_release_commands_from_conn
+T6                                            wait_for_completion_timeout()
+T7     target_wait_for_sess_cmds()
+       (waits for kref to drop)
+T8                                            target_put_sess_cmd() final
+T9     proceeds, frees session
 ```
+
+The kref-during-walk pattern in TMR (day 17, day 22) is what saves us. Even though `rmdir` is
+trying to free everything, the TMR has krefs that prevent free. Once TMR completes its drain,
+those krefs drop, and `rmdir` can proceed.
+
+`target_tmr_wq` being `__WQ_ORDERED` also helps — at most one TMR is in flight per device, so
+Thread B's wait above is a finite operation.
 
 ---
 
-## Tuning replacement_timeout for faster fencing
+## Sysfs visibility during teardown
 
-The 120-second default `replacement_timeout` means the full fencing sequence takes ~120s per
-path. For HA environments this is often too long.
+While teardown is in progress, other userspace tools may read
+`/sys/kernel/config/target/iscsi/.../sessions` or similar. The configfs node hasn't been removed
+yet; `rmdir` is blocked in the kernel. Reading the session info would block on the same lock.
 
-```bash
-# On the initiator — reduce replacement_timeout to 10 seconds
-# Applied per target node in /etc/iscsi/nodes/<target>/<ip>/default
-iscsiadm -m node -T <target_iqn> -p <ip>:<port> \
-    --op update -n node.session.timeo.replacement_timeout -v 10
-
-# Verify
-iscsiadm -m node -T <target_iqn> -p <ip>:<port> --op show | \
-    grep replacement_timeout
-```
-
-With `replacement_timeout=10`, fencing completes in ~10s per path instead of ~120s. The tradeoff:
-transient network blips that recover in 10-120s will now cause unnecessary path failures.
-
-For a production fencing system, a good balance is `replacement_timeout=30` combined with
-`no_path_retry=fail` to get fast error propagation without excessively triggering on flaps.
+For administration scripts: never assume `rmdir` returns instantly. With slow backends or many
+in-flight commands, it can take seconds. The 20-second warning in `target_wait_for_sess_cmds()`
+gives an upper-bound expectation; in practice well-tuned setups complete in < 1s.
 
 ---
 
 ## Key takeaways
 
-- `iscsit_close_session()` is the teardown entry point: sets `sess_tearing_down`, closes
-  connections, waits for `sess_cmd_list` to drain, then frees memory.
-- `sess_tearing_down = 1` gates new commands: `transport_lookup_cmd_lun()` rejects them.
-- `iscsit_close_connection()` optionally sends `ASYNC_MSG_REQUEST_LOGOUT` (clean fencing signal),
-  stops TX/RX threads, closes TCP socket, sets `CMD_T_ABORTED | CMD_T_FABRIC_STOP` on all cmds.
-- `CMD_T_FABRIC_STOP`: no response PDU sent. `CMD_T_ABORTED`: don't dispatch to backend (if not
-  yet submitted); if already in backend, complete with aborted status when backend finishes.
-- `target_wait_for_sess_cmds()` blocks on `sess_wait_comp`. Signalled in
-  `target_release_cmd_kref()` when `sess_cmd_list` becomes empty after the last command drops
-  its reference — guaranteeing memory is freed only after all commands are done.
-- `core_tpg_del_initiator_node_acl()` removes ACL first (blocking reconnect), then calls
-  `close_session()` for each active session. Order matters: removing ACL first prevents race
-  where session closes but initiator reconnects before ACL is removed.
-- `replacement_timeout` (default 120s) controls how long the initiator waits before declaring
-  the session permanently failed. Reduce it for faster HA failover.
+- Session teardown enters via `iscsit_close_session()`, called from ACL removal, TPG disable,
+  Logout PDU, or connection failure.
+- `iscsit_cause_connection_reinstatement()` forces socket errors to wake the RX/TX threads,
+  then `kthread_stop()` waits for them to exit.
+- `iscsit_release_commands_from_conn()` sets `CMD_T_FABRIC_STOP` on each in-flight command —
+  signals backend "don't bother sending fabric responses for these".
+- `target_wait_for_sess_cmds()` is the kref-based drain. Returns when every command has been
+  released via `target_release_cmd_kref()`. Has a 20-second warning loop for stuck commands.
+- TCP close may produce FIN or RST depending on socket buffer state and configuration. Both
+  trigger `iscsi_conn_failure()` on the initiator — same recovery path.
+- The clean target-side fencing protocol: send `ASYNC_MSG_REQUEST_LOGOUT`, then `rmdir` ACL.
+- MC/S complicates teardown — must close ALL connections; rare in practice (most setups use
+  dm-multipath instead).
+- The kref-during-walk pattern in TMR + `target_tmr_wq` ordering prevents races between
+  in-flight TMFs and configfs teardown.
+- `replacement_timeout` (default 120s, set from open-iscsi userspace via sysfs) is the
+  initiator-side bound on how long held I/O waits before failing with
+  `DID_TRANSPORT_FAILFAST`.
 
 ---
 
 ## Previous / Next
 
-[Day 24 — configfs: LIO control plane](day24.md) | [Day 26 — NVMe-oF target fabric](day26.md)
+[Day 24 — configfs control plane](day24.md) | [Day 26 — NVMe-oF target fabric comparison](day26.md)

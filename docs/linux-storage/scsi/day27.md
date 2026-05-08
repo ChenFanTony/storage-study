@@ -1,390 +1,445 @@
 # Day 27 — iSCSI login sequence
 
-**Week 4**: Deep Cuts — TMF, ALUA, configfs, NVMe-oF, Sense Data
-**Time**: 1–2 hours
-**Reference**: `drivers/target/iscsi/iscsi_target_login.c`, `drivers/target/iscsi/iscsi_target_parameters.c`
+**Week 4**: Advanced Topics  
+**Time**: 1–2 hours  
+**Reference**: `drivers/target/iscsi/iscsi_target_login.c`, `drivers/target/iscsi/iscsi_target_nego.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-The iSCSI Login Phase is a multi-stage negotiation that establishes session and connection
-parameters before any SCSI commands flow. On the target side it runs in a dedicated login thread.
-Understanding the login sequence is critical for two reasons: (1) session parameters negotiated
-here directly control the five write data-flow paths (day 18), and (2) login rejection is the
-mechanism that prevents a fenced initiator from reconnecting.
+The iSCSI Login Phase (RFC 7143 §6) is the most complex part of the protocol. It establishes
+session identity, negotiates parameters (HeaderDigest, DataDigest, MaxRecvDataSegmentLength,
+InitialR2T, ImmediateData, MaxBurstLength, etc.), authenticates the initiator (CHAP or none),
+and assigns the session age. Login is also where ACL enforcement happens — a fenced initiator's
+attempts are rejected here, which is why ACL-based fencing works.
 
 ---
 
-## Login phases
+## Login Phase overview
 
 ```
-iSCSI Login Phase (RFC 7143 section 5):
-
-1. SecurityNegotiation    (optional if authentication enabled)
-   Text key-value pairs: AuthMethod=CHAP/None, CHAP_A=5, etc.
-
-2. LoginOperationalNegotiation
-   Text key-value pairs negotiating all session/connection parameters:
-     InitiatorName=<IQN>         (required)
-     InitiatorAlias=<string>     (optional)
-     TargetName=<IQN>            (required)
-     SessionType=Normal          (or Discovery)
-     MaxConnections=1
-     InitialR2T=Yes/No           ← controls write data paths
-     ImmediateData=Yes/No        ← controls write data paths
-     MaxRecvDataSegmentLength=N
-     FirstBurstLength=N
-     MaxBurstLength=N
-     MaxOutstandingR2T=N
-     DataPDUInOrder=Yes/No
-     DataSequenceInOrder=Yes/No
-     ErrorRecoveryLevel=0/1/2
-     HeaderDigest=None/CRC32C
-     DataDigest=None/CRC32C
-
-3. FullFeaturePhase       (login complete)
-   SCSI commands flow.
+Initiator                                  Target
+─────────                                  ──────
+TCP SYN → SYN/ACK → ACK
+    │
+    │  Login Request (T=0, C=0)
+    │  ----------------------------→
+    │  opcode = 0x03
+    │  CSG=0, NSG=0 (SecurityNegotiation)
+    │  ISID, TSIH=0 (new session)
+    │  CmdSN=0, ExpStatSN=0
+    │  text params: InitiatorName=, TargetName=, AuthMethod=
+    │
+    │                              Login Response (T=0)
+    │  ←----------------------------
+    │  status_class=0, status_detail=0 (success)
+    │  TSIH assigned
+    │  text params: AuthMethod=CHAP (or None)
+    │
+    │  Login Request (CHAP_A, CHAP_I, CHAP_C exchange, multiple PDUs)
+    │  ←--------- CHAP challenge -----
+    │  ----------- CHAP response ---→
+    │  ←--------- success ------------
+    │
+    │  Login Request (T=1, C=0)
+    │  ----------------------------→
+    │  CSG=1, NSG=3 (move to FullFeaturePhase)
+    │  text params: HeaderDigest=, DataDigest=, MaxRecvDataSegmentLength=,
+    │               InitialR2T=, ImmediateData=, ...
+    │
+    │                              Login Response (T=1, NSG=3)
+    │  ←----------------------------
+    │  status_class=0 (success)
+    │  text params: negotiated values
+    │
+[FullFeaturePhase begins — SCSI commands now allowed]
 ```
 
-Login PDUs use opcode `0x03` (Login Request) and `0x23` (Login Response).
+CSG = Current Stage, NSG = Next Stage. Stages:
+- 0 = SecurityNegotiation
+- 1 = LoginOperationalNegotiation
+- 3 = FullFeaturePhase
 
 ---
 
-## iscsi_target_login_thread — `drivers/target/iscsi/iscsi_target_login.c`
+## Login PDU structure
 
-```c
-static int iscsi_target_login_thread(void *arg)
-{
-    struct iscsi_np *np = arg;   /* network portal (IP:port listener) */
-    int ret;
-
-    allow_signal(SIGINT);
-
-    while (!kthread_should_stop()) {
-        /*
-         * Accept new TCP connection on the portal socket.
-         * This is a blocking accept() call.
-         */
-        ret = iscsi_target_accept_np(np, current);
-        if (ret == -EINTR)
-            break;
-        if (ret < 0)
-            continue;
-
-        /*
-         * Handle the login for the new connection.
-         * Spawns a per-connection login handler.
-         */
-        ret = iscsi_target_do_login_rx(np, &np->np_login_timer);
-        if (ret < 0)
-            iscsit_close_connection(np->np_connection);
-    }
-
-    return 0;
-}
-```
-
----
-
-## iscsit_process_login — the core login handler
-
-```c
-static int iscsit_process_login(struct iscsi_conn *conn,
-                                 struct iscsi_login *login)
-{
-    struct iscsi_login_req *login_req;
-    struct iscsi_login_rsp *login_rsp;
-    int err;
-    u8 login_rsp_status = ISCSI_STATUS_CLS_SUCCESS;
-
-    login_req = (struct iscsi_login_req *)login->req;
-    login_rsp = (struct iscsi_login_rsp *)login->rsp;
-
-    /*
-     * Stage dispatch — process each login stage.
-     */
-    switch (ISCSI_LOGIN_CURRENT_STAGE(login_req->flags)) {
-    case ISCSI_SECURITY_NEGOTIATION_STAGE:
-        err = iscsi_target_do_authentication(conn, login);
-        if (err < 0)
-            return err;
-        break;
-
-    case ISCSI_OP_PARMS_NEGOTIATION_STAGE:
-        /*
-         * Process operational parameters.
-         * iscsit_login_rx_data_from_ini() reads key=value pairs.
-         * iscsit_login_set_conn_values() applies them.
-         */
-        err = iscsi_target_handle_csg_one(conn, login);
-        if (err < 0)
-            return err;
-
-        if (ISCSI_LOGIN_NEXT_STAGE(login_req->flags) ==
-            ISCSI_FULL_FEATURE_PHASE) {
-            /*
-             * Login complete. Transition to FullFeaturePhase.
-             * This is where we check if the initiator is allowed.
-             */
-            err = iscsi_target_do_tx_login_rsp(conn, login,
-                ISCSI_STATUS_CLS_SUCCESS);
-
-            /* Start the RX/TX kthreads for the connection */
-            iscsit_start_kthreads(conn);
-        }
-        break;
-    }
-
-    return 0;
-}
-```
-
----
-
-## ACL check during login — the fencing gate
-
-```c
-/* in iscsi_target_login.c — called during OPERATIONAL_NEGOTIATION stage */
-static int iscsi_login_negotiate_tpg_params(struct iscsi_conn *conn,
-                                             struct iscsi_login *login)
-{
-    struct iscsi_tpg_np *tpg_np = conn->tpg_np;
-    struct iscsi_portal_group *tpg = tpg_np->tpg;
-    struct se_node_acl *se_nacl;
-    char *initiatorname = login->req_buf; /* parsed from InitiatorName= key */
-
-    /*
-     * Check if this initiator is allowed to access this target.
-     * core_tpg_check_initiator_node_acl() searches tpg->acl_node_list
-     * for a matching IQN.
-     *
-     * If ACL was removed (fencing): returns NULL.
-     */
-    se_nacl = core_tpg_check_initiator_node_acl(
-        &tpg->tpg_se_tpg, initiatorname);
-
-    if (!se_nacl) {
-        /*
-         * Initiator not found in ACL list.
-         * If generate_node_acl=1 (dynamic ACLs): create ACL dynamically.
-         * If generate_node_acl=0 (static ACLs, default): REJECT.
-         */
-        if (!tpg->tpg_attrib.generate_node_acl) {
-            /*
-             * Send Login Response with failure status.
-             * Status-Class: 0x02 (Initiator Error)
-             * Status-Detail: 0x01 (Initiator Not Authorized / Not Found)
-             *
-             * On initiator: iscsi_login_failed() -> iscsi_conn_failure().
-             * Reconnect attempt fails. replacement_timeout counts down.
-             * After timeout: DID_TRANSPORT_FAILFAST -> dm-multipath fail_path().
-             */
-            iscsi_target_do_tx_login_rsp(conn, login,
-                ISCSI_STATUS_CLS_INITIATOR_ERR);
-            return -EPERM;
-        }
-
-        /* dynamic ACL: create and allow */
-        se_nacl = core_tpg_get_initiator_node_acl_dynamic(
-            &tpg->tpg_se_tpg, initiatorname);
-    }
-
-    conn->sess->se_sess->se_node_acl = se_nacl;
-    return 0;
-}
-```
-
----
-
-## Parameter negotiation — `drivers/target/iscsi/iscsi_target_parameters.c`
-
-```c
-/*
- * iscsit_check_login_param() is called for each key=value pair
- * received in Login PDU data segments.
- *
- * The negotiation follows RFC 7143 section 11 rules:
- *   - Initiator proposes a value
- *   - Target accepts, proposes a different value, or rejects
- *   - Final value = min of initiator and target for numeric params
- *   - For boolean params: AND logic (Yes wins only if both agree)
- */
-static int iscsit_check_login_param(struct iscsi_conn *conn,
-                                     struct iscsi_param *param,
-                                     char *value)
-{
-    char *proposer = PTYPE_PROPOSER;
-
-    /*
-     * Apply negotiation rules based on parameter type.
-     * Example: MaxRecvDataSegmentLength
-     *   Type: TYPERANGE (numeric range)
-     *   Rule: take minimum of offered and proposed
-     */
-    switch (param->set_param) {
-    case SET_PARAM_MRDSL:
-        /* MaxRecvDataSegmentLength — our receive limit */
-        return iscsit_check_param_mrdsl(conn, param, value);
-
-    case SET_PARAM_INITIAL_R2T:
-        /*
-         * InitialR2T: Yes or No.
-         * LIO default: Yes (solicited data only).
-         * If initiator proposes No and target accepts No:
-         *   unsolicited Data-Out PDUs allowed (path D in day 18).
-         * If either says Yes: InitialR2T=Yes (path E).
-         *
-         * In practice: set InitialR2T=No + ImmediateData=Yes for best
-         * write performance (single RTT for small writes).
-         */
-        if (!strcmp(value, YES) && !strcmp(param->value, YES))
-            /* both say Yes: agreed */
-            return 0;
-        if (!strcmp(value, NO)) {
-            /* initiator wants No: accept if we allow it */
-            if (tpg_ops->allow_initial_r2t_no)
-                strncpy(param->value, NO, sizeof(param->value));
-        }
-        return 0;
-
-    case SET_PARAM_IMMEDIATE_DATA:
-        /*
-         * ImmediateData: Yes or No.
-         * LIO default: Yes.
-         * If both agree Yes: immediate data in Command PDU allowed (paths B/C).
-         * If either says No: ImmediateData=No (paths D/E only).
-         */
-        if (!strcmp(value, NO))
-            strncpy(param->value, NO, sizeof(param->value));
-        return 0;
-    }
-    return 0;
-}
-```
-
----
-
-## Where negotiated parameters are stored
-
-```c
-/*
- * After login completes, negotiated values are stored in:
- *   conn->conn_ops  (struct iscsi_conn_ops)  — connection-level params
- *   sess->sess_ops  (struct iscsi_sess_ops)  — session-level params
- *
- * conn->conn_ops->MaxRecvDataSegmentLength = negotiated value
- * sess->sess_ops->InitialR2T = negotiated value (Yes/No as bool)
- * sess->sess_ops->ImmediateData = negotiated value
- * sess->sess_ops->FirstBurstLength = negotiated value
- * sess->sess_ops->MaxBurstLength = negotiated value
- *
- * These are READ by:
- *   iscsit_process_scsi_cmd() — to determine write data-flow path (day 18)
- *   iscsit_handle_immediate_data() — to know expected immediate data size
- *   iscsit_request_r2t() — to know FirstBurstLength for R2T size
- *
- * And on the initiator side:
- *   iscsi_prep_scsi_cmd_pdu() — reads session->imm_data_en, first_burst etc.
- *     to set flags in the Command PDU BHS (day 9).
- */
-```
-
----
-
-## Login Response PDU format
+Login Request BHS (48 bytes):
 
 ```
-iSCSI Login Response PDU (48-byte BHS):
-
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|0|  0x23       |T|C|0|0| CSG |  NSG  | Version-max| Version-min|
+|.|I|  Op(0x03) |T|C|. |CSG|NSG|  Ver Max  |  Ver Min            |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| TotalAHSLen   |               DataSegmentLength               |
+|TotalAHSLength |       DataSegmentLength (3 bytes BE)           |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         ISID (6 bytes)                        |
-+               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|               |                    TSIH                       |
+|                                                               |
++                          ISID (6 bytes)                       +
+|                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                           ITT                                 |
+|              ISID (cont)             |          TSIH          |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         Reserved                              |
+|                        ITT                                    |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                          StatSN                               |
+|         CID            |                Reserved              |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         ExpCmdSN                              |
+|                          CmdSN                                |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         MaxCmdSN                              |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Status-Class  | Status-Detail |          Reserved             |
+|                          ExpStatSN                            |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                          Reserved                             |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-Key fields for fencing:
-  Status-Class = 0x00 (Success) or 0x02 (Initiator Error)
-  Status-Detail = 0x01 (Not Authorized / Not Found) when ACL missing
-
-T-bit (Transit): set when login is transitioning to next stage
-C-bit (Continue): set when more Login PDUs follow in this stage
-CSG (Current Stage): 0=SecurityNeg, 1=OpParms, 3=FullFeature
-NSG (Next Stage): target of T-bit transition
 ```
+
+Key bits:
+- `T` (Transit, bit 1 of byte 1): 1 = move to NSG; 0 = stay in CSG
+- `C` (Continue, bit 2): 1 = more PDUs in this stage; 0 = this is the last in stage
+- `I` (Immediate, bit 6 of byte 0): 1 (always for Login)
+
+The data segment carries text-format key=value pairs:
+
+```
+InitiatorName=iqn.2025-01.com.example:host-a\0
+TargetName=iqn.2025-01.com.example:tgt0\0
+HeaderDigest=None\0
+DataDigest=None\0
+DefaultTime2Wait=0\0
+DefaultTime2Retain=0\0
+MaxConnections=1\0
+MaxBurstLength=262144\0
+FirstBurstLength=65536\0
+MaxRecvDataSegmentLength=65536\0
+InitialR2T=Yes\0
+ImmediateData=Yes\0
+ErrorRecoveryLevel=0\0
+```
+
+---
+
+## Login thread on the target — `drivers/target/iscsi/iscsi_target_login.c`
+
+```c
+/* Simplified — see drivers/target/iscsi/iscsi_target_login.c. */
+int iscsi_target_login_thread(void *arg)
+{
+    struct iscsi_np *np = arg;          /* network portal */
+    struct iscsit_conn *conn;
+    struct sockaddr_storage sock_in;
+    int rc;
+
+    while (!kthread_should_stop()) {
+        /* accept incoming TCP connection */
+        rc = iscsit_accept_np(np, &sock_in);
+        if (rc < 0)
+            break;
+
+        /* allocate connection state */
+        conn = iscsit_alloc_conn(np);
+        if (!conn) {
+            /* close the new socket */
+            continue;
+        }
+
+        /*
+         * Drive the per-connection login state machine.
+         * iscsi_target_start_negotiation() runs the multi-PDU exchange.
+         */
+        rc = iscsi_target_start_negotiation(conn);
+        if (rc < 0) {
+            iscsit_free_conn(conn);
+            continue;
+        }
+
+        /*
+         * Login complete. Spawn dedicated RX/TX kthreads for this
+         * connection; the login thread loops back to accept the next.
+         */
+        rc = iscsit_post_login_handler(np, conn, ... );
+        if (rc < 0)
+            iscsit_free_conn(conn);
+    }
+
+    return 0;
+}
+```
+
+Each network portal (np) has its own login thread. Multiple portals → multiple login threads
+running in parallel. After login completes, RX/TX threads are spawned and the login thread is
+done with this connection — back to accepting more.
+
+---
+
+## Negotiation — multiple PDU exchange
+
+```c
+/* Simplified. */
+static int iscsi_target_do_login(struct iscsit_conn *conn,
+                                   struct iscsi_login *login)
+{
+    int pdu_count = 0;
+    struct iscsi_login_req *login_req;
+
+    while (!login->login_complete) {
+        /*
+         * Receive a Login Request PDU.
+         */
+        if (iscsi_target_do_login_rx(conn, login) < 0)
+            return -1;
+
+        login_req = (struct iscsi_login_req *)login->req;
+
+        /*
+         * Determine current/next stage from PDU flags.
+         */
+        if (login_req->flags & ISCSI_FLAG_LOGIN_TRANSIT) {
+            switch (login_req->flags & ISCSI_FLAG_LOGIN_NEXT_STAGE_MASK) {
+            case ISCSI_NSG_OP_NEG:
+                /* moving from SecurityNegotiation → OpNegotiation */
+                break;
+            case ISCSI_NSG_FULL_FEATURE:
+                /* moving to FullFeaturePhase — last response sent */
+                login->login_complete = 1;
+                break;
+            }
+        }
+
+        /*
+         * Process the request — parse text, do auth, build response.
+         */
+        switch (current_stage) {
+        case ISCSI_INITIAL_LOGIN_STAGE:
+        case ISCSI_SECURITY_NEGOTIATION_STAGE:
+            iscsi_handle_login_security_negotiation(conn, login);
+            break;
+
+        case ISCSI_OP_PARMS_NEGOTIATION_STAGE:
+            iscsi_handle_login_op_params(conn, login);
+            break;
+        }
+
+        /*
+         * Send Login Response PDU.
+         */
+        if (iscsi_target_do_tx_login_rsp(conn, login) < 0)
+            return -1;
+
+        if (++pdu_count > MAX_LOGIN_PDU_COUNT)
+            return -1;  /* defense against runaway negotiation */
+    }
+
+    return 0;
+}
+```
+
+The exact number of PDUs in a login varies. Minimum:
+- No auth: 1 request + 1 response (T=1, NSG=3 in both, single PDU each direction).
+- CHAP auth: 4–6 request/response pairs (challenge, response, success, then op-params).
+
+---
+
+## ACL enforcement — the fencing hook
+
+After parsing the InitiatorName from the Login Request, the target consults the TPG's ACL list:
+
+```c
+/* Simplified — see drivers/target/iscsi/iscsi_target_login.c. */
+static int iscsi_target_locate_portal(struct iscsi_np *np,
+                                         struct iscsit_conn *conn,
+                                         struct iscsi_login *login)
+{
+    char *initiator_name = login->initiator_name;
+    char *target_name = login->target_name;
+    struct iscsi_tiqn *tiqn;
+    struct iscsi_portal_group *tpg;
+    struct se_node_acl *se_nacl;
+    int ret;
+
+    /*
+     * Find the target IQN configured.
+     */
+    tiqn = iscsit_get_tiqn_for_login(target_name);
+    if (!tiqn) {
+        login->error_class = ISCSI_STATUS_CLS_INITIATOR_ERR;
+        login->error_detail = ISCSI_LOGIN_STATUS_TGT_NOT_FOUND;
+        return -1;
+    }
+
+    /*
+     * Find the appropriate TPG for this initiator.
+     * iscsit_get_tpg_from_np() walks the TPG list and may match
+     * by portal/IQN config.
+     */
+    tpg = iscsit_get_tpg_from_np(tiqn, np, ...);
+    if (!tpg) {
+        login->error_class = ISCSI_STATUS_CLS_INITIATOR_ERR;
+        login->error_detail = ISCSI_LOGIN_STATUS_TGT_NOT_FOUND;
+        return -1;
+    }
+
+    if (!atomic_read(&tpg->tpg_state) == TPG_STATE_ACTIVE) {
+        /* TPG is disabled (echo 0 > enable) */
+        login->error_class = ISCSI_STATUS_CLS_INITIATOR_ERR;
+        login->error_detail = ISCSI_LOGIN_STATUS_SVC_UNAVAILABLE;
+        return -1;
+    }
+
+    /*
+     * *** THE FENCING HOOK ***
+     *
+     * core_tpg_check_initiator_node_acl() is defined in
+     * drivers/target/target_core_tpg.c. It searches the TPG's ACL list
+     * for this initiator IQN and either returns the existing ACL or
+     * (if generate_node_acls=1) creates a placeholder.
+     *
+     * For static ACL mode (generate_node_acls=0), removed initiators
+     * land here with no match → return error.
+     */
+    se_nacl = core_tpg_check_initiator_node_acl(&tpg->tpg_se_tpg,
+                                                  initiator_name);
+    if (!se_nacl) {
+        login->error_class = ISCSI_STATUS_CLS_INITIATOR_ERR;
+        /* "Not Authorized" / "Initiator Not Found" */
+        login->error_detail = ISCSI_LOGIN_STATUS_TGT_FORBIDDEN;
+        return -1;
+    }
+
+    /*
+     * If the ACL has CHAP credentials configured, set up the auth
+     * exchange to use them.
+     */
+    iscsit_set_login_acl(conn, se_nacl);
+    return 0;
+}
+```
+
+When an ACL is removed via `rmdir` (day 24), `core_tpg_check_initiator_node_acl()` returns NULL
+for subsequent login attempts. The login thread sends a Login Response with:
+- `status_class = 0x02` (Initiator Error)
+- `status_detail = 0x03` (Not Authorized) — though specific codes vary; verify against
+  `include/scsi/iscsi_proto.h`
+
+The initiator's `iscsid` sees the rejection, logs it, and (per `node.session.timeo.replacement_timeout`)
+keeps retrying. Each retry hits the same rejection. After `replacement_timeout` expires, the
+initiator declares `RECOVERY_FAILED` and dm-multipath fails the path (day 12).
+
+---
+
+## Login Response status codes
+
+```c
+/* status_class values — see include/scsi/iscsi_proto.h */
+#define ISCSI_STATUS_CLS_SUCCESS              0x00
+#define ISCSI_STATUS_CLS_REDIRECT             0x01  /* try a different portal */
+#define ISCSI_STATUS_CLS_INITIATOR_ERR        0x02  /* most fencing rejections */
+#define ISCSI_STATUS_CLS_TARGET_ERR           0x03  /* target-side problem */
+
+/* status_detail values for INITIATOR_ERR */
+#define ISCSI_LOGIN_STATUS_INIT_ERR           0x00
+#define ISCSI_LOGIN_STATUS_AUTH_FAILED        0x01
+#define ISCSI_LOGIN_STATUS_TGT_FORBIDDEN      0x02  /* not in ACL */
+#define ISCSI_LOGIN_STATUS_TGT_NOT_FOUND      0x03
+#define ISCSI_LOGIN_STATUS_TGT_REMOVED        0x04
+#define ISCSI_LOGIN_STATUS_NO_VERSION         0x05
+/* ... others — verify against your kernel's iscsi_proto.h */
+```
+
+The exact code returned for ACL rejection varies by kernel version; the initiator-visible
+behavior is the same: login fails, retry continues, eventually `replacement_timeout` expires.
 
 ---
 
 ## ErrorRecoveryLevel negotiation
 
+ErrorRecoveryLevel (ERL) determines how much error recovery the protocol will support:
+
+- **ERL=0**: session-level recovery only. On any fatal error, drop the session and reconnect.
+  This is the default and the only level all initiators reliably support.
+- **ERL=1**: Within-Connection recovery. Allows SNACK-based PDU recovery if HeaderDigest or
+  DataDigest detects corruption. Requires both sides to support digest-driven recovery.
+- **ERL=2**: Connection recovery. Allows a connection to be re-established within an active
+  session without losing in-flight commands. Requires task-recovery state machinery on both
+  sides.
+
+In practice, **ERL=0 is what gets used everywhere** for production. The initiator and LIO target
+both negotiate down to the lowest common value, and most setups don't bother enabling ERL > 0.
+
+Mike Christie's 2017 patch series substantially simplified the libiscsi initiator by removing
+unused ERL > 0 code paths. LIO target retains partial ERL=2 support but it is rarely exercised.
+
+For fencing analysis, ERL=0 is the correct mental model — sessions just drop and recover, no
+fancy mid-session recovery to reason about.
+
+---
+
+## Negotiation outcome — what each side advertises
+
 ```c
-/*
- * ErrorRecoveryLevel (ERL) controls what happens on PDU loss:
- *
- * ERL=0 (default, most common):
- *   Connection-level recovery only.
- *   On any error: drop connection, reconnect, restart commands.
- *   Simplest. CmdSN ordering reset on reconnect.
- *
- * ERL=1:
- *   Digest error recovery.
- *   On HeaderDigest mismatch: request retransmit via SNACK.
- *   On DataDigest mismatch: re-request Data-Out.
- *   Connection stays up. Adds SNACK handling complexity.
- *
- * ERL=2 (rarely implemented):
- *   Session-level recovery.
- *   TASK_REASSIGN TMF: move in-flight commands to new connection.
- *   ICF_GOT_LAST_DATAOUT checked to decide if Data-Out restart needed.
- *   Almost never used in practice.
- *
- * For fencing: ERL=0 is the relevant case.
- * On ERL=0, connection drop -> all commands on that connection are
- * lost (no retransmit). iscsit_release_commands_from_conn() handles
- * this by setting CMD_T_ABORTED on all affected commands.
- */
+/* Negotiation rules per RFC 7143 §13 — examples */
+struct iscsi_param_neg {
+    /* HeaderDigest / DataDigest */
+    /* "Supported" types: list intersection. Result is one of the values
+     * present on both sides; "None" if the sets don't overlap. */
+
+    /* MaxRecvDataSegmentLength */
+    /* Each side declares its own — different values per direction.
+     * No negotiation per se; both sides honor the other's value. */
+
+    /* MaxBurstLength, FirstBurstLength */
+    /* Minimum: result = min(initiator's value, target's value). */
+
+    /* InitialR2T, ImmediateData */
+    /* Boolean AND for safer behavior:
+     * InitialR2T=No only if BOTH sides offered No.
+     * ImmediateData=Yes only if BOTH sides agreed Yes. */
+};
 ```
+
+The negotiation outcome shapes the write path (day 18) — Path B/C/D/E selection depends on the
+final InitialR2T and ImmediateData values.
+
+---
+
+## Concurrent login attempts
+
+Multiple initiators logging in simultaneously to the same TPG: each gets its own
+`iscsit_conn`, ACL lookup, parameter negotiation. The login thread serializes accept() but
+the per-connection state machines run concurrently in their own contexts.
+
+For fencing scripts: there is a small race window where a login is in progress at the moment
+`rmdir` of the ACL is called. The login could complete (find the ACL) just before `rmdir`
+deletes it. Mitigations:
+- Disable the TPG (`echo 0 > .../tpgt_1/enable` with force) before rmdir — stops new logins.
+- Delete ACL → kill any new sessions immediately via `iscsit_close_session()` on detect.
+
+In practice, because `replacement_timeout` is 120s by default and the cluster orchestrator
+drives fencing, the small race window is acceptable — within seconds the situation
+reconverges.
 
 ---
 
 ## Key takeaways
 
-- Login is a multi-stage negotiation: SecurityNegotiation → OperationalNegotiation → FullFeature.
-- `core_tpg_check_initiator_node_acl()` is called during OperationalNegotiation — the fencing
-  gate. If ACL was removed, returns NULL → Login Response with Status-Class=0x02 (Initiator Error).
-- On the initiator side, login rejection calls `iscsi_login_failed()` → `iscsi_conn_failure()` →
-  `replacement_timeout` countdown → `RECOVERY_FAILED` → `DID_TRANSPORT_FAILFAST` → `fail_path()`.
-- Negotiated parameters are stored in `conn->conn_ops` and `sess->sess_ops`. They control write
-  data-flow paths: `InitialR2T`, `ImmediateData`, `FirstBurstLength`, `MaxBurstLength`.
-- The same parameters on the initiator side are stored in `iscsi_session->initial_r2t_en`,
-  `imm_data_en`, `first_burst`, `max_burst` — read by `iscsi_prep_scsi_cmd_pdu()` (day 9).
-- `ErrorRecoveryLevel=0` (default): connection drop → restart all commands. ERL=1/2 add digest
-  and session recovery but are rarely used in production.
-- `generate_node_acl=0` (static ACLs, default) means login rejection is clean and deterministic.
-  `generate_node_acl=1` (dynamic ACLs) bypasses the ACL check — must be disabled for fencing.
+- iSCSI Login Phase has up to 3 stages: SecurityNegotiation → LoginOperationalNegotiation →
+  FullFeaturePhase.
+- T-bit drives stage transitions; C-bit means "more PDUs coming in this stage".
+- The login state machine in the kernel is `iscsi_target_login_thread` per network portal.
+- ACL enforcement happens via `core_tpg_check_initiator_node_acl()` (defined in
+  `drivers/target/target_core_tpg.c`) — searches TPG's ACL list for the InitiatorName.
+- For fencing, `generate_node_acls=0` (static mode) is required — otherwise removed initiators
+  re-create their ACL on next login.
+- Login rejection: `status_class=0x02` (Initiator Error), `status_detail` indicates the reason
+  (e.g., 0x02 forbidden, 0x03 not found). Specific codes vary by kernel version.
+- ErrorRecoveryLevel is almost always 0 in production. Mike Christie's 2017 cleanup removed
+  unused ERL>0 code paths from libiscsi initiator.
+- Parameter negotiation rules: digest "Supported" intersection, lengths min(), bools AND for
+  safer values.
+- Race window: in-flight login at moment of `rmdir`. Disable TPG first to close.
 
 ---
 
 ## Previous / Next
 
-[Day 26 — NVMe-oF target fabric](day26.md) | [Day 28 — ERL1 and ERL2 error recovery](day28.md)
+[Day 26 — NVMe-oF target fabric comparison](day26.md) | [Day 28 — ERL1 and ERL2 error recovery](day28.md)

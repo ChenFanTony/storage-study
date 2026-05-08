@@ -1,406 +1,414 @@
-# Day 24 — configfs: LIO control plane
+# Day 24 — configfs control plane
 
-**Week 4**: Deep Cuts — TMF, ALUA, configfs, NVMe-oF, Sense Data
-**Time**: 1–2 hours
-**Reference**: `drivers/target/target_core_configfs.c`, `drivers/target/iscsi/iscsi_target_configfs.c`
+**Week 4**: Advanced Topics  
+**Time**: 1–2 hours  
+**Reference**: `drivers/target/target_core_configfs.c`, `drivers/target/iscsi/iscsi_target_configfs.c`, `drivers/target/target_core_tpg.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-configfs is the kernel filesystem that LIO uses as its control plane. Every `targetcli` command
-ultimately writes to or reads from configfs. The kernel provides a generic configfs framework
-(`fs/configfs/`) and LIO registers its objects into it. Understanding how a configfs write
-translates to kernel struct changes — especially ACL deletion — is essential for implementing
-the session-drop fencing approach cleanly.
+LIO is administered through configfs at `/sys/kernel/config/target/`. There are no ioctls or
+netlink commands — every operation (create backstore, define TPG, add LUN, add ACL,
+enable/disable) is a filesystem write. `targetcli` is a userspace shell that drives this
+filesystem. Understanding the configfs layout and the kernel hooks behind each write is essential
+for the ACL-removal fencing approach (day 25).
 
 ---
 
-## configfs object hierarchy
+## configfs layout
 
 ```
-/sys/kernel/config/target/                    ← root (target_core_configfs.c)
-    core/                                     ← backstores
-        iblock_0/                             ← iblock subsystem
-            <device_name>/                    ← se_device
-                attrib/                       ← device attributes
-                alua/                         ← ALUA port groups
-    iscsi/                                    ← iSCSI fabric (iscsi_target_configfs.c)
-        <target_iqn>/                         ← iscsi_tiqn
-            tpgt_1/                           ← iscsi_tpg (Target Portal Group)
-                param/                        ← session parameters
-                portals/                      ← IP:port endpoints
-                    <ip>:<port>/
-                luns/                         ← LUN mappings
-                    lun_0/
-                        <link> → ../../core/iblock_0/<device>
-                acls/                         ← initiator access control
-                    <initiator_iqn>/          ← se_node_acl
-                        attrib/
-                        auth/
-                        mapped_luns/
-                            mapped_lun_0/
-                                <link> → ../../../luns/lun_0
+/sys/kernel/config/target/
+├── core/
+│   └── iblock_0/                       # an HBA
+│       └── disk0/                      # a backstore
+│           ├── alua/
+│           │   └── default_tg_pt_gp/
+│           │       ├── alua_access_state    # 0..F (day 23)
+│           │       ├── alua_access_type     # 1 implicit, 2 explicit, 3 both
+│           │       └── members
+│           ├── pr/
+│           │   ├── res_aptpl_active         # APTPL toggle (day 20)
+│           │   ├── res_holder
+│           │   └── res_pr_registered_i_pts
+│           ├── attrib/                  # block size, max_sectors, emulate_*, etc.
+│           ├── statistics/
+│           └── enable                   # 0|1 — enable backstore
+└── iscsi/                              # iSCSI fabric module
+    └── iqn.2025-01.com.example:tgt0/   # a target IQN (the "wwn" / target-name)
+        └── tpgt_1/                     # Target Portal Group 1
+            ├── acls/
+            │   └── iqn.client.example/  # an initiator ACL
+            │       ├── lun_0/           # mapped LUN for this ACL
+            │       │   └── ...
+            │       ├── auth/            # CHAP credentials
+            │       └── attrib/          # queue_depth, etc.
+            ├── attrib/                  # demo_mode, generate_node_acls, etc.
+            ├── lun/
+            │   └── lun_0/
+            │       └── storage_object → /backstores/iblock_0/disk0
+            ├── np/                      # network portals (ip:port pairs)
+            └── enable                   # 0|1 — TPG accepting logins
 ```
 
-Each directory in this tree corresponds to a configfs `config_item` or `config_group`. Creating
-a directory calls the `make_group()` callback. Deleting (rmdir) calls `drop_item()`.
+Each directory and file is created/removed by mkdir/rmdir or echo, and the kernel module
+intercepts the operation through `configfs_attribute` and `configfs_subsystem` callbacks.
 
 ---
 
-## How configfs works — the kernel side
+## Backstore creation
+
+```bash
+# create an iblock backstore for /dev/sdb
+mkdir /sys/kernel/config/target/core/iblock_0/disk0
+echo "/dev/sdb" > /sys/kernel/config/target/core/iblock_0/disk0/udev_path
+echo 1 > /sys/kernel/config/target/core/iblock_0/disk0/enable
+```
+
+What happens in the kernel:
 
 ```c
-/*
- * A configfs item has:
- *   - config_item_type: defines the operations (show, store, make, drop)
- *   - config_group: a directory that can contain children
- *   - configfs_attribute: a file with show/store callbacks
- *
- * Example: writing to an attribute file:
- *   echo "1" > /sys/kernel/config/target/core/iblock_0/dev/attrib/block_size
- *   → VFS write → configfs_write_iter() → attr->store(item, buf, len)
- *   → target_core attribute store callback
- */
+/* mkdir intercepted by configfs subsystem at target/core/iblock_0/ */
 
-/* Generic attribute structure */
-struct configfs_attribute {
-    const char  *ca_name;
-    struct module *ca_owner;
-    umode_t     ca_mode;
-    ssize_t     (*show)(struct config_item *, char *);
-    ssize_t     (*store)(struct config_item *, const char *, size_t);
-};
-```
-
----
-
-## ACL creation — `drivers/target/iscsi/iscsi_target_configfs.c`
-
-When `targetcli` does `acls create wwn=iqn.2024-01.com.example:host`:
-
-```c
-/*
- * mkdir /sys/kernel/config/target/iscsi/<tiqn>/tpgt_1/acls/<initiator_iqn>
- * → configfs calls make_group() for the acls directory
- * → iscsi_target_configfs.c's acl make_group callback:
- */
-static struct config_group *iscsi_tpg_initiator_make_acl(
-    struct config_group *group,
-    const char *name)         /* name = initiator IQN string */
+/* Simplified — see drivers/target/target_core_iblock.c. */
+static struct se_device *iblock_alloc_device(struct se_hba *hba,
+                                                const char *name)
 {
-    struct iscsi_tpg_acl *acl;
-    struct se_portal_group *se_tpg = group->cg_item.ci_parent...;
-    struct se_node_acl *se_nacl;
-
-    /*
-     * core_tpg_add_initiator_node_acl() creates the se_node_acl:
-     *   - allocates se_node_acl
-     *   - copies initiatorname string
-     *   - initialises lun_entry_hlist, acl_sess_list
-     *   - adds to se_tpg->acl_node_list
-     */
-    se_nacl = core_tpg_add_initiator_node_acl(se_tpg, name);
-    if (IS_ERR(se_nacl))
-        return ERR_CAST(se_nacl);
-
-    acl = kzalloc(sizeof(*acl), GFP_KERNEL);
-    acl->se_nacl = se_nacl;
-    config_group_init_type_name(&acl->acl_group,
-                                 name,
-                                 &iscsi_tpg_initiator_acl_cit);
-    return &acl->acl_group;
+    struct iblock_dev *ib_dev = kzalloc(sizeof(*ib_dev), GFP_KERNEL);
+    /* attach to hba */
+    return &ib_dev->dev;
 }
-```
 
----
-
-## ACL deletion — the fencing control path
-
-When `targetcli` does `acls delete wwn=<initiator_iqn>`:
-
-```c
-/*
- * rmdir /sys/kernel/config/target/iscsi/<tiqn>/tpgt_1/acls/<initiator_iqn>
- * → configfs calls drop_item()
- */
-static void iscsi_tpg_initiator_drop_acl(
-    struct config_group *group,
-    struct config_item *item)
+/* later: echo /dev/sdb > udev_path triggers iblock_set_configfs_dev_params */
+static ssize_t iblock_set_configfs_dev_params(struct se_device *dev,
+                                                 const char *page,
+                                                 ssize_t count)
 {
-    struct iscsi_tpg_acl *acl = container_of(item, struct iscsi_tpg_acl, ...);
-    struct se_portal_group *se_tpg = ...;
-
-    /*
-     * core_tpg_del_initiator_node_acl() removes the ACL:
-     *   1. Removes se_nacl from se_tpg->acl_node_list
-     *   2. Closes all active sessions for this initiator
-     *   3. Frees se_nacl (after sessions drain)
-     */
-    core_tpg_del_initiator_node_acl(se_tpg, acl->se_nacl);
-
-    kfree(acl);
+    struct iblock_dev *ib_dev = IBLOCK_DEV(dev);
+    /* parse "udev_path=/dev/sdb" */
+    snprintf(ib_dev->ibd_udev_path, sizeof(ib_dev->ibd_udev_path),
+             "%s", path);
+    return count;
 }
-```
 
-```c
-/* target_core_configfs.c */
-int core_tpg_del_initiator_node_acl(struct se_portal_group *tpg,
-                                     struct se_node_acl *acl)
+/* echo 1 > enable triggers iblock_configure_device (day 21) */
+static int iblock_configure_device(struct se_device *dev)
 {
-    LIST_HEAD(sess_list);
-    struct se_session *sess, *sess_tmp;
-    unsigned long flags;
-    int rc;
-
-    mutex_lock(&tpg->acl_node_mutex);
-
-    /*
-     * Remove ACL from the TPG's ACL list.
-     * New login attempts from this IQN will now fail:
-     *   core_tpg_check_initiator_node_acl() returns NULL
-     *   → login rejected with ISCSI_STATUS_CLS_INITIATOR_ERR
-     */
-    list_del(&acl->acl_list);
-
-    /*
-     * Collect all active sessions for this ACL.
-     * Move them to a local list for teardown.
-     */
-    spin_lock_irqsave(&acl->acl_sess_lock, flags);
-    list_splice_init(&acl->acl_sess_list, &sess_list);
-    spin_unlock_irqrestore(&acl->acl_sess_lock, flags);
-
-    mutex_unlock(&tpg->acl_node_mutex);
-
-    /*
-     * Close each active session.
-     * For iSCSI: se_tfo->close_session() = iscsit_close_session()
-     *
-     * iscsit_close_session() (day 25):
-     *   - Sends Async PDU (if configured) requesting logout
-     *   - Waits for sess_cmd_list to drain
-     *   - Closes TCP connection
-     */
-    list_for_each_entry_safe(sess, sess_tmp, &sess_list, sess_list) {
-        struct se_portal_group *se_tpg = sess->se_tpg;
-        se_tpg->se_tpg_tfo->close_session(sess);
-    }
-
-    /*
-     * Wait for reference count on se_nacl to drop to 0.
-     * In-flight commands hold a reference.
-     */
-    target_put_nacl(acl);
-
+    /* blkdev_get_by_path(), bioset_init(), probe attrs ... */
     return 0;
 }
 ```
 
-This is the exact code path that runs when `targetcli` deletes an ACL during fencing. It:
-1. Removes the ACL → future logins rejected
-2. Closes existing sessions → TCP torn down → EH triggered on initiator
-3. Waits for in-flight commands to drain safely
+After `enable=1`, the device is online and ready to be mapped into a TPG.
 
 ---
 
-## Login check — how ACL removal blocks reconnects
+## TPG creation
+
+```bash
+# create iSCSI target IQN and TPG
+mkdir /sys/kernel/config/target/iscsi/iqn.2025-01.com.example:tgt0
+mkdir /sys/kernel/config/target/iscsi/iqn.2025-01.com.example:tgt0/tpgt_1
+```
 
 ```c
-/*
- * Called during iSCSI Login Phase to check if the initiator is allowed.
- * In iscsi_target_login.c → iscsit_process_login():
- */
-struct se_node_acl *core_tpg_check_initiator_node_acl(
-    struct se_portal_group *tpg,
-    unsigned char *initiatorname)
+/* Simplified — see drivers/target/iscsi/iscsi_target_configfs.c. */
+static struct se_wwn *iscsi_target_make_tiqn(struct target_fabric_configfs *tf,
+                                                struct config_group *group,
+                                                const char *name)
 {
-    struct se_node_acl *acl;
+    struct iscsi_tiqn *tiqn;
 
-    mutex_lock(&tpg->acl_node_mutex);
+    tiqn = iscsit_add_tiqn((unsigned char *)name);
+    if (IS_ERR(tiqn))
+        return ERR_CAST(tiqn);
 
-    /*
-     * Linear search of tpg->acl_node_list for matching IQN.
-     * If ACL was removed by core_tpg_del_initiator_node_acl():
-     *   list_del(&acl->acl_list) removed it
-     *   → this search returns NULL
-     */
-    list_for_each_entry(acl, &tpg->acl_node_list, acl_list) {
-        if (!strcmp(acl->initiatorname, initiatorname)) {
-            mutex_unlock(&tpg->acl_node_mutex);
-            return acl;  /* found — login proceeds */
-        }
-    }
+    return &tiqn->tiqn_wwn;
+}
 
-    mutex_unlock(&tpg->acl_node_mutex);
+static struct se_portal_group *iscsi_target_make_tpg(struct se_wwn *wwn,
+                                                       struct config_group *group,
+                                                       const char *name)
+{
+    struct iscsi_tiqn *tiqn = container_of(wwn, struct iscsi_tiqn, tiqn_wwn);
+    struct iscsi_portal_group *tpg;
+    u16 tpgt;
 
-    /*
-     * Not found.
-     * If tpg->tpg_attrib.generate_node_acl = 1 (dynamic ACLs):
-     *   Create a new ACL on-the-fly and allow login.
-     * Else:
-     *   Return NULL → login rejected.
-     *
-     * For fencing: ensure generate_node_acl = 0 (default in LIO).
-     */
-    if (tpg->tpg_attrib.generate_node_acl)
-        return core_tpg_get_initiator_node_acl_dynamic(tpg, initiatorname);
+    /* parse "tpgt_1" → tpgt = 1 */
+    if (sscanf(name, "tpgt_%hu", &tpgt) != 1)
+        return ERR_PTR(-EINVAL);
 
-    return NULL;  /* ← initiator is fenced: login rejected */
+    tpg = iscsit_alloc_portal_group(tiqn, tpgt);
+    if (!tpg)
+        return ERR_PTR(-ENOMEM);
+
+    return &tpg->tpg_se_tpg;
 }
 ```
 
-When this returns NULL, `iscsit_process_login()` sends a Login Response PDU with status
-`ISCSI_STATUS_CLS_INITIATOR_ERR` (0x02) and reason `ISCSI_LOGIN_STATUS_TGT_NOT_FOUND` (0x01).
+---
 
-On the initiator side, this causes `iscsi_login_thread()` → `iscsi_login_failed()` →
-`iscsi_conn_failure()`. The reconnect attempt fails. `replacement_timeout` counts down. After
-120s: `ISCSI_STATE_RECOVERY_FAILED` → `DID_TRANSPORT_FAILFAST` → dm-multipath `fail_path()`.
+## LUN attach
+
+```bash
+# map the backstore as LUN 0 of this TPG
+mkdir /sys/kernel/config/target/iscsi/iqn.2025-01.com.example:tgt0/tpgt_1/lun/lun_0
+ln -s /sys/kernel/config/target/core/iblock_0/disk0 \
+      /sys/kernel/config/target/iscsi/iqn.2025-01.com.example:tgt0/tpgt_1/lun/lun_0/storage_object
+```
+
+```c
+/* Simplified. */
+static struct config_group *target_fabric_make_lun(struct config_group *group,
+                                                     const char *name)
+{
+    struct se_lun *lun;
+    struct se_portal_group *se_tpg = container_of(...);
+    u64 unpacked_lun;
+
+    /* parse "lun_0" → unpacked_lun = 0 */
+    if (kstrtoull(name + 4, 0, &unpacked_lun) < 0)
+        return ERR_PTR(-EINVAL);
+
+    lun = core_tpg_alloc_lun(se_tpg, unpacked_lun);
+    if (IS_ERR(lun))
+        return ERR_CAST(lun);
+
+    /* configfs group hooks for storage_object symlink etc. */
+    return &lun->lun_group;
+}
+
+/* the symlink to storage_object triggers core_dev_add_lun() which binds
+ * the LUN to its se_device and initializes lun_ref (percpu_ref). */
+```
+
+After this, the LUN is visible via REPORT LUNS to any initiator with the right ACL.
 
 ---
 
-## LUN enable/disable — `drivers/target/target_core_configfs.c`
+## ACL creation — the fencing hook
+
+```bash
+# allow this initiator IQN to access the TPG
+mkdir /sys/kernel/config/target/iscsi/iqn.2025-01.com.example:tgt0/tpgt_1/acls/iqn.client.example
+# map LUN 0 within this ACL
+mkdir /sys/kernel/config/target/iscsi/iqn.2025-01.com.example:tgt0/tpgt_1/acls/iqn.client.example/lun_0
+ln -s ../../../lun/lun_0 \
+      /sys/kernel/config/target/iscsi/iqn.2025-01.com.example:tgt0/tpgt_1/acls/iqn.client.example/lun_0/...
+```
 
 ```c
-/*
- * echo 0 > /sys/kernel/config/target/core/iblock_0/<dev>/enable
- * → calls target_core_dev_enable_store()
- */
-static ssize_t target_core_dev_enable_store(struct config_item *item,
-                                              const char *page, size_t count)
+/* Simplified — see drivers/target/iscsi/iscsi_target_configfs.c. */
+static struct se_node_acl *iscsi_target_make_nodeacl(
+    struct se_portal_group *se_tpg,
+    const char *name)
 {
-    struct se_dev_attrib *da = to_attrib(item);
-    struct se_device *dev    = da->da_dev;
-    bool enable;
+    struct se_node_acl *se_nacl_new, *se_nacl;
+    struct iscsi_portal_group *tpg = container_of(se_tpg, ...);
+    u32 cmdsn_depth;
 
-    if (strtobool(page, &enable))
-        return -EINVAL;
+    /*
+     * core_tpg_check_initiator_node_acl() — defined in
+     * drivers/target/target_core_tpg.c — performs the lookup that
+     * decides whether to create a new ACL or return an existing one.
+     * Behaviour depends on tpg_attrib.generate_node_acls.
+     */
+    se_nacl = core_tpg_check_initiator_node_acl(se_tpg,
+                                                  (unsigned char *)name);
+    if (IS_ERR(se_nacl))
+        return se_nacl;
 
-    if (!enable) {
-        /*
-         * Disable the device.
-         * Sets dev->dev_flags |= DF_SHUTDOWN.
-         *
-         * Effect: transport_lookup_cmd_lun() calls
-         *   percpu_ref_tryget_live(&lun->lun_ref) which returns false
-         *   → TCM_NON_EXISTENT_LUN → ILLEGAL REQUEST to initiator.
-         *
-         * In-flight commands complete normally.
-         * New commands are rejected.
-         *
-         * This is the LUN offline mechanism.
-         * For initiator with no_path_retry=queue: causes indefinite hang
-         * (as discussed in day 7) because all paths return CHECK CONDITION
-         * NOT_READY → dm-multipath marks all paths failed → queue_ios.
-         */
-        target_dev_setup_virtual_lba_map(dev);
+    cmdsn_depth = tpg->tpg_attrib.default_cmdsn_depth;
+    se_nacl->queue_depth = cmdsn_depth;
+
+    return se_nacl;
+}
+```
+
+The function `core_tpg_check_initiator_node_acl()` lives in
+`drivers/target/target_core_tpg.c`. It searches the TPG's ACL list for the IQN. If found:
+return existing. If not:
+- `generate_node_acls=1` (dynamic mode): auto-create a placeholder ACL with default LUN
+  mappings.
+- `generate_node_acls=0` (static mode, default in many configurations): only allow IQNs that
+  have been explicitly added.
+
+The default value of `generate_node_acls` has changed across LIO versions. Check the value for
+your kernel before relying on it; for fencing-controlled environments the safest practice is to
+explicitly set `generate_node_acls=0`.
+
+For fencing, **static ACLs are essential**. Otherwise, a fenced initiator simply re-logs in,
+gets an auto-generated ACL, and bypasses the fence.
+
+---
+
+## ACL removal — `rmdir` triggers session teardown
+
+When the cluster decides to fence node A:
+
+```bash
+# remove node A's ACL — this is the fencing hook
+rmdir /sys/kernel/config/target/iscsi/iqn.2025-01.com.example:tgt0/tpgt_1/acls/iqn.client.A
+```
+
+```c
+/* Simplified. */
+static void iscsi_target_drop_nodeacl(struct se_node_acl *se_nacl)
+{
+    struct se_portal_group *se_tpg = se_nacl->se_tpg;
+    struct iscsi_portal_group *tpg = container_of(se_tpg, ...);
+
+    core_tpg_del_initiator_node_acl(se_tpg, se_nacl, 1);
+    /* this calls __core_tpg_del_initiator_node_acl() which:
+     *   1. detaches the ACL from the TPG list
+     *   2. iterates active sessions for this ACL
+     *   3. calls iscsit_close_session() on each (day 25)
+     *   4. frees per-LUN dev_entries
+     *   5. kfree(se_nacl)
+     */
+}
+```
+
+The session is forcibly closed. The initiator's TCP connection sees an RST or FIN. Subsequent
+reconnect attempts fail at Login because the IQN is no longer in the ACL list — Login Response
+reports status class 0x02 (Initiator Error), detail 0x01 (Authentication Failure) or 0x03
+(Initiator Not Found).
+
+After `replacement_timeout` (open-iscsi userspace default 120s, pushed to the kernel via
+sysfs), the initiator's session declares `RECOVERY_FAILED` → all paths fail → bios queue or
+fail per `no_path_retry` setting (day 12).
+
+---
+
+## Disabling the LUN — the alternative fencing path
+
+Instead of removing the ACL, an admin can disable the LUN globally:
+
+```bash
+echo 0 > /sys/kernel/config/target/iscsi/iqn.../tpgt_1/lun/lun_0/enable
+```
+
+But there's no `enable` attribute on `lun_X` in stock LIO — what's actually controlled is the
+backstore's `enable`:
+
+```bash
+echo 0 > /sys/kernel/config/target/core/iblock_0/disk0/enable
+```
+
+When this is written:
+
+```c
+/* Simplified — see drivers/target/target_core_device.c. */
+static ssize_t target_dev_enable_store(struct config_item *item,
+                                          const char *page, size_t count)
+{
+    struct se_device *dev = to_device(item);
+    int ret;
+    bool flag;
+
+    ret = kstrtobool(page, &flag);
+    if (ret)
+        return ret;
+
+    if (flag) {
+        ret = target_configure_device(dev);
+    } else {
+        /* disable: percpu_ref_kill on every LUN's lun_ref,
+         * wait for in-flight commands to drain,
+         * tear down backend connection */
+        target_unconfigure_device(dev);
     }
-
     return count;
 }
 ```
 
-This confirms the earlier analysis: LUN disable alone is not clean for fencing. It causes
-`TCM_NON_EXISTENT_LUN` (or `NOT_READY` depending on implementation), which dm-multipath
-treats as a path error, marking all paths failed, and `no_path_retry=queue` hangs.
+After this, `transport_lookup_cmd_lun()` (day 16) fails for every LUN backed by this device —
+new commands return NOT READY immediately. dm-multipath sees the failures and retries on other
+paths; if all paths back to the same backstore, all paths fail.
+
+This approach is too coarse for fencing in most setups (it disables the LUN for ALL initiators,
+not just the fenced one). Per-initiator fencing requires ACL removal or PR.
 
 ---
 
-## Session parameter attributes — `iscsi_target_configfs.c`
+## TPG enable/disable
 
-```c
-/*
- * Reading/writing iSCSI session parameters via configfs:
- * cat /sys/kernel/config/target/iscsi/<tiqn>/tpgt_1/param/MaxRecvDataSegmentLength
- * → calls iscsi_tpg_param_show_attr()
- *
- * These parameters are the defaults for new sessions.
- * They are negotiated during Login Phase — the connection-specific
- * values end up in conn->conn_ops->MaxRecvDataSegmentLength.
- *
- * Key parameters for understanding write data paths (day 18):
- *   ImmediateData=Yes/No       → imm_data_en in iscsi_session
- *   InitialR2T=Yes/No          → initial_r2t_en
- *   FirstBurstLength=<bytes>   → first_burst
- *   MaxBurstLength=<bytes>     → max_burst
- *   MaxRecvDataSegmentLength=<bytes> → max_recv_dlength
- *   MaxOutstandingR2T=<n>      → max_r2t
- */
+```bash
+echo 0 > /sys/kernel/config/target/iscsi/iqn.../tpgt_1/enable
 ```
 
----
-
-## Dynamic vs static ACLs
+This stops the TPG from accepting new logins. Existing sessions are NOT torn down. Useful for
+maintenance.
 
 ```c
-/*
- * tpg->tpg_attrib.generate_node_acl controls ACL mode:
- *
- * Static ACLs (generate_node_acl=0, default):
- *   Admin must explicitly create ACL for each initiator IQN.
- *   Fencing is precise: remove specific IQN's ACL.
- *   targetcli: acls create wwn=<iqn> / acls delete wwn=<iqn>
- *
- * Dynamic ACLs (generate_node_acl=1):
- *   Any initiator can connect. ACL created automatically on first login.
- *   Fencing is harder: removing a dynamic ACL doesn't prevent reconnect
- *   because a new dynamic ACL would be created.
- *   For fencing with dynamic ACLs: need additional mechanism
- *   (firewall rule, IP-based block, or switch-level port disable).
- *
- * targetcli: /iscsi/<tiqn>/tpgt1 set attribute generate_node_acl=0
- */
+static ssize_t lio_target_tpg_enable_store(struct config_item *item,
+                                              const char *page, size_t count)
+{
+    struct iscsi_portal_group *tpg = ...;
+    bool flag;
+
+    if (kstrtobool(page, &flag) < 0)
+        return -EINVAL;
+
+    if (flag) {
+        iscsit_tpg_enable_portal_group(tpg);
+    } else {
+        iscsit_tpg_disable_portal_group(tpg, /* force = */ 0);
+        /* if force=1, also forcibly close all existing sessions */
+    }
+    return count;
+}
 ```
+
+For fencing, `force=1` (write `0` to enable when in use) is the heavy hammer — drops every
+session on this TPG immediately.
 
 ---
 
-## The fencing sequence through configfs
+## What targetcli does on top
+
+`targetcli /backstores/iblock create disk0 /dev/sdb` translates to:
+- `mkdir /sys/kernel/config/target/core/iblock_0/disk0`
+- `echo "/dev/sdb" > .../udev_path`
+- `echo 1 > .../enable`
+
+Plus pretty-printing, error checking, persistence to JSON (`/etc/target/saveconfig.json`), and
+restoration on boot via the `target` systemd unit.
+
+For automated fencing scripts, calling configfs directly (no targetcli) is simplest:
 
 ```bash
 #!/bin/bash
-# Fence a specific initiator via targetcli (configfs) + session drop
-
-TARGET_IQN="iqn.2024-01.com.example:target"
-INITIATOR_IQN="iqn.2024-01.com.example:host-to-fence"
-TPGT="tpgt_1"
-
-# Step 1: Remove ACL — blocks reconnect immediately
-# (core_tpg_del_initiator_node_acl called → login check returns NULL)
-targetcli /iscsi/${TARGET_IQN}/${TPGT}/acls \
-    delete wwn=${INITIATOR_IQN}
-
-# After this:
-# - Existing session: still active (sessions are not force-closed yet
-#   unless core_tpg_del_initiator_node_acl closes them — it does)
-# - New login attempts: rejected with ISCSI_LOGIN_STATUS_TGT_NOT_FOUND
-#
-# core_tpg_del_initiator_node_acl() closes existing sessions via
-# se_tfo->close_session() = iscsit_close_session()
-# → iscsit_close_connection() → TCP teardown
-
-echo "Initiator ${INITIATOR_IQN} fenced."
-echo "Existing session torn down, reconnect blocked."
-echo "Initiator replacement_timeout (120s) begins now."
-echo "After 120s: DID_TRANSPORT_FAILFAST → dm-multipath fail_path()"
+# fence-node.sh <fenced-node-iqn>
+FENCED_IQN="$1"
+ACL_PATH=/sys/kernel/config/target/iscsi/iqn.../tpgt_1/acls/$FENCED_IQN
+[ -d "$ACL_PATH" ] && rmdir "$ACL_PATH"
 ```
+
+A single rmdir does everything: detach ACL → close session → reject future logins.
 
 ---
 
 ## Key takeaways
 
-- configfs is LIO's control plane. Every `targetcli` operation maps to a VFS write/mkdir/rmdir
-  on `/sys/kernel/config/target/`.
-- ACL creation: `mkdir <initiator_iqn>` → `make_group()` → `core_tpg_add_initiator_node_acl()`.
-- ACL deletion: `rmdir <initiator_iqn>` → `drop_item()` → `core_tpg_del_initiator_node_acl()`.
-  This (1) removes ACL from list (blocking future logins), (2) closes active sessions via
-  `se_tfo->close_session()`, (3) waits for se_nacl reference to drop.
-- `core_tpg_check_initiator_node_acl()` is called during Login Phase. Returns NULL when ACL
-  removed → login rejected with `ISCSI_STATUS_CLS_INITIATOR_ERR`.
-- On initiator: login rejection → `iscsi_conn_failure()` → `replacement_timeout` → `RECOVERY_FAILED`
-  → `DID_TRANSPORT_FAILFAST` → dm-multipath `fail_path()`.
-- LUN disable (`echo 0 > enable`) is NOT clean for fencing with `no_path_retry=queue` — causes
-  all paths to fail via `NOT_READY`, with no recovery trigger.
-- Dynamic ACLs (`generate_node_acl=1`) make fencing harder — always use static ACLs in HA setups.
+- LIO has no ioctl interface — everything goes through configfs at
+  `/sys/kernel/config/target/`.
+- Backstore creation: mkdir under `core/<plugin>_N/`, write attributes, `echo 1 > enable`.
+- TPG creation: mkdir under `iscsi/<iqn>/tpgt_N`. LUN attach: mkdir
+  `tpgt_N/lun/lun_M` + symlink to a backstore.
+- ACL creation: mkdir `tpgt_N/acls/<initiator-iqn>` →
+  `iscsi_target_make_nodeacl()` calls `core_tpg_check_initiator_node_acl()` (in
+  `drivers/target/target_core_tpg.c`). Behaviour depends on `generate_node_acls`.
+- For fencing, `generate_node_acls=0` (static mode) is required — explicitly verify the value
+  for your kernel and configure if needed; otherwise a fenced node simply re-creates its ACL on
+  reconnect.
+- ACL removal (`rmdir`) is the primary fencing hook: detaches ACL → closes session →
+  rejects future logins.
+- Backstore `enable=0` is too coarse for per-initiator fencing — affects all initiators.
+- TPG `enable=0` (with force) drops every session on the TPG.
+- `targetcli` is just a friendly wrapper around mkdir/echo to configfs.
 
 ---
 

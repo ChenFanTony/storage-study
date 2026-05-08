@@ -1,30 +1,32 @@
 # Day 12 — session failure and EH interaction
 
-**Week 2**: iSCSI Initiator Kernel Code
-**Time**: 1–2 hours
-**Reference**: `drivers/scsi/libiscsi.c`
+**Week 2**: iSCSI Initiator Kernel Code  
+**Time**: 1–2 hours  
+**Reference**: `drivers/scsi/libiscsi.c`, `drivers/scsi/scsi_transport_iscsi.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-When a TCP session drops (RST, FIN, or timeout), `iscsi_conn_failure()` is called. This starts
-a chain of state transitions, device blocking, and EH interactions that ultimately either recovers
-the session or — after `replacement_timeout` — permanently fails all commands. This is the exact
-chain that connects a target-side fence action (session drop + ACL removal) to a dm-multipath
-path failure visible to the application.
+When a TCP session breaks (RST, FIN, NOP-Out timeout), libiscsi must coordinate three things:
+
+1. Stop sending new commands on this connection.
+2. Mark in-flight commands so they can be replayed when the session reconnects.
+3. Coordinate with the SCSI Error Handler (EH) and dm-multipath about what to fail / retry / queue.
+
+The interaction between `iscsi_conn_failure()`, the SCSI mid-layer EH (day 6), and dm-multipath
+(day 7) is the heart of the fencing problem. Understanding the timing here is essential.
 
 ---
 
-## iscsi_conn_failure — `drivers/scsi/libiscsi.c`
+## iscsi_conn_failure — entry point — `drivers/scsi/libiscsi.c`
 
-The entry point for any connection-level error. Called from:
-- TCP socket error callback (`iscsi_sw_tcp_error_report`)
-- NOP-Out timeout (`iscsi_check_transport_timeouts`)
-- RX parse error (`iscsi_tcp_recv_pdu` on bad opcode/digest)
-- Async PDU requesting logout
+Called whenever the connection breaks: TCP error, NOP-Out timeout, RX parse error, transmit
+failure.
 
 ```c
+/* Simplified — see drivers/scsi/libiscsi.c. */
 void iscsi_conn_failure(struct iscsi_conn *conn, enum iscsi_err err)
 {
     struct iscsi_session *session = conn->session;
@@ -33,390 +35,321 @@ void iscsi_conn_failure(struct iscsi_conn *conn, enum iscsi_err err)
     spin_lock_irqsave(&session->frwd_lock, flags);
 
     if (session->state == ISCSI_STATE_FAILED) {
-        /* already failing — don't process again */
         spin_unlock_irqrestore(&session->frwd_lock, flags);
-        return;
+        return; /* already failing — idempotent */
     }
 
-    if (conn->stop_stage == 0)
-        session->state = ISCSI_STATE_FAILED;
+    session->state = ISCSI_STATE_FAILED;
+    conn->state    = ISCSI_CONN_FAILED;
+
+    /*
+     * Stop the TX worker — no new commands sent on this connection.
+     */
+    set_bit(ISCSI_SUSPEND_BIT, &conn->suspend_tx);
+    set_bit(ISCSI_SUSPEND_BIT, &conn->suspend_rx);
 
     spin_unlock_irqrestore(&session->frwd_lock, flags);
 
     /*
-     * Record the error for userspace (iscsid) to see.
-     * ISCSI_ERR_CONN_FAILED, ISCSI_ERR_XMIT_FAILED, etc.
-     */
-    set_bit(err, &conn->err_flags);
-
-    /*
-     * Stop accepting new commands on this connection.
-     * suspend_tx=1 → iscsi_queuecommand() returns MLQUEUE_HOST_BUSY.
-     * suspend_rx=1 → RX path stops processing.
-     */
-    iscsi_suspend_tx(conn);
-
-    /*
-     * Notify the iSCSI transport class → userspace iscsid daemon.
-     * iscsid will attempt to reconnect.
+     * Notify the iscsi transport class — this calls
+     * iscsi_block_session() which calls scsi_target_block() to move the
+     * SCSI devices toward SDEV_TRANSPORT_OFFLINE. Held bios get retried
+     * by blk-mq instead of failed immediately.
      */
     iscsi_conn_error_event(conn->cls_conn, err);
 }
-EXPORT_SYMBOL_GPL(iscsi_conn_failure);
 ```
-
-After `session->state = ISCSI_STATE_FAILED`:
-- `iscsi_session_chkready()` returns `DID_TRANSPORT_DISRUPTED` for new commands
-- New commands are requeued by blk-mq (not failed permanently)
-- `replacement_timeout` countdown begins (via the delayed work registered in `iscsi_session_setup`)
 
 ---
 
-## iscsi_suspend_tx — stopping command flow
+## scsi_target_block — `drivers/scsi/scsi_lib.c`
+
+Called by `iscsi_block_session()` from the transport class, this puts the per-LUN state machine
+into a transport-blocked state:
 
 ```c
-void iscsi_suspend_tx(struct iscsi_conn *conn)
+/* Simplified. */
+int scsi_target_block(struct device *dev)
 {
-    struct Scsi_Host *shost = conn->session->host;
+    if (scsi_is_target_device(dev))
+        starget_for_each_device(to_scsi_target(dev), NULL,
+                                  device_block);
+    else
+        device_for_each_child(dev, NULL, target_block);
+    return 0;
+}
 
-    /*
-     * Set the suspend bit — TX kthread checks this before sending.
-     * In-progress sends may complete, but no new ones will start.
-     */
-    set_bit(ISCSI_SUSPEND_BIT, &conn->suspend_tx);
+static void device_block(struct scsi_device *sdev, void *data)
+{
+    int err;
 
+    err = scsi_internal_device_block_nowait(sdev);
     /*
-     * scsi_target_block() sets all scsi_devices on this target
-     * to SDEV_TRANSPORT_OFFLINE state.
-     *
-     * Effect on blk-mq:
-     *   - scsi_prep_state_check() returns SCSI_MLQUEUE_TERMINATE
-     *     for new commands → DID_TRANSPORT_DISRUPTED
-     *   - Commands already in the SCSI mid layer are held
-     *   - EH is woken for in-flight commands that timed out
+     * Sets sdev_state = SDEV_TRANSPORT_OFFLINE (or SDEV_BLOCK depending
+     * on path). After this:
+     *   - new commands hitting scsi_prep_state_check() get
+     *     BLK_STS_TRANSPORT (held by blk-mq for retry)
+     *   - in-flight commands are not aborted yet — EH will decide
      */
-    scsi_target_block(&conn->session->cls_session->dev);
 }
 ```
 
-`scsi_target_block()` walks all `scsi_device` structs under the target and calls
-`scsi_device_set_state(sdev, SDEV_TRANSPORT_OFFLINE)` + `scsi_device_blocked(sdev)`. This causes
-`scsi_queue_rq()` to return `SCSI_MLQUEUE_DEVICE_BUSY` for any new requests — blk-mq queues them
-and retries until the device unblocks or the host's EH gives up.
+---
+
+## In-flight command handling
+
+When the connection fails, in-flight `iscsi_task` entries on `conn->taskqueue` need to be marked.
+They cannot complete normally (response will never arrive). Two strategies:
+
+1. **Wait for reconnect (ERL=1 mode):** keep the tasks pending. After reconnect, replay or expect
+   the target to deliver responses (only with command-recovery negotiated, which is rare).
+2. **Force-fail (default):** complete each task with `DID_TRANSPORT_DISRUPTED` after EH timeout.
+
+Modern open-iscsi uses (2) by default. The transport class triggers `iscsi_session_recovery_timedout()`
+after `recovery_tmo` jiffies (the kernel field is set from the userspace
+`replacement_timeout` parameter, default 120s):
+
+```c
+/* Simplified — see scsi_transport_iscsi.c for the actual handler. */
+static void iscsi_session_recovery_timedout(struct iscsi_cls_session *cls_session)
+{
+    struct iscsi_session *session = cls_session->dd_data;
+
+    spin_lock_bh(&session->frwd_lock);
+    session->state = ISCSI_STATE_RECOVERY_FAILED;
+    spin_unlock_bh(&session->frwd_lock);
+
+    /*
+     * Transport class wakes EH and unblocks the SCSI devices into the
+     * permanent-offline state. The actual unblock call is made by the
+     * transport class machinery — not directly here. Held commands now
+     * complete with DID_TRANSPORT_FAILFAST as the device transitions
+     * out of the blocked state.
+     */
+}
+```
+
+The transition `ISCSI_STATE_FAILED → ISCSI_STATE_RECOVERY_FAILED` is the moment where:
+- All held commands fail with `DID_TRANSPORT_FAILFAST` → `BLK_STS_TRANSPORT`
+- dm-multipath sees `BLK_STS_TRANSPORT` and calls `fail_path()` for this path
+- `nr_valid_paths` decrements
+- If this was the last path AND `no_path_retry=queue` is set → bios queue indefinitely
 
 ---
 
-## iscsi_session_recovery_timedout — `drivers/scsi/libiscsi.c`
-
-Fires when `replacement_timeout` expires without reconnection:
+## Recovery work — `drivers/scsi/libiscsi.c`
 
 ```c
-static void iscsi_session_recovery_timedout(struct work_struct *work)
+/* Simplified — schedules userspace iscsid (via netlink) to drive the
+ * actual reconnect; the kernel work just arms the recovery timer. */
+static void iscsi_session_failure(struct iscsi_session *session,
+                                   enum iscsi_err err)
 {
+    spin_lock_bh(&session->frwd_lock);
+    session->state = ISCSI_STATE_FAILED;
+    spin_unlock_bh(&session->frwd_lock);
+
+    /*
+     * Schedule recovery_work to fire after recovery_tmo.
+     * If a reconnect succeeds before the timer fires, the work is cancelled.
+     * If the timer fires, recovery is declared failed.
+     *
+     * recovery_tmo is the kernel-side mirror of the userspace
+     * node.session.timeo.replacement_timeout (default 120s, pushed to the
+     * kernel via sysfs at session creation).
+     */
+    schedule_delayed_work(&session->recovery_work,
+                          session->recovery_tmo * HZ);
+}
+```
+
+When the timer fires:
+```c
+static void iscsi_recovery_timed_out(struct work_struct *work)
+{
+    struct delayed_work *dwork = to_delayed_work(work);
     struct iscsi_session *session =
-        container_of(work, struct iscsi_session, recovery_work.work);
+        container_of(dwork, struct iscsi_session, recovery_work);
 
-    spin_lock_bh(&session->frwd_lock);
-    if (session->state != ISCSI_STATE_LOGGED_IN) {
-        /*
-         * Still not logged in after replacement_timeout seconds.
-         * Transition to RECOVERY_FAILED.
-         * iscsi_session_chkready() will now return DID_TRANSPORT_FAILFAST.
-         * DID_TRANSPORT_FAILFAST → scsi_decide_disposition() → SUCCESS (with error)
-         * → BLK_STS_TRANSPORT → multipath_end_io() → blk_path_error()=true
-         * → fail_path() → nr_valid_paths-- → queued_ios accumulates.
-         */
-        session->state = ISCSI_STATE_RECOVERY_FAILED;
-    }
-    spin_unlock_bh(&session->frwd_lock);
-
-    /*
-     * Unblock the scsi_devices — but since state=RECOVERY_FAILED,
-     * new commands will get DID_TRANSPORT_FAILFAST instead of DISRUPTED.
-     * EH will complete all held commands with DID_TRANSPORT_FAILFAST.
-     */
-    scsi_target_unblock(&session->cls_session->dev, SDEV_TRANSPORT_OFFLINE);
-
-    wake_up_all(&session->ehwait);
+    iscsi_session_recovery_timedout(session->cls_session);
 }
 ```
 
-The transition `ISCSI_STATE_FAILED → ISCSI_STATE_RECOVERY_FAILED` is the moment the path is
-permanently lost. Everything before this point is recoverable. After this, dm-multipath removes
-the path from the valid set.
+---
+
+## Userspace coordination via netlink
+
+The kernel does not initiate reconnects itself. It relies on `iscsid` (open-iscsi userspace) to
+attempt reconnection. The flow:
+
+```
+1. Kernel: iscsi_conn_failure()
+2. Kernel: send ISCSI_KEVENT_CONN_ERROR netlink message to iscsid
+3. iscsid receives error, marks session failed
+4. iscsid: attempt reconnect — may take many attempts, each retrying TCP connect + Login
+5a. Reconnect succeeds:
+    iscsid sends ISCSI_UEVENT_TRANSPORT_EP_CONNECT, then ISCSI_UEVENT_START_CONN
+    Kernel: cancel recovery_work, transition to ISCSI_STATE_LOGGED_IN
+5b. Reconnect fails for replacement_timeout seconds:
+    Kernel: recovery_work fires → ISCSI_STATE_RECOVERY_FAILED
+    All held I/O fails → dm-multipath fail_path()
+```
+
+This split is important: the kernel timer (`recovery_tmo`) is just a deadline. The actual reconnect
+attempts are made by `iscsid`, which uses its own retry logic (typically tries every
+`node.conn[0].timeo.login_timeout` seconds).
 
 ---
 
-## iscsi_eh_abort — `drivers/scsi/libiscsi.c`
+## EH interaction during session failure
 
-Called by the SCSI EH kthread (day 6) to abort a specific command:
+If the SCSI mid layer's command timer fires while the session is failed, EH wakes for that
+command:
+
+```
+Command timer fires (default 30s)
+    │
+    ▼
+scsi_times_out(scmd)
+    │
+    ▼
+scsi_eh_scmd_add(scmd, SCSI_EH_CANCEL_CMD)
+    │  scmd added to shost->eh_cmd_q
+    │  scsi_eh_wakeup(shost) wakes EH kthread
+    ▼
+scsi_unjam_host()
+    │
+    ▼
+scsi_eh_abort_cmds()
+    │  for each scmd: try iscsi_eh_abort() (day 6)
+    ▼
+iscsi_eh_abort()
+    │  session->state != ISCSI_STATE_LOGGED_IN
+    │  → return FAILED
+    ▼
+scsi_eh_ready_devs()
+    │  try iscsi_eh_device_reset() — fails (session not logged in)
+    │  try iscsi_eh_target_reset() — drops session, triggers reconnect
+    │  try host reset — also fails
+    ▼
+scsi_eh_offline_sdevs()
+    │  set sdev_state = SDEV_OFFLINE
+    │  scmd->result = DID_NO_CONNECT << 16
+    │  scsi_finish_command(scmd)
+    ▼
+multipath_end_io()
+    │  blk_path_error(BLK_STS_IOERR) = true → fail_path()
+```
+
+This path is taken when `eh_deadline` is short relative to `replacement_timeout`. With the default
+`eh_deadline=-1`, EH keeps trying until either the session reconnects or `replacement_timeout`
+expires.
+
+---
+
+## Suspend bits — gating new commands
+
+`conn->suspend_tx` and `conn->suspend_rx` are checked in the queuecommand and TX paths:
 
 ```c
-int iscsi_eh_abort(struct scsi_cmnd *sc)
-{
-    struct iscsi_cls_session *cls_session =
-        starget_to_session(scsi_target(sc->device));
-    struct iscsi_session *session = cls_session->dd_data;
-    struct iscsi_conn *conn;
-    struct iscsi_task *task;
-    int rc, age;
-
-    mutex_lock(&session->eh_mutex);
-    spin_lock_bh(&session->frwd_lock);
-
-    /*
-     * Validate that this command belongs to the CURRENT session.
-     * sc->SCp.phase holds the session age at the time the command
-     * was allocated. If it doesn't match session->age, the command
-     * was from a previous session and is already gone.
-     */
-    age = sc->SCp.phase;
-    if (session->age != age) {
-        /* stale command — consider it aborted already */
-        rc = SUCCESS;
-        goto unlock;
-    }
-
-    if (session->state != ISCSI_STATE_LOGGED_IN) {
-        /* cannot send TMF if session is down */
-        rc = FAILED;
-        goto unlock;
-    }
-
-    conn = session->leadconn;
-
-    /* find the iscsi_task from sc->SCp.ptr */
-    task = (struct iscsi_task *)sc->SCp.ptr;
-
-    if (!task || !task->sc) {
-        /* task completed normally between EH trigger and now */
-        rc = SUCCESS;
-        goto unlock;
-    }
-
-    iscsi_get_task(task);
-    spin_unlock_bh(&session->frwd_lock);
-
-    ISCSI_DBG_EH(session, "aborting [sc %p itt 0x%x]\n",
-                 sc, task->itt);
-
-    /* suspend command queue — don't let new commands race with abort */
-    iscsi_suspend_queue(conn);
-
-    /*
-     * Send ABORT TASK TMF PDU.
-     * The response from the target (TASK_MGMT_RESPONSE) will be
-     * delivered via iscsi_tmf_rsp() in the RX path.
-     *
-     * We wait up to session->abort_timeout seconds (default 10s).
-     */
-    conn->tmabort_state = TMABORT_INITIAL;
-    rc = iscsi_exec_task_mgmt_fn(conn, ISCSI_TM_FUNC_ABORT_TASK,
-                                  session->age, task->itt);
-
-    switch (rc) {
-    case SUCCESS:
-        rc = iscsi_eh_abort_cleanup(task);
-        break;
-    case FAILED:
-    case TIMEDOUT:
-        break;
-    }
-
-    iscsi_resume_queue(conn);
-    iscsi_put_task(task);
-
-    mutex_unlock(&session->eh_mutex);
-    return rc;
-
-unlock:
-    spin_unlock_bh(&session->frwd_lock);
-    mutex_unlock(&session->eh_mutex);
-    return rc;
+/* in iscsi_queuecommand() (day 9) */
+if (test_bit(ISCSI_SUSPEND_BIT, &conn->suspend_tx)) {
+    reason = SCSI_MLQUEUE_HOST_BUSY;
+    goto reject;
 }
-EXPORT_SYMBOL_GPL(iscsi_eh_abort);
+```
+
+Setting `suspend_tx` halts all dispatch on this connection. Set by:
+- `iscsi_conn_failure()` — connection failed
+- `__iscsi_conn_send_pdu()` — during certain TMF processing
+- `iscsi_suspend_tx()` — explicit pause (called by `scsi_target_block()`)
+
+Cleared by:
+- `iscsi_unblock_session()` — after successful reconnect / login
+- `iscsi_resume_tx()` — explicit resume
+
+This is the same suspend mechanism used by EH to pause the connection during reset operations.
+
+---
+
+## State transition diagram with timing
+
+```
+Session state                Connection state           Devices state
+═════════════                ════════════════           ═════════════
+
+LOGGED_IN  ──TCP RST──┐
+                      │
+                      ▼
+                FAILED                                  SDEV_TRANSPORT_OFFLINE
+                  │                                         (held by blk-mq)
+                  │ delayed_work armed (recovery_tmo)
+                  │
+        ┌─────────┴─────────┐
+        │                   │
+   reconnect              timeout
+   succeeds               (replacement_timeout)
+        │                   │
+        ▼                   ▼
+  LOGGED_IN              RECOVERY_FAILED                SDEV_OFFLINE (or
+        │                   │                            transitions out of
+        │                   │                            blocked → commands
+        ▼                   ▼                            complete)
+  Held cmds              Held cmds: DID_TRANSPORT_FAILFAST
+  retried                blk_status: BLK_STS_TRANSPORT
+        │                   │
+                            ▼
+                       multipath_end_io()
+                            │
+                            ▼
+                       fail_path()
+                       atomic_dec(nr_valid_paths)
+                            │
+                            ▼  (if nr_valid_paths==0 && queue_if_no_path)
+                       Future bios → m->queued_bios (HANG)
 ```
 
 ---
 
-## iscsi_eh_device_reset — LUN reset — `drivers/scsi/libiscsi.c`
+## Why this matters for fencing
 
-```c
-int iscsi_eh_device_reset(struct scsi_cmnd *sc)
-{
-    return iscsi_eh_reset_helper(sc, ISCSI_TM_FUNC_LOGICAL_UNIT_RESET);
-}
+When a fenced node's session is dropped administratively on the target:
 
-static int iscsi_eh_reset_helper(struct scsi_cmnd *sc, uint8_t func)
-{
-    struct iscsi_cls_session *cls_session =
-        starget_to_session(scsi_target(sc->device));
-    struct iscsi_session *session = cls_session->dd_data;
-    struct iscsi_conn *conn;
-    int rc;
+1. Target sends Async PDU `REQUEST_LOGOUT` (clean) OR sends TCP RST (abrupt).
+2. Initiator: `iscsi_conn_failure()` → `ISCSI_STATE_FAILED`.
+3. Initiator's `iscsid` tries to reconnect.
+4. Target's ACL has been removed (or initiator IQN deleted) → Login Response: status 0x0203
+   "Initiator not allowed".
+5. `iscsid` keeps retrying — each attempt fails with the same auth rejection.
+6. After `replacement_timeout` (120s default), kernel: `ISCSI_STATE_RECOVERY_FAILED`.
+7. All paths `fail_path()`'d → `nr_valid_paths=0`.
+8. New bios queue forever in `m->queued_bios` (assuming `no_path_retry=queue`).
 
-    mutex_lock(&session->eh_mutex);
-
-    if (session->state != ISCSI_STATE_LOGGED_IN) {
-        /* session gone — cannot send TMF */
-        mutex_unlock(&session->eh_mutex);
-        return FAILED;
-    }
-
-    conn = session->leadconn;
-
-    iscsi_suspend_queue(conn);
-
-    /*
-     * Send LOGICAL UNIT RESET TMF.
-     * On LIO target: core_tmr_lun_reset() aborts all tasks for this LUN.
-     * LUN reset causes a UNIT ATTENTION on all subsequent commands
-     * (POWER ON, RESET, OR BUS DEVICE RESET OCCURRED).
-     * Wait up to session->lu_reset_timeout seconds (default 15s).
-     */
-    rc = iscsi_exec_task_mgmt_fn(conn, func, session->age, 0);
-
-    iscsi_resume_queue(conn);
-    mutex_unlock(&session->eh_mutex);
-    return rc;
-}
-EXPORT_SYMBOL_GPL(iscsi_eh_device_reset);
-```
-
----
-
-## iscsi_eh_recover_target — target reset — `drivers/scsi/libiscsi.c`
-
-```c
-int iscsi_eh_recover_target(struct scsi_cmnd *sc)
-{
-    struct iscsi_cls_session *cls_session =
-        starget_to_session(scsi_target(sc->device));
-    struct iscsi_session *session = cls_session->dd_data;
-    int rc;
-
-    mutex_lock(&session->eh_mutex);
-
-    if (session->state == ISCSI_STATE_LOGGED_IN) {
-        /* try TARGET WARM RESET first */
-        rc = iscsi_eh_reset_helper(sc, ISCSI_TM_FUNC_TARGET_WARM_RESET);
-    } else {
-        rc = FAILED;
-    }
-
-    if (rc == FAILED) {
-        /*
-         * Cannot communicate with target.
-         * Drop the connection and let recovery machinery reconnect.
-         * This triggers: iscsi_conn_failure() →
-         *   session->state = ISCSI_STATE_FAILED →
-         *   replacement_timeout starts →
-         *   iscsid reconnect attempt.
-         *
-         * If reconnect succeeds within replacement_timeout:
-         *   session reconnects → DID_TRANSPORT_DISRUPTED clears →
-         *   commands resubmitted.
-         *
-         * If NOT → replacement_timeout fires → DID_TRANSPORT_FAILFAST →
-         *   dm-multipath fail_path().
-         */
-        iscsi_conn_failure(conn, ISCSI_ERR_CONN_FAILED);
-        rc = SUCCESS; /* EH treated as handled — recovery machinery takes over */
-    }
-
-    mutex_unlock(&session->eh_mutex);
-    return rc;
-}
-EXPORT_SYMBOL_GPL(iscsi_eh_recover_target);
-```
-
----
-
-## The full session-drop → path-failure chain
-
-```
-Target drops TCP session (RST or admin teardown)
-    │
-    ▼  iscsi_sw_tcp_error_report() / NOP timeout
-iscsi_conn_failure(conn, ISCSI_ERR_CONN_FAILED)
-    │  session->state = ISCSI_STATE_FAILED
-    │  set_bit(ISCSI_SUSPEND_BIT, &conn->suspend_tx)
-    │  scsi_target_block() → SDEV_TRANSPORT_OFFLINE on all sdevs
-    │  iscsi_conn_error_event() → notify iscsid
-    │
-    ▼  [replacement_timeout countdown begins — default 120s]
-    │
-    │  [iscsid attempts reconnect: login → negotiate params → LOGGED_IN]
-    │  [if reconnect succeeds within 120s: session recovers, commands resume]
-    │
-    │  [if ACL was removed (fencing): login rejected → reconnect fails]
-    │
-    ▼  [120s later — no reconnect]
-iscsi_session_recovery_timedout()
-    │  session->state = ISCSI_STATE_RECOVERY_FAILED
-    │  scsi_target_unblock() → EH fires for all blocked commands
-    │
-    ▼  EH runs for each blocked command:
-    │  iscsi_eh_abort() → FAILED (session gone)
-    │  iscsi_eh_device_reset() → FAILED (session gone)
-    │  iscsi_eh_recover_target() → FAILED
-    │  scsi_eh_flush_done_q() → sc->result = DID_NO_CONNECT << 16
-    │  scsi_finish_command(sc) → scsi_io_completion()
-    │  scsi_result_to_blk_status() → BLK_STS_IOERR
-    │
-    ▼  dm-multipath:
-    │  multipath_end_io() → blk_path_error(BLK_STS_IOERR) = true
-    │  fail_path(pgpath) → atomic_dec(&m->nr_valid_paths)
-    │
-    ▼  [if last path]
-    │  nr_valid_paths == 0
-    │  New bios → multipath_map_bio() → bio_list_add(&m->queued_ios, bio)
-    │
-    ▼  [if no_path_retry=queue]
-    Application I/O hangs until a path recovers (never, if fenced)
-```
-
----
-
-## Why session drop + ACL removal is the right fencing approach
-
-```
-Session drop ONLY:
-    iscsid reconnects → gets back in → fencing incomplete
-
-ACL removal ONLY:
-    existing session still active → I/O continues → fencing incomplete
-
-Session drop + ACL removal:
-    1. Session drops → iscsi_conn_failure() → ISCSI_STATE_FAILED
-    2. iscsid reconnects → Login Phase → target checks ACL → REJECT
-    3. Login rejected → reconnect fails → replacement_timeout counts down
-    4. At 120s → RECOVERY_FAILED → DID_TRANSPORT_FAILFAST → fail_path()
-    5. dm-multipath: path permanently failed → I/O fails (or queues if queue mode)
-
-For no_path_retry=queue:
-    Step 4 above + all paths fail = queued_ios accumulates.
-    To avoid hang: reduce replacement_timeout or set no_path_retry=fail.
-```
+Fencing achieved — the node cannot write to the SAN. But its applications hang on every I/O.
+This is the trade-off `no_path_retry=queue` makes: data integrity > availability.
 
 ---
 
 ## Key takeaways
 
-- `iscsi_conn_failure()` is the entry point for all connection errors. It sets
-  `ISCSI_STATE_FAILED`, suspends TX, and blocks the SCSI target device.
-- `scsi_target_block()` sets `SDEV_TRANSPORT_OFFLINE` — new commands get `DID_TRANSPORT_DISRUPTED`
-  (retry) not `FAILFAST` (permanent failure). Commands are held, not failed.
-- `iscsi_session_recovery_timedout()` fires after `replacement_timeout` (default 120s). Sets
-  `ISCSI_STATE_RECOVERY_FAILED`. Now `DID_TRANSPORT_FAILFAST` → dm-multipath `fail_path()`.
-- EH (`iscsi_eh_abort`, `iscsi_eh_device_reset`, `iscsi_eh_recover_target`) all fail when the
-  session is gone. EH then completes commands with `DID_NO_CONNECT`.
-- `DID_NO_CONNECT` → `BLK_STS_IOERR` → `fail_path()` → `nr_valid_paths--`.
-- `session->age` stamped in sc→SCp.phase prevents EH from aborting commands from the wrong session.
-- Session drop + ACL removal = clean fence. Session drop alone = reconnect possible.
+- `iscsi_conn_failure()` is the entry point for all session breaks. It sets state to FAILED and
+  suspends TX/RX.
+- `scsi_target_block()` (called by the iSCSI transport class) holds new commands at the SCSI mid
+  layer with `BLK_STS_TRANSPORT` so they can retry once the session is back.
+- `recovery_tmo` (the kernel field set from userspace `replacement_timeout`) is the deadline.
+  After expiry, `ISCSI_STATE_RECOVERY_FAILED` — held commands fail with `DID_TRANSPORT_FAILFAST`.
+- dm-multipath sees `BLK_STS_TRANSPORT` → `fail_path()` → `atomic_dec(&m->nr_valid_paths)`.
+- The kernel does NOT do reconnects itself — `iscsid` (userspace) is in charge. Kernel just
+  enforces the deadline.
+- Async PDU `REQUEST_LOGOUT` (opcode 0x32, AsyncEvent 0x01) is the clean session-drop signal.
+  TCP RST is the abrupt one.
+- For session-drop fencing: target removes ACL → reconnect attempts fail at Login → after
+  `replacement_timeout`, paths fail and (with `no_path_retry=queue`) bios queue forever.
+- All references to a per-command session age use the SCSI command's private area (modern
+  `iscsi_cmd(sc)` / `scsi_cmd_priv()`), not the legacy `sc->SCp` field which was removed in v6.2.
 
 ---
 
 ## Previous / Next
 
-[Day 11 — iscsi_tcp RX path](day11.md) | [Day 13 — PR slow path initiator side](day13.md)
+[Day 11 — iscsi_tcp RX path](day11.md) | [Day 13 — PR slow path: initiator side](day13.md)

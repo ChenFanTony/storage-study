@@ -1,437 +1,448 @@
-# Day 17 — target_core_transport: completion path
+# Day 17 — target_core_transport completion path
 
-**Week 3**: LIO Target Core — Fabric to Backend
-**Time**: 1–2 hours
+**Week 3**: LIO Target Kernel Code  
+**Time**: 1–2 hours  
 **Reference**: `drivers/target/target_core_transport.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-The completion path runs in `target_completion_wq`. It takes a completed `se_cmd` (from either
-the backend or the PR/emulation inline path), stamps the final SCSI status and sense data, and
-calls the fabric's `queue_status()` to send the response PDU back to the initiator. Understanding
-every step here explains how `RESERVATION CONFLICT`, `CHECK CONDITION`, and `GOOD` statuses are
-generated and how they get back to the initiator.
+When a backend (iblock, fileio) finishes executing a command — or when an error short-circuits
+the dispatch — control returns to the target core for response generation. The completion path
+is `target_complete_cmd()` → workqueue → `target_complete_ok_work` (or
+`target_complete_failure_work`) → fabric callbacks (`queue_data_in`, `queue_status`) → command
+release. This is also where sense data gets built and where the abort/release race is resolved.
 
 ---
 
 ## target_complete_cmd — `drivers/target/target_core_transport.c`
 
-The entry point for all completions. Called by:
-- Backend I/O done: `iblock_bio_done()` → `target_complete_cmd()`
-- PR emulation done: `core_scsi3_emulate_pro()` → `target_complete_cmd()`
-- Request failure: `transport_generic_request_failure()` → `target_complete_cmd()`
-- TMF completion: `core_tmr_abort_task()` → `target_complete_cmd()`
+The single entry point used by every backend and every error path.
 
 ```c
+/* Simplified — see drivers/target/target_core_transport.c. */
 void target_complete_cmd(struct se_cmd *cmd, u8 scsi_status)
 {
-    int success;
+    struct se_device *dev = cmd->se_dev;
+    int success = scsi_status == SAM_STAT_GOOD;
+    unsigned long flags;
 
-    spin_lock_irqsave(&cmd->t_state_lock, flags);
-
-    /*
-     * If CMD_T_ABORTED is set, this command was aborted by a TMF.
-     * Don't send a normal SCSI response — the TMF handler deals with it.
-     */
-    if (cmd->transport_state & CMD_T_ABORTED) {
-        /*
-         * Complete the transport stop — unblock the TMF waiter.
-         */
-        if (cmd->transport_state & CMD_T_STOP) {
-            spin_unlock_irqrestore(&cmd->t_state_lock, flags);
-            complete_all(&cmd->t_transport_stop_comp);
-            return;
-        }
-        spin_unlock_irqrestore(&cmd->t_state_lock, flags);
-        target_handle_aborted_cmd(cmd);
-        return;
-    }
-
-    /*
-     * Stamp the SCSI status on the command.
-     * scsi_status = SAM_STAT_GOOD (0x00) for success
-     *             = SAM_STAT_CHECK_CONDITION (0x02) for errors with sense
-     *             = SAM_STAT_RESERVATION_CONFLICT (0x18) for PR conflict
-     *             = SAM_STAT_TASK_ABORTED (0x40) for TMF abort
-     */
     cmd->scsi_status = scsi_status;
 
-    success = (scsi_status == SAM_STAT_GOOD);
-    cmd->transport_state &= ~CMD_T_ACTIVE;
+    spin_lock_irqsave(&cmd->t_state_lock, flags);
+    cmd->t_state = TRANSPORT_COMPLETE;
+    cmd->transport_state |= (CMD_T_COMPLETE | CMD_T_ACTIVE);
 
+    /*
+     * If the command was aborted while we were in the backend,
+     * t_transport_stop_comp wakes the abort handler instead.
+     */
+    if (cmd->transport_state & CMD_T_ABORTED) {
+        spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+        complete_all(&cmd->t_transport_stop_comp);
+        return;
+    }
     spin_unlock_irqrestore(&cmd->t_state_lock, flags);
 
     /*
-     * Queue to the completion workqueue.
-     * work.func is set to either:
-     *   target_complete_ok_work  — command completed successfully or with sense
+     * Pick the work handler based on success.
+     * Both run on target_completion_wq.
      */
-    INIT_WORK(&cmd->work, success ? target_complete_ok_work :
-                                     target_complete_failure_work);
-    queue_work(target_completion_wq, &cmd->work);
+    INIT_WORK(&cmd->work, success ? target_complete_ok_work
+                                  : target_complete_failure_work);
+
+    /*
+     * For UNORDERED commands or fast paths, run inline on the calling
+     * CPU rather than queueing to the workqueue. This is a per-device
+     * optimization controlled by dev_attrib.
+     */
+    if (cmd->se_cmd_flags & SCF_TASK_ATTR_SET) {
+        queue_work_on(cmd->cpuid, target_completion_wq, &cmd->work);
+    } else {
+        queue_work(target_completion_wq, &cmd->work);
+    }
 }
 EXPORT_SYMBOL(target_complete_cmd);
 ```
 
+`CMD_T_ABORTED` set during execution means a TMF (ABORT TASK or LUN RESET) handler is waiting on
+`t_transport_stop_comp`. We must signal it instead of going down the normal completion path —
+the abort handler is responsible for completing the command (with TASK_ABORTED status or
+freeing).
+
 ---
 
-## target_complete_ok_work — the completion worker
+## target_complete_ok_work — successful completion
 
 ```c
+/* Simplified. */
 static void target_complete_ok_work(struct work_struct *work)
 {
     struct se_cmd *cmd = container_of(work, struct se_cmd, work);
-    int rc;
+    int ret;
 
     /*
-     * For reads: queue data to the initiator first via queue_data_in().
-     * The fabric sends Data-In PDUs. When all data is sent, the fabric
-     * calls se_tfo->queue_status() to send the final status PDU.
-     *
-     * For writes and no-data: go directly to queue_status().
+     * Update LUN counters (read_bytes / write_bytes) for stats.
      */
-    if (cmd->data_direction == DMA_FROM_DEVICE) {
-        /*
-         * For iSCSI: iscsit_queue_data_in() sends Data-In PDUs.
-         * If the S-bit optimisation is enabled, the last Data-In PDU
-         * carries the SCSI status piggybacked — no separate Response PDU.
-         */
-        rc = cmd->se_tfo->queue_data_in(cmd);
-        if (rc == -EAGAIN || rc == -ENOMEM) {
-            /* fabric temporarily unable — requeue */
-            goto queue_full;
+    transport_complete_task_attr(cmd);
+
+    /*
+     * For commands that returned data (READ): hand to fabric to
+     * deliver Data-In + Status.
+     */
+    switch (cmd->data_direction) {
+    case DMA_FROM_DEVICE:
+        if (cmd->data_length) {
+            /*
+             * Fabric callback to send Data-In PDU(s).
+             * For iSCSI: iscsit_queue_data_in() — builds Data-In PDUs
+             * with possibly piggybacked status (S-bit on last PDU).
+             */
+            ret = cmd->se_tfo->queue_data_in(cmd);
+            if (ret) {
+                transport_handle_queue_full(cmd, cmd->se_dev, ret, false);
+                return;
+            }
         }
-        return;
+        /* fall through */
+
+    case DMA_NONE:
+queue_status:
+        /*
+         * Send SCSI Response PDU (status only, no data).
+         * For iSCSI: iscsit_queue_status() — builds the Response PDU
+         * with status, sense (if any), and sequence numbers.
+         */
+        ret = cmd->se_tfo->queue_status(cmd);
+        if (ret == -EAGAIN || ret == -ENOMEM)
+            transport_handle_queue_full(cmd, cmd->se_dev, ret, false);
+        break;
+
+    case DMA_TO_DEVICE:
+        /*
+         * For WRITE: data was already received via write_pending →
+         * fabric data-receive → backend I/O. Now just status remains.
+         */
+        goto queue_status;
+
+    default:
+        break;
     }
-
-    /*
-     * For writes, no-data (INQUIRY, PR OUT, TUR), and errors:
-     * call queue_status() to send the SCSI Response PDU.
-     *
-     * For iSCSI: queue_status = iscsit_queue_status()
-     *   → iscsit_send_response()
-     *   → TX kthread
-     *   → SCSI Response PDU on wire
-     *
-     * The SCSI Response PDU carries:
-     *   - Status field: cmd->scsi_status (0x00, 0x02, 0x18, etc.)
-     *   - Sense data (if CHECK CONDITION): from cmd->sense_buffer
-     *   - ResidualCount (if underrun/overrun)
-     *   - StatSN, ExpCmdSN, MaxCmdSN (window management)
-     */
-    rc = cmd->se_tfo->queue_status(cmd);
-    if (rc == -EAGAIN || rc == -ENOMEM)
-        goto queue_full;
-
-    return;
-
-queue_full:
-    /*
-     * Fabric temporarily busy (TX buffer full).
-     * Requeue to try again.
-     */
-    transport_handle_queue_full(cmd, cmd->se_dev, rc, false);
 }
 ```
 
----
-
-## transport_generic_request_failure — generating sense data
-
-Called when a command fails anywhere in the path (PR conflict, ALUA denial, backend error, etc.):
+`cmd->se_tfo->queue_data_in` and `queue_status` are the fabric's hooks. For iSCSI:
 
 ```c
-void transport_generic_request_failure(struct se_cmd *cmd,
-                                        sense_reason_t reason)
-{
-    /*
-     * Map the TCM_* sense reason to SCSI sense key / ASC / ASCQ.
-     * The sense data is written into cmd->sense_buffer (96 bytes).
-     */
-    switch (reason) {
-    case TCM_NON_EXISTENT_LUN:
-        /* ILLEGAL REQUEST, ASC=0x25 (LU NOT SUPPORTED) */
-        cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
-        scsi_build_sense(cmd->sense_buffer, 0,
-                         ILLEGAL_REQUEST, 0x25, 0x00);
-        break;
-
-    case TCM_UNSUPPORTED_SCSI_OPCODE:
-        /* ILLEGAL REQUEST, ASC=0x20 (INVALID COMMAND OPERATION CODE) */
-        cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
-        scsi_build_sense(cmd->sense_buffer, 0,
-                         ILLEGAL_REQUEST, 0x20, 0x00);
-        break;
-
-    case TCM_SECTOR_COUNT_TOO_MANY:
-    case TCM_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE:
-        /* ILLEGAL REQUEST, ASC=0x21 (LBA OUT OF RANGE) */
-        cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
-        scsi_build_sense(cmd->sense_buffer, 0,
-                         ILLEGAL_REQUEST, 0x21, 0x00);
-        break;
-
-    case TCM_WRITE_PROTECTED:
-        /* DATA PROTECT, ASC=0x27 (WRITE PROTECTED) */
-        cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
-        scsi_build_sense(cmd->sense_buffer, 0,
-                         DATA_PROTECT, 0x27, 0x00);
-        break;
-
-    case TCM_CHECK_CONDITION_UNIT_ATTENTION:
-        /* UNIT ATTENTION — generated for power-on, mode change, etc. */
-        cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
-        /* sense data already set by caller */
-        break;
-
-    case TCM_RESERVATION_CONFLICT:
-        /*
-         * RESERVATION CONFLICT is NOT a CHECK CONDITION.
-         * It has its own SCSI status byte (0x18).
-         * No sense data is attached.
-         * The Response PDU status field = 0x18, data segment = empty.
-         */
-        cmd->scsi_status     = SAM_STAT_RESERVATION_CONFLICT;
-        cmd->scsi_sense_reason = TCM_RESERVATION_CONFLICT;
-        /* NO sense buffer written — RESERVATION CONFLICT needs none */
-        goto queue_status;  /* skip sense building, go straight to complete */
-
-    case TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE:
-        /*
-         * NOT READY — hardware error or LUN offline.
-         * HARDWARE ERROR, ASC=0x08 (LOGICAL UNIT COMMUNICATION FAILURE)
-         */
-        cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
-        scsi_build_sense(cmd->sense_buffer, 0,
-                         HARDWARE_ERROR, 0x08, 0x00);
-        break;
-
-    case TCM_ALUA_TG_PT_STANDBY:
-        /*
-         * ALUA: target port is in Standby state.
-         * NOT READY, ASC=0x04, ASCQ=0x0B (LOGICAL UNIT NOT ACCESSIBLE,
-         * TARGET PORT IN STANDBY STATE)
-         */
-        cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
-        scsi_build_sense(cmd->sense_buffer, 0,
-                         NOT_READY, 0x04, 0x0B);
-        break;
-
-    /* ... many more cases ... */
-    }
-
-    target_complete_cmd(cmd, cmd->scsi_status);
-    return;
-
-queue_status:
-    target_complete_cmd(cmd, cmd->scsi_status);
-}
-EXPORT_SYMBOL(target_generic_request_failure);
+/* drivers/target/iscsi/iscsi_target_configfs.c */
+static const struct target_core_fabric_ops iscsi_ops = {
+    .queue_data_in    = iscsit_queue_data_in,
+    .queue_status     = iscsit_queue_status,
+    .queue_tm_rsp     = iscsit_queue_tm_rsp,
+    .release_cmd      = iscsit_release_cmd,
+    .write_pending    = iscsit_write_pending,
+    /* ... */
+};
 ```
+
+`iscsit_queue_data_in()` and `iscsit_queue_status()` add the command to the appropriate iSCSI
+output queue and signal the iSCSI TX thread (day 19).
 
 ---
 
-## target_complete_failure_work — the failure completion worker
+## target_complete_failure_work — error completion
 
 ```c
 static void target_complete_failure_work(struct work_struct *work)
 {
     struct se_cmd *cmd = container_of(work, struct se_cmd, work);
 
-    /*
-     * For commands that completed with an error (CHECK CONDITION,
-     * RESERVATION CONFLICT, etc.):
-     * queue_status() sends the SCSI Response PDU with the error status
-     * and sense data.
-     *
-     * The iSCSI Response PDU for CHECK CONDITION:
-     *   - Status = 0x02 (CHECK CONDITION)
-     *   - DataSegmentLength = 2 + sense_length (2-byte length prefix)
-     *   - Data segment = [sense_length(2)] [sense_buffer]
-     *
-     * The iSCSI Response PDU for RESERVATION CONFLICT:
-     *   - Status = 0x18
-     *   - DataSegmentLength = 0 (no sense data)
-     */
-    transport_complete_qf(cmd);
+    transport_generic_request_failure(cmd, cmd->scsi_sense_reason);
 }
 
-static void transport_complete_qf(struct se_cmd *cmd)
+void transport_generic_request_failure(struct se_cmd *cmd,
+                                         sense_reason_t sense_reason)
 {
-    int rc = 0;
+    /*
+     * Build sense data appropriate for sense_reason.
+     */
+    transport_send_check_condition_and_sense(cmd, sense_reason, 0);
 
-    if (cmd->se_cmd_flags & SCF_TRANSPORT_TASK_SENSE)
-        rc = cmd->se_tfo->queue_status(cmd);
-
-    if (!rc)
-        rc = cmd->se_tfo->queue_status(cmd);
-
-    if (rc)
-        transport_handle_queue_full(cmd, cmd->se_dev, rc, false);
+    /*
+     * Drop the kref that was held during execution.
+     */
+    target_put_sess_cmd(cmd);
 }
 ```
 
+In current kernels these two helpers may be merged or further refactored, but the responsibility
+split is the same: success path delivers data + status, failure path builds sense and sends
+status.
+
 ---
 
-## target_put_sess_cmd — reference counting and cleanup
+## transport_send_check_condition_and_sense
 
 ```c
-void target_put_sess_cmd(struct se_cmd *se_cmd)
+/* Simplified — see target_core_transport.c. */
+int transport_send_check_condition_and_sense(struct se_cmd *cmd,
+                                                sense_reason_t reason,
+                                                int from_transport)
 {
-    /*
-     * Drop the command reference. When it reaches 0, the command
-     * memory is released.
-     *
-     * kref_put() calls target_release_cmd_kref() when count = 0:
-     *   - removes se_cmd from se_sess->sess_cmd_list
-     *   - releases LUN reference: percpu_ref_put(&se_cmd->se_lun->lun_ref)
-     *   - calls se_cmd->se_tfo->check_stop_free() → iscsit_check_stop_free()
-     *   - frees SGL pages
-     *   - calls fabric's release function to free the se_cmd memory
-     *     (for iSCSI: the iscsit_cmd contains the se_cmd inline)
-     */
-    kref_put(&se_cmd->cmd_kref, target_release_cmd_kref);
-}
+    struct se_device *dev = cmd->se_dev;
+    int ret;
 
+    if (!from_transport) {
+        cmd->se_cmd_flags |= SCF_EMULATED_TASK_SENSE;
+        cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
+    }
+
+    /*
+     * Map TCM_* sense reason → SCSI sense key / ASC / ASCQ.
+     * Table-driven via sense_info_table in target_core_transport.c.
+     *
+     * Examples:
+     *   TCM_NON_EXISTENT_LUN          -> ILLEGAL_REQUEST 25/00
+     *   TCM_LBA_OUT_OF_RANGE          -> ILLEGAL_REQUEST 21/00
+     *   TCM_RESERVATION_CONFLICT      -> (no sense — status 0x18)
+     *   TCM_CHECK_CONDITION_NOT_READY -> NOT_READY 04/<ascq>
+     *   TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE -> HARDWARE_ERROR 08/00
+     */
+
+    if (reason != TCM_RESERVATION_CONFLICT) {
+        scsi_build_sense(cmd, dev->dev_attrib.emulate_ua_intlck_ctrl,
+                         sense_key, asc, ascq);
+    } else {
+        /*
+         * RESERVATION CONFLICT is a status, not a sense. Set status
+         * byte to 0x18 directly. Some targets attach sense; LIO does not.
+         */
+        cmd->scsi_status = SAM_STAT_RESERVATION_CONFLICT;
+    }
+
+    /*
+     * Dispatch the response via fabric.
+     */
+    ret = cmd->se_tfo->queue_status(cmd);
+    return ret;
+}
+```
+
+`scsi_build_sense()` is shared with the initiator side — both build sense in the same fixed
+(0x70) or descriptor (0x72) format. Lives in `drivers/scsi/scsi_common.c`. Day 29 covers the
+sense format in detail.
+
+---
+
+## target_release_cmd_kref — command teardown
+
+After the response is on the wire, the fabric drops its kref via `target_put_sess_cmd()`. When
+the count hits zero:
+
+```c
 static void target_release_cmd_kref(struct kref *kref)
 {
-    struct se_cmd *se_cmd = container_of(kref, struct se_cmd, cmd_kref);
-    struct se_session *se_sess = se_cmd->se_sess;
-    struct completion *compl = NULL;
-    unsigned long flags;
+    struct se_cmd *cmd = container_of(kref, struct se_cmd, cmd_kref);
+    struct se_session *se_sess = cmd->se_sess;
 
-    spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
-    list_del_init(&se_cmd->se_cmd_list);
+    spin_lock(&se_sess->sess_cmd_lock);
+    if (!list_empty(&cmd->se_cmd_list))
+        list_del_init(&cmd->se_cmd_list);
+    spin_unlock(&se_sess->sess_cmd_lock);
 
     /*
-     * If session teardown is waiting for commands to drain,
-     * wake it when the list becomes empty.
+     * Free any backend resources (SGL pages, etc.).
+     * Must happen BEFORE release_cmd() because release_cmd() may free
+     * the containing struct (iscsit_cmd) which the SGL might reference.
      */
-    if (se_sess->sess_tearing_down && list_empty(&se_sess->sess_cmd_list))
-        compl = &se_sess->sess_wait_comp;
-    spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+    transport_free_pages(cmd);
 
-    /* release LUN reference */
-    if (se_cmd->lun_ref_active)
-        percpu_ref_put(&se_cmd->se_lun->lun_ref);
+    /*
+     * Drop the LUN reference taken in transport_lookup_cmd_lun().
+     * If this is the last command holding the LUN's percpu_ref, and
+     * percpu_ref_kill has been called, the LUN can now be torn down.
+     */
+    if (cmd->se_lun)
+        percpu_ref_put(&cmd->se_lun->lun_ref);
 
-    /* free SGL */
-    transport_free_pages(se_cmd);
+    /*
+     * Fabric-specific cleanup. For iSCSI: iscsit_release_cmd() frees
+     * the iscsit_cmd and returns its tag to the session pool.
+     */
+    cmd->se_tfo->release_cmd(cmd);
 
-    /* fabric cleanup */
-    se_cmd->se_tfo->release_cmd(se_cmd);
+    /*
+     * Drop the per-session command counter. When this percpu_ref is
+     * killed (during session shutdown), its release waits for all
+     * commands to drop their refs.
+     */
+    percpu_ref_put(&se_sess->cmd_count);
 
-    if (compl)
-        complete(compl);  /* wake session teardown waiter */
+    /*
+     * Wake the abort waiter, if any.
+     */
+    if (cmd->free_compl_on_release)
+        complete(&cmd->free_compl);
 }
 ```
 
-`sess_tearing_down` + `sess_cmd_list` drain is the safe session teardown mechanism (day 25). When
-`target_wait_for_sess_cmds()` is called during `iscsit_close_session()`, it waits for
-`sess_cmd_list` to become empty. Each `target_release_cmd_kref()` call checks this and wakes
-the waiter when the last command is released.
+The ordering — `transport_free_pages` BEFORE `release_cmd` — is critical. `release_cmd` may free
+the `iscsit_cmd` that owns the SGL pages, so we need to release the pages first.
 
 ---
 
-## Complete completion path for RESERVATION CONFLICT
+## Abort race — why CMD_T_FABRIC_STOP exists
+
+Consider this race scenario:
 
 ```
-core_scsi3_pr_seq_non_holder() returns TCM_RESERVATION_CONFLICT
-    │  (called from target_submit_cmd → target_scsi3_pr_reservation_check)
-    ▼
-transport_generic_request_failure(cmd, TCM_RESERVATION_CONFLICT)
-    │  cmd->scsi_status = SAM_STAT_RESERVATION_CONFLICT (0x18)
-    │  no sense data written (RESERVATION CONFLICT needs none)
-    ▼
-target_complete_cmd(cmd, SAM_STAT_RESERVATION_CONFLICT)
-    │  INIT_WORK(&cmd->work, target_complete_failure_work)
-    │  queue_work(target_completion_wq, &cmd->work)
-    ▼
-[target_completion_wq worker fires]
-target_complete_failure_work()
-    │  → transport_complete_qf()
-    ▼
-cmd->se_tfo->queue_status(cmd)
-    │  = iscsit_queue_status(cmd)  [for iSCSI]
-    ▼
-iscsit_send_response(conn, cmd)
-    │  builds SCSI Response PDU:
-    │    opcode = ISCSI_OP_SCSI_CMD_RSP (0x21)
-    │    cmd_status = 0x18 (RESERVATION CONFLICT)
-    │    DataSegmentLength = 0 (no sense)
-    │    StatSN, ExpCmdSN, MaxCmdSN (window fields)
-    │  TX kthread sends PDU over TCP socket
-    ▼
-Initiator receives SCSI Response PDU
-    │  iscsi_scsi_cmd_rsp() (day 11):
-    │    sc->result = DID_OK | SAM_STAT_RESERVATION_CONFLICT
-    │    sc->scsi_done(sc)
-    ▼
-scsi_done() → scsi_complete() [passthrough]
-    │  blk_end_sync_rq() → complete() → wakes blk_execute_rq()
-    ▼
-scsi_execute_cmd() returns
-    │  sd_pr_reserve() returns error
-    ▼
-blk_pr_reserve() returns -ENODEV to ioctl caller
-    │  ioctl() returns -ENODEV to userspace
-    ▼
-Cluster fencing agent sees: reservation failed → fencing complete
+Thread A (RX): receives ABORT TASK TMF for ITT=0x42
+Thread B (TX): just finished sending Status PDU for ITT=0x42
+
+Time   Thread A                            Thread B
+─────  ──────────────────────              ──────────────────────
+T0     iscsit_handle_task_mgt()
+T1     core_tmr_abort_task() walks
+       sess_cmd_list, finds cmd
+T2                                         iscsit_send_response() done
+T3                                         target_release_cmd_kref()
+T4                                         transport_free_pages()
+T5     spin_lock(t_state_lock)
+T6                                         release_cmd() → kfree(iscsit_cmd)
+T7     test cmd->transport_state           ← USE-AFTER-FREE
 ```
+
+The fix: TMR processing takes a kref on every command it intends to abort, before walking the
+list. The kref guarantees the cmd cannot be freed while TMR is examining it:
+
+```c
+/* Simplified — see drivers/target/target_core_tmr.c. */
+static void core_tmr_drain_state_list(...)
+{
+    struct se_cmd *cmd, *next;
+
+    spin_lock_irqsave(&dev->execute_task_lock, flags);
+    list_for_each_entry_safe(cmd, next, &drain_task_list, state_list) {
+        /*
+         * Take a kref on this cmd. If kref is already 0, this returns
+         * false and we skip the cmd — it's already being released.
+         */
+        if (!target_get_sess_cmd_kref(cmd))
+            continue;
+
+        list_del_init(&cmd->state_list);
+
+        /* mark for abort */
+        spin_lock(&cmd->t_state_lock);
+        cmd->transport_state |= (CMD_T_ABORTED | CMD_T_FABRIC_STOP);
+        spin_unlock(&cmd->t_state_lock);
+
+        /* ... wait for completion ... */
+
+        target_put_sess_cmd(cmd);   /* drop our kref */
+    }
+    spin_unlock_irqrestore(&dev->execute_task_lock, flags);
+}
+```
+
+`CMD_T_FABRIC_STOP` (added around 2017) distinguishes "fabric is going away — wait for in-flight
+I/O to complete cleanly" from `CMD_T_ABORTED` ("abort this specific command"). During session
+shutdown, every command gets `CMD_T_FABRIC_STOP` set, the fabric stops accepting new work, and
+existing work drains naturally. The exact rationale beyond ordering preservation is upstream
+inference — the commit log emphasizes coordinated teardown rather than spelling out a specific
+memory hazard.
 
 ---
 
-## Complete completion path for a successful READ
+## target_tmr_wq — why ordered
+
+```c
+target_tmr_wq = alloc_workqueue("tmr-%s",
+                                  WQ_MEM_RECLAIM | WQ_UNBOUND |
+                                  __WQ_ORDERED, 1, dev_alias);
+```
+
+`__WQ_ORDERED` means: only one work item runs at a time. TMF processing must be serialized
+because:
+
+1. Two ABORT TASK TMFs can race on the same `sess_cmd_list` walk. Concurrent walks would each
+   try to take krefs and could double-account.
+2. ABORT TASK SET (kills all tasks for an I_T_L) and ABORT TASK (kills one) must not
+   interleave — order matters for which commands get TASK_ABORTED status (`CMD_T_TAS`).
+3. LOGICAL UNIT RESET vs in-flight ABORT TASK: the LUN reset must process all current aborts
+   first, then quiesce.
+
+Strict FIFO ordering avoids these hazards. The cost — only one TMF processed at a time per
+device — is acceptable because TMFs are rare (orders of magnitude rarer than data commands).
+
+---
+
+## Full completion flow for a successful WRITE
 
 ```
-iblock_bio_done() called by block layer completion softirq
-    │  target_complete_cmd(cmd, SAM_STAT_GOOD)
+backend (iblock_bio_done) calls target_complete_cmd(cmd, SAM_STAT_GOOD)
+    │
     ▼
 target_complete_cmd()
-    │  cmd->scsi_status = SAM_STAT_GOOD
-    │  INIT_WORK(&cmd->work, target_complete_ok_work)
-    │  queue_work(target_completion_wq, &cmd->work)
-    ▼
-[target_completion_wq worker]
+    │  cmd->scsi_status = GOOD
+    │  cmd->t_state = TRANSPORT_COMPLETE
+    │  CMD_T_ABORTED check: not aborted
+    │  INIT_WORK(work, target_complete_ok_work)
+    │  queue_work(target_completion_wq, work)
+    │
+    ▼  (work item runs — possibly on different CPU)
 target_complete_ok_work()
-    │  data_direction == DMA_FROM_DEVICE
+    │  cmd->data_direction = DMA_TO_DEVICE
+    │  → goto queue_status
+    │  cmd->se_tfo->queue_status(cmd)
     ▼
-cmd->se_tfo->queue_data_in(cmd)
-    │  = iscsit_queue_data_in(cmd)
-    │  → iscsit_send_datain() × N PDUs
-    │    each Data-In PDU: BHS + data segment from SGL
-    │    last PDU: F=1, S=1 (status piggybacked) → status = GOOD
+iscsit_queue_status(cmd)                  [drivers/target/iscsi/iscsi_target.c]
+    │  set ICF flag for status pending
+    │  iscsit_add_cmd_to_response_queue()
+    │  signal iSCSI TX thread
     ▼
-Initiator receives Data-In PDUs + final status
-    │  iscsi_data_in_rsp() per PDU
-    │  on S=1: sc->result = DID_OK | SAM_STAT_GOOD
-    │           iscsi_complete_scsi_task() → sc->scsi_done(sc)
+iSCSI TX thread (day 19)
+    │  build SCSI Response PDU BHS
+    │    opcode = 0x21
+    │    response = 0x00 (CMD_COMPLETED)
+    │    cmd_status = 0x00 (GOOD)
+    │  send via TCP
     ▼
-scsi_done() → blk_complete_request() → softirq → scsi_io_completion()
-    │  scsi_decide_disposition() → SUCCESS
-    │  blk_mq_complete_request() → bio_endio()
-    ▼
-VFS / filesystem / application: read() returns data
+target_release_cmd_kref()
+    │  remove from sess_cmd_list
+    │  transport_free_pages()
+    │  percpu_ref_put(lun_ref)
+    │  cmd->se_tfo->release_cmd()
+    │      iscsit_release_cmd() — return tag to session pool
+    │  percpu_ref_put(cmd_count)
 ```
+
+For a RESERVATION CONFLICT path, the diagram is similar but `target_complete_failure_work` is
+queued instead of `target_complete_ok_work`, and `transport_send_check_condition_and_sense()`
+sets `cmd->scsi_status = SAM_STAT_RESERVATION_CONFLICT` before the response is sent.
 
 ---
 
 ## Key takeaways
 
-- `target_complete_cmd()` stamps `scsi_status`, sets `cmd->work.func`, and calls
-  `queue_work(target_completion_wq, &cmd->work)`.
-- `target_complete_ok_work()` runs in completion_wq. For reads: `queue_data_in()` first, then
-  `queue_status()`. For writes/no-data: `queue_status()` directly.
-- `transport_generic_request_failure()` maps `TCM_*` reason codes to SCSI status + sense data.
-  `TCM_RESERVATION_CONFLICT` maps to `SAM_STAT_RESERVATION_CONFLICT` (0x18) with no sense data.
-- `queue_status()` = fabric callback = `iscsit_queue_status()` for iSCSI → builds and queues the
-  SCSI Response PDU to the TX kthread.
-- `target_put_sess_cmd()` drops the cmd reference. When 0: removes from `sess_cmd_list`, releases
-  LUN ref, frees SGL, calls fabric release. Wakes session teardown waiter if list empty.
-- `sess_tearing_down` + `sess_cmd_list` drain = the safe shutdown mechanism for fencing.
-- `CMD_T_ABORTED` prevents double-completion when a TMF aborts a command that's also completing.
+- `target_complete_cmd()` is the single entry from backends. It chooses success vs failure work
+  and queues to `target_completion_wq`.
+- `target_complete_ok_work()` calls fabric `queue_data_in` (for reads) then `queue_status`.
+- `target_complete_failure_work()` calls `transport_generic_request_failure` →
+  `transport_send_check_condition_and_sense` → fabric `queue_status`.
+- Abort race: TMR takes a kref on every command before examining it. `CMD_T_FABRIC_STOP`
+  distinguishes session shutdown from per-command abort, allowing in-flight I/O to drain
+  cleanly during teardown.
+- `target_tmr_wq` is `__WQ_ORDERED` so TMFs run strictly serially — avoids races on
+  `sess_cmd_list` walks and preserves the SAM-required ordering between ABORT TASK / TASK SET
+  / LUN RESET.
+- `target_release_cmd_kref()` ordering: `transport_free_pages()` → `percpu_ref_put(lun_ref)` →
+  `release_cmd()` → `percpu_ref_put(cmd_count)`. SGL freed before release_cmd so dangling
+  pointers don't form.
+- `scsi_build_sense()` is shared between initiator and target — both produce the same wire-format
+  sense data.
 
 ---
 

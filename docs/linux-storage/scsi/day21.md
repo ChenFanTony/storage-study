@@ -1,152 +1,201 @@
-# Day 21 — LIO backends
+# Day 21 — LIO backends: iblock, fileio, ramdisk, pscsi
 
-**Week 3**: LIO Target Core — Fabric to Backend
-**Time**: 1–2 hours
-**Reference**: `drivers/target/target_core_iblock.c`, `drivers/target/target_core_file.c`, `drivers/target/target_core_pscsi.c`
+**Week 3**: LIO Target Kernel Code  
+**Time**: 1–2 hours  
+**Reference**: `drivers/target/target_core_iblock.c`, `target_core_file.c`, `target_core_rd.c`, `target_core_pscsi.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-LIO supports multiple backend plugins — iblock (block device), fileio (file), and pscsi (SCSI
-passthrough). Each implements `target_backend_ops.execute_cmd`. The backend receives an `se_cmd`
-with a fully-populated SGL and must call `target_complete_cmd()` when done. Understanding iblock
-most deeply is worth the time — it is the production backend for real storage and the one that
-shows exactly how the SGL from the iSCSI fabric maps to block layer I/O.
+LIO separates fabric (iSCSI/FC/etc.) from backend storage. A backend implements
+`struct target_backend_ops` with an `execute_cmd` that turns a `se_cmd` into actual I/O. Four
+backends are upstream: `iblock` (block devices), `fileio` (regular files), `ramdisk`,
+`pscsi` (SCSI passthrough). Choice of backend affects performance, features (PR, ALUA, T10-DIF),
+and recovery semantics.
 
 ---
 
-## iblock backend — `drivers/target/target_core_iblock.c`
-
-### struct iblock_dev
+## struct target_backend_ops — `include/target/target_core_backend.h`
 
 ```c
-struct iblock_dev {
-    struct block_device     *ibd_bd;         /* the underlying block device */
-    struct bio_set          ibd_bio_set;     /* pre-allocated bio pool */
-    struct iblock_req       *ibd_bio_err_lock; /* for error tracking */
-    struct request_queue    *ibd_request_queue;
+struct target_backend_ops {
+    char            name[16];
+
+    /* Module reference */
+    struct module   *owner;
+
+    /* Lifecycle */
+    int             (*attach_hba)(struct se_hba *, u32);
+    void            (*detach_hba)(struct se_hba *);
+    struct se_device *(*alloc_device)(struct se_hba *, const char *);
+    int             (*configure_device)(struct se_device *);
+    void            (*destroy_device)(struct se_device *);
+    void            (*free_device)(struct se_device *);
+
+    /* I/O dispatch */
+    sense_reason_t  (*parse_cdb)(struct se_cmd *cmd);
+    sense_reason_t  (*execute_cmd)(struct se_cmd *cmd);
+
+    /* Capabilities */
+    u32             (*get_blocks)(struct se_device *);
+    u32             (*get_block_size)(struct se_device *);
+    sector_t        (*get_alignment_offset_lbas)(struct se_device *);
+    unsigned int    (*get_lbppbe)(struct se_device *);
+    unsigned int    (*get_io_min)(struct se_device *);
+    unsigned int    (*get_io_opt)(struct se_device *);
+    unsigned char   *(*get_sense_buffer)(struct se_cmd *);
+
+    /* configfs */
+    ssize_t         (*set_configfs_dev_params)(struct se_device *,
+                                                 const char *, ssize_t);
+    ssize_t         (*show_configfs_dev_params)(struct se_device *,
+                                                  char *);
+
+    /* Transport flags */
+    u32             transport_flags_changeable;
+    u32             transport_flags_default;
 };
 ```
 
-`ibd_bd` is the `struct block_device` for `/dev/sda`, `/dev/nvme0n1`, etc. All block I/O goes
-through this device — iblock is essentially a thin pass-through from LIO's SGL to the block layer.
+`execute_cmd` is the function the target core calls (via `target_execute_cmd_work` on
+`target_submission_wq`) when it's time to do actual I/O.
 
 ---
 
-### iblock_execute_rw — `drivers/target/target_core_iblock.c`
+## iblock — backed by a Linux block device
 
-The main execute function for READ and WRITE commands:
+The most common backend. Wraps a `/dev/sdX`, `/dev/nvme0n1`, `/dev/dm-N`, etc.
+
+### iblock_alloc_device
 
 ```c
-static sense_reason_t iblock_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl,
-                                         u32 sgl_nents, enum dma_data_direction data_direction)
+/* Simplified — see drivers/target/target_core_iblock.c. */
+static struct se_device *iblock_alloc_device(struct se_hba *hba,
+                                                const char *name)
 {
-    struct se_device *dev     = cmd->se_dev;
+    struct iblock_dev *ib_dev;
+
+    ib_dev = kzalloc(sizeof(*ib_dev), GFP_KERNEL);
+    if (!ib_dev)
+        return NULL;
+
+    /* configfs writes the path here later via set_configfs_dev_params */
+    return &ib_dev->dev;
+}
+
+static int iblock_configure_device(struct se_device *dev)
+{
     struct iblock_dev *ib_dev = IBLOCK_DEV(dev);
-    struct iblock_req *ibr;
-    struct bio *bio;
-    struct bio_list list;
-    struct scatterlist *sg;
-    sector_t block_lba;
-    u32 sg_num = sgl_nents;
-    unsigned bio_cnt;
-    int i;
+    struct block_device *bd;
+    fmode_t mode;
 
-    /*
-     * Translate the SCSI LBA from the CDB to a block layer sector number.
-     * LBA is in cmd->t_task_lba (set by parse_cdb from CDB bytes).
-     * Block layer uses 512-byte sectors.
-     * Device logical block size may differ (4096 bytes):
-     *   sector = lba * (dev_attrib.block_size / 512)
-     */
-    block_lba = target_to_linux_sector(dev, cmd->t_task_lba);
+    mode = FMODE_READ | FMODE_WRITE | FMODE_EXCL;
 
-    ibr = kzalloc(sizeof(struct iblock_req), GFP_KERNEL);
-    if (!ibr)
-        goto fail;
+    /* open the configured block device path */
+    bd = blkdev_get_by_path(ib_dev->ibd_udev_path, mode, ib_dev,
+                              NULL);
+    if (IS_ERR(bd))
+        return PTR_ERR(bd);
 
-    cmd->priv = ibr;
+    ib_dev->ibd_bd = bd;
 
-    /* atomic reference count — one per bio submitted */
-    atomic_set(&ibr->pending, 1);
-    ibr->cmd = cmd;
+    /* set up bio_set for fast bio allocation under memory pressure */
+    bioset_init(&ib_dev->ibd_bio_set, IBLOCK_BIO_POOL_SIZE,
+                offsetof(struct iblock_req, ib_bio), BIOSET_NEED_BVECS);
 
-    bio_list_init(&list);
+    /* probe device attributes (block size, max sectors, etc.) */
+    dev->dev_attrib.hw_block_size       = bdev_logical_block_size(bd);
+    dev->dev_attrib.hw_max_sectors      = queue_max_hw_sectors(bdev_get_queue(bd));
+    dev->dev_attrib.hw_queue_depth      = bdev_get_queue(bd)->nr_requests;
+    dev->dev_attrib.is_nonrot           = blk_queue_nonrot(bdev_get_queue(bd));
+    dev->dev_attrib.fua_write_emulated  = false;
 
-    /*
-     * Convert the se_cmd SGL into one or more bios.
-     * Each bio can hold up to BIO_MAX_VECS (256) pages.
-     * A large SGL (e.g. 1MB / 4KB pages = 256 entries) may need
-     * multiple bios chained together.
-     */
-    bio = iblock_get_bio(cmd, block_lba, sgl_nents, data_direction);
-    if (!bio)
-        goto fail_free_ibr;
-
-    bio_list_add(&list, bio);
-    bio_cnt = 1;
-
-    for_each_sg(sgl, sg, sgl_nents, i) {
-        /*
-         * Try to add this SGL entry to the current bio.
-         * bio_add_page() returns 0 if bio is full (BIO_MAX_VECS reached).
-         */
-        if (bio_add_page(bio, sg_page(sg), sg->length, sg->offset) != sg->length) {
-            /*
-             * Current bio is full. Allocate a new bio for the next sector.
-             * Update block_lba: advance by bytes consumed so far.
-             */
-            block_lba += bio_sectors(bio);
-            atomic_inc(&ibr->pending);  /* one more bio in flight */
-
-            bio = iblock_get_bio(cmd, block_lba, sg_num, data_direction);
-            if (!bio)
-                goto fail_put_bios;
-
-            bio_list_add(&list, bio);
-            bio_cnt++;
-
-            /* retry adding this sg to the new bio */
-            if (bio_add_page(bio, sg_page(sg), sg->length, sg->offset) != sg->length)
-                goto fail_put_bios;
-        }
-        sg_num--;
-    }
-
-    /*
-     * Submit all bios in the list.
-     * Each bio goes through the block layer (blk-mq) to the device.
-     * The block device may be an NVMe SSD, a spinning disk, or even
-     * another iSCSI target (chained targets).
-     */
-    while ((bio = bio_list_pop(&list))) {
-        /* completion callback: iblock_bio_done */
-        bio->bi_end_io  = iblock_bio_done;
-        bio->bi_private = cmd;
-
-        submit_bio(bio);  /* ← back into blk-mq on the target side */
-    }
-
-    return TCM_NO_SENSE;  /* 0: I/O submitted, not yet complete */
-
-fail_put_bios:
-    while ((bio = bio_list_pop(&list)))
-        bio_put(bio);
-fail_free_ibr:
-    kfree(ibr);
-fail:
-    return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+    return 0;
 }
 ```
 
-`submit_bio()` on the target side goes into blk-mq just like any filesystem write — the target
-IS a block device consumer. The I/O eventually reaches the device driver (NVMe, SATA, etc.) and
-completes via `iblock_bio_done()`.
+### iblock_execute_rw — the I/O entry
 
----
+```c
+/* Simplified. */
+sense_reason_t iblock_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl,
+                                   u32 sgl_nents,
+                                   enum dma_data_direction data_direction)
+{
+    struct iblock_dev *ib_dev = IBLOCK_DEV(cmd->se_dev);
+    struct iblock_req *ibr;
+    struct bio *bio;
+    sector_t block_lba = target_to_linux_sector(cmd, cmd->t_task_lba);
+    int sg_num = sgl_nents;
+    blk_opf_t opf;
+    unsigned int op_flags = 0;
+    struct scatterlist *sg;
+    int i;
 
-### iblock_bio_done — completion callback
+    /* allocate request tracking struct (one per se_cmd) */
+    ibr = kzalloc(sizeof(*ibr), GFP_KERNEL);
+    if (!ibr)
+        return TCM_OUT_OF_RESOURCES;
+    cmd->priv = ibr;
+
+    /*
+     * blk_opf_t builds the operation + flags word:
+     *   data_direction → REQ_OP_READ or REQ_OP_WRITE
+     *   FUA            → REQ_FUA (force unit access)
+     *   sync writes    → REQ_SYNC
+     */
+    opf = (data_direction == DMA_FROM_DEVICE) ? REQ_OP_READ : REQ_OP_WRITE;
+    if (cmd->se_cmd_flags & SCF_FUA)
+        op_flags |= REQ_FUA;
+
+    /*
+     * Allocate first bio. nr_vecs caps the number of bio_vec entries
+     * in this bio; if SGL has more, we'll chain additional bios.
+     * BIO_MAX_VECS is 256 in modern kernels.
+     */
+    bio = bio_alloc_bioset(ib_dev->ibd_bd,
+                             min_t(unsigned short, sg_num, BIO_MAX_VECS),
+                             opf | op_flags, GFP_NOIO,
+                             &ib_dev->ibd_bio_set);
+    if (!bio) {
+        kfree(ibr);
+        return TCM_OUT_OF_RESOURCES;
+    }
+
+    bio->bi_iter.bi_sector = block_lba;
+    bio->bi_private = ibr;
+    bio->bi_end_io = iblock_bio_done;
+
+    atomic_set(&ibr->pending, 1);  /* one bio in flight */
+
+    /*
+     * Walk the SGL, adding pages to the bio. When this bio fills up
+     * (returns 0 from bio_add_pc_page), allocate a chained bio.
+     */
+    for_each_sg(sgl, sg, sgl_nents, i) {
+        while (bio_add_pc_page(bdev_get_queue(ib_dev->ibd_bd),
+                                 bio, sg_page(sg), sg->length,
+                                 sg->offset) == 0) {
+            /* this bio is full — chain a new one */
+            atomic_inc(&ibr->pending);
+            bio = iblock_get_bio(cmd, block_lba, sg_num - i, opf);
+            /* link via bi_next */
+            bio->bi_next = ibr->ib_bio;
+            ibr->ib_bio = bio;
+        }
+        block_lba += sg->length >> SECTOR_SHIFT;
+    }
+
+    /* submit the bio chain */
+    iblock_submit_bios(&list);
+
+    return 0;
+}
+```
+
+### iblock_bio_done — completion
 
 ```c
 static void iblock_bio_done(struct bio *bio)
@@ -154,145 +203,125 @@ static void iblock_bio_done(struct bio *bio)
     struct se_cmd *cmd = bio->bi_private;
     struct iblock_req *ibr = cmd->priv;
 
-    /*
-     * Track I/O errors: if any bio in the chain failed, record it.
-     * blk_status_to_sense() maps BLK_STS_IOERR → MEDIUM_ERROR sense.
-     */
-    if (bio->bi_status)
-        atomic_inc(&ibr->bio_err_cnt);
+    if (bio->bi_status) {
+        atomic_inc(&ibr->ib_bio_err_cnt);
+        smp_mb__after_atomic();
+    }
 
     bio_put(bio);
 
-    /*
-     * Decrement the pending count. When it reaches 0, all bios for
-     * this command have completed. Call target_complete_cmd().
-     *
-     * If ibr->bio_err_cnt > 0: complete with CHECK_CONDITION (medium error).
-     * Otherwise: complete with SAM_STAT_GOOD.
-     */
+    /* When all bios are done, complete the se_cmd. */
     if (atomic_dec_and_test(&ibr->pending)) {
-        if (atomic_read(&ibr->bio_err_cnt)) {
+        if (atomic_read(&ibr->ib_bio_err_cnt))
             target_complete_cmd(cmd, SAM_STAT_CHECK_CONDITION);
-            /*
-             * sense data will be built by transport_generic_request_failure
-             * from the error type.
-             */
-        } else {
+        else
             target_complete_cmd(cmd, SAM_STAT_GOOD);
-        }
+
         kfree(ibr);
     }
 }
 ```
 
-`atomic_dec_and_test(&ibr->pending)` implements a simple barrier: the last bio to complete
-triggers `target_complete_cmd()`. For a 1MB write split across 4 bios, `ibr->pending` starts
-at 4 (+ 1 initial = 5 minus the initial dec-and-test = 4 real bios). Each bio completion
-decrements; the last one fires `target_complete_cmd()`.
+The chain pattern is important: a multi-bio request decrements `ibr->pending` only when its
+last bio completes. Earlier bios just `bio_put()`; only the final one calls
+`target_complete_cmd()`. Order of completion among the bios doesn't matter for correctness —
+only the count does.
 
 ---
 
-### iblock_get_bio — allocating bios from the pool
+## fileio — backed by a regular file
+
+Useful for testing, snapshot images, sparse files. Slower than iblock because it goes through
+the VFS / page cache.
 
 ```c
-static struct bio *iblock_get_bio(struct se_cmd *cmd, sector_t lba,
-                                   u32 sg_num, enum dma_data_direction data_dir)
+/* Simplified — see drivers/target/target_core_file.c. */
+sense_reason_t fd_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl,
+                              u32 sgl_nents,
+                              enum dma_data_direction data_direction)
 {
-    struct iblock_dev *ib_dev = IBLOCK_DEV(cmd->se_dev);
-    struct bio *bio;
+    struct fd_dev *fd_dev = FD_DEV(cmd->se_dev);
+    struct file *file = fd_dev->fd_file;
+    struct iov_iter iter;
+    struct bio_vec *bvec;
+    loff_t pos = (loff_t)cmd->t_task_lba * dev->dev_attrib.block_size;
+    ssize_t ret;
+    int i;
 
-    /*
-     * Allocate from the pre-created bio_set (ib_dev->ibd_bio_set).
-     * bio_set ensures allocation never fails even under memory pressure
-     * by maintaining a reserved pool of bios.
-     *
-     * GFP_NOIO: don't trigger page reclaim that might need I/O —
-     * would cause a deadlock in the I/O path.
-     */
-    bio = bio_alloc_bioset(ib_dev->ibd_bd,
-                           min_t(u32, sg_num, BIO_MAX_VECS),
-                           (data_dir == DMA_TO_DEVICE) ?
-                               REQ_OP_WRITE : REQ_OP_READ,
-                           GFP_NOIO,
-                           &ib_dev->ibd_bio_set);
-    if (!bio) {
-        pr_err("Unable to allocate memory for bio\n");
-        return NULL;
+    /* convert SGL to bio_vec for iov_iter */
+    bvec = kcalloc(sgl_nents, sizeof(*bvec), GFP_KERNEL);
+    for_each_sg(sgl, sg, sgl_nents, i) {
+        bvec[i].bv_page   = sg_page(sg);
+        bvec[i].bv_len    = sg->length;
+        bvec[i].bv_offset = sg->offset;
     }
 
-    bio->bi_iter.bi_sector = lba;  /* starting sector for this bio */
-    return bio;
+    iov_iter_bvec(&iter,
+                   data_direction == DMA_TO_DEVICE ? WRITE : READ,
+                   bvec, sgl_nents, cmd->data_length);
+
+    if (data_direction == DMA_FROM_DEVICE) {
+        ret = vfs_iter_read(file, &iter, &pos, 0);
+    } else {
+        ret = vfs_iter_write(file, &iter, &pos, 0);
+        if (cmd->se_cmd_flags & SCF_FUA) {
+            /* fsync to flush to disk */
+            vfs_fsync_range(file, pos - cmd->data_length, pos, 1);
+        }
+    }
+
+    kfree(bvec);
+
+    if (ret < 0)
+        return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+
+    target_complete_cmd(cmd, SAM_STAT_GOOD);
+    return 0;
 }
 ```
 
+Note: this function is synchronous — it blocks until the VFS read/write returns. Therefore it
+runs on `target_submission_wq` (queued via `target_execute_cmd`) so it doesn't block the iSCSI
+RX thread. Real upstream `fd_execute_rw` may use `call_read_iter()`/`call_write_iter()`
+helpers depending on the kernel version.
+
 ---
 
-## fileio backend — `drivers/target/target_core_file.c`
+## ramdisk — backed by kernel memory
 
-### struct fd_dev
-
-```c
-struct fd_dev {
-    struct file     *fd_file;        /* the backing file (open with O_LARGEFILE|O_NOATIME) */
-    u64             fd_dev_size;     /* file size in bytes */
-    u32             fd_block_size;   /* logical block size (512 or 4096) */
-};
-```
-
-### fd_execute_rw — `drivers/target/target_core_file.c`
+Pure kernel pages, fastest possible backend (no I/O), used for benchmarks and tests.
 
 ```c
-static sense_reason_t fd_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl,
-                                     u32 sgl_nents, enum dma_data_direction data_direction)
+/* Simplified. */
+sense_reason_t rd_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl,
+                               u32 sgl_nents,
+                               enum dma_data_direction data_direction)
 {
-    struct se_device *dev = cmd->se_dev;
-    struct fd_dev *fd_dev = FD_DEV(dev);
-    struct file *fd = fd_dev->fd_file;
-    struct scatterlist *sg;
-    struct iov_iter iter;
-    struct kvec *iov;
-    loff_t pos;
-    size_t len = 0;
-    int i, ret;
+    struct rd_dev *rd_dev = RD_DEV(cmd->se_dev);
+    struct rd_dev_sg_table *table;
+    struct scatterlist *rd_sg;
+    void *rd_addr, *cmd_addr;
+    u32 src_len, table_idx, rd_offset = 0;
+    int i;
 
     /*
-     * Convert SGL to kvec array for kernel_write/kernel_read.
-     * Each SGL entry → one kvec entry.
+     * The ramdisk maintains its own SGL of pages (one for the whole device).
+     * Map by LBA → table->sg_table → page within.
      */
-    iov = kcalloc(sgl_nents, sizeof(struct kvec), GFP_KERNEL);
-    if (!iov)
-        return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+    table = rd_get_sg_table(rd_dev, rd_offset);
 
+    /*
+     * Memcpy in either direction.
+     * For READ: target buffer ← ramdisk pages
+     * For WRITE: target buffer → ramdisk pages
+     */
     for_each_sg(sgl, sg, sgl_nents, i) {
-        iov[i].iov_base = sg_virt(sg);  /* virtual address of page */
-        iov[i].iov_len  = sg->length;
-        len += sg->length;
-    }
-
-    /* file position = LBA × block_size */
-    pos = (loff_t)cmd->t_task_lba * fd_dev->fd_block_size;
-
-    if (data_direction == DMA_TO_DEVICE) {
-        /*
-         * Write to file using kernel_write().
-         * The file may be on ext4, xfs, tmpfs, etc.
-         * This eventually goes through the page cache (unless O_DIRECT).
-         */
-        iov_iter_kvec(&iter, WRITE, iov, sgl_nents, len);
-        ret = vfs_iter_write(fd, &iter, &pos, 0);
-    } else {
-        /* Read from file */
-        iov_iter_kvec(&iter, READ, iov, sgl_nents, len);
-        ret = vfs_iter_read(fd, &iter, &pos, 0);
-    }
-
-    kfree(iov);
-
-    if (ret < 0 || ret != len) {
-        pr_err("fd_execute_rw(): vfs_%s returned %d\n",
-               (data_direction == DMA_TO_DEVICE) ? "write" : "read", ret);
-        target_complete_cmd(cmd, SAM_STAT_CHECK_CONDITION);
-        return 0;
+        if (data_direction == DMA_FROM_DEVICE) {
+            memcpy(sg_virt(sg), sg_virt(rd_sg) + rd_offset, sg->length);
+        } else {
+            memcpy(sg_virt(rd_sg) + rd_offset, sg_virt(sg), sg->length);
+        }
+        rd_offset += sg->length;
     }
 
     target_complete_cmd(cmd, SAM_STAT_GOOD);
@@ -300,135 +329,115 @@ static sense_reason_t fd_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl,
 }
 ```
 
-fileio calls `vfs_iter_write()` / `vfs_iter_read()` — synchronous VFS calls. The `target_submission_wq`
-worker blocks until the file I/O completes. This is why fileio has higher latency than iblock
-for real storage — iblock uses async bio submission and the worker returns immediately.
-
 ---
 
-## pSCSI backend — `drivers/target/target_core_pscsi.c`
+## pscsi — SCSI command passthrough
 
-pSCSI passes commands through to a real SCSI device on the target machine — useful for tape
-drives, optical, or chained SCSI targets.
+Wraps a SCSI device by passing commands through unchanged. Useful for proxying tape drives,
+optical drives, or chained SCSI to an initiator. Limitations: no PR emulation (target relies on
+the underlying device's PR support), no ALUA, no T10-DIF.
 
 ```c
-static sense_reason_t pscsi_execute_cmd(struct se_cmd *cmd)
+/* Simplified — see drivers/target/target_core_pscsi.c. */
+sense_reason_t pscsi_execute_cmd(struct se_cmd *cmd)
 {
-    struct scatterlist *sgl = cmd->t_data_sg;
-    u32 sgl_nents          = cmd->t_data_nents;
     struct pscsi_dev_virt *pdv = PSCSI_DEV(cmd->se_dev);
-    struct scsi_device *sd     = pdv->pdv_sd;  /* underlying scsi_device */
-    sense_reason_t rc;
+    struct scsi_device *sd = pdv->pdv_sd;
+    unsigned char *cdb = cmd->t_task_cdb;
+    struct request *req;
+    int data_direction;
+    blk_opf_t opf;
 
     /*
-     * Use scsi_execute_cmd() — the SCSI mid-layer synchronous slow path
-     * (the same one initiators use for PR commands, day 13).
-     *
-     * This sends the CDB from the remote initiator directly to the
-     * local SCSI device. Essentially: iSCSI → target → local SCSI bus.
-     *
-     * timeout: cmd->timeout_per_command or PSCSI_DEFAULT_TIMEOUT.
-     * retries: 0 (target core handles retries).
+     * Build a passthrough request directly via blk_get_request.
+     * Bypasses pscsi-internal queueing — the underlying SCSI mid layer
+     * handles dispatch.
      */
-    rc = scsi_execute_cmd(sd,
-                          cmd->t_task_cdb,
-                          (cmd->data_direction == DMA_TO_DEVICE) ?
-                              REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
-                          sgl ? sg_virt(sgl) : NULL,
-                          cmd->data_length,
-                          PSCSI_DEFAULT_TIMEOUT,
-                          0,
-                          NULL);
+    opf = (cmd->data_direction == DMA_FROM_DEVICE)
+            ? REQ_OP_DRV_IN : REQ_OP_DRV_OUT;
 
-    if (rc) {
-        /* error: copy sense from local scsi_cmnd to se_cmd->sense_buffer */
-        memcpy(cmd->sense_buffer, sd->last_sense, SCSI_SENSE_BUFFERSIZE);
-        target_complete_cmd(cmd, SAM_STAT_CHECK_CONDITION);
-    } else {
-        target_complete_cmd(cmd, SAM_STAT_GOOD);
-    }
+    req = blk_mq_alloc_request(sd->request_queue, opf, 0);
+    if (IS_ERR(req))
+        return TCM_OUT_OF_RESOURCES;
 
+    /* copy CDB into the request's scsi_cmnd */
+    struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(req);
+    memcpy(scmd->cmnd, cdb, cmd->t_task_cdb_size);
+    scmd->cmd_len = cmd->t_task_cdb_size;
+
+    /* map our SGL into the request */
+    blk_rq_map_kern(...);
+
+    req->end_io = pscsi_req_done;
+    req->end_io_data = cmd;
+    req->timeout = PS_TIMEOUT_DISK;
+
+    blk_execute_rq_nowait(req, false);
     return 0;
 }
 ```
-
-Notice that pSCSI calls `scsi_execute_cmd()` — the same function called by `sd_pr_reserve()` on
-the initiator side. This means pSCSI execution blocks the `target_submission_wq` worker thread
-for the entire I/O duration. This is acceptable for low-throughput devices (tape, optical) but
-unsuitable for high-speed storage.
 
 ---
 
 ## Backend comparison
 
-| Aspect | iblock | fileio | pscsi |
-|---|---|---|---|
-| Storage object | block device (`/dev/sdX`, `/dev/nvmeX`) | regular file | SCSI device |
-| I/O model | async bio → blk-mq | sync vfs_iter_write/read | sync scsi_execute_cmd |
-| Worker blocks? | No (returns immediately) | Yes (blocks on VFS) | Yes (blocks on SCSI) |
-| Performance | Highest | Medium | Lowest |
-| Use case | Production storage | Dev/testing, ramdisk-backed | Tape, optical, chained SCSI |
-| UNMAP/DISCARD | Yes (blkdev_issue_discard) | Yes (fallocate PUNCH_HOLE) | Pass-through |
-| Write-back cache | Controlled by device | Controlled by page cache | Pass-through |
+| Backend | Backing | Latency | PR | ALUA | T10-DIF | Use case |
+|---|---|---|---|---|---|---|
+| iblock | block device | µs | yes | yes | yes | most common |
+| fileio | regular file | ms | yes | yes | no | testing, sparse |
+| ramdisk | kernel pages | ns | yes | yes | no | benchmark |
+| pscsi | SCSI passthrough | depends | underlying | no | no | tape, SES, optical |
+
+For fencing setups, **iblock is the default**. PR is fully emulated by LIO regardless of
+backend (except pscsi), so the underlying block device doesn't need to support PR — LIO does it.
+ALUA likewise.
 
 ---
 
-## The SGL → bio conversion in detail
-
-For a 1MB WRITE command with 256 4KB pages:
+## How execute_cmd is called
 
 ```
-se_cmd->t_data_sg: [page_0, 4096, 0] [page_1, 4096, 0] ... [page_255, 4096, 0]
-se_cmd->t_data_nents: 256
-
-iblock_execute_rw():
-    bio_0: pages 0..255 (256 × 4096 = 1MB if BIO_MAX_VECS >= 256)
-    submit_bio(bio_0)
-
-iblock_bio_done(bio_0):
-    ibr->pending: 1 → 0
-    atomic_dec_and_test: true
-    target_complete_cmd(cmd, SAM_STAT_GOOD)
-
-target_complete_cmd():
-    queue_work(target_completion_wq, &cmd->work)
-
-target_complete_ok_work():
-    cmd->se_tfo->queue_status(cmd)  [write — no Data-In PDUs needed]
-    = iscsit_queue_status()
-    TX thread sends SCSI Response PDU: status=0x00 (GOOD)
+target_execute_cmd(cmd)                   [target_core_transport.c]
+    │
+    ├── synchronous emulated commands run inline
+    │   (TUR, READ CAPACITY, REPORT LUNS, INQUIRY, PR commands)
+    │
+    └── data commands queue to target_submission_wq
+            │
+            ▼
+    target_execute_cmd_work(work)
+            │  cmd->se_dev->transport->execute_cmd(cmd)
+            ▼
+    iblock_execute_cmd / fd_execute_cmd / rd_execute_cmd
+            │  routes to _rw, _sync_cache, _unmap, _write_same etc.
+            ▼
+    backend submits I/O (bio for iblock, vfs_iter_* for fileio)
+            │
+            ▼  asynchronous: I/O completes later
+    bio->bi_end_io = iblock_bio_done (or equivalent)
+            │
+            ▼
+    target_complete_cmd(cmd, SAM_STAT_GOOD or CHECK_CONDITION)
+            │
+            ▼
+    queue to target_completion_wq → response sent to initiator
 ```
-
-For large I/O that exceeds BIO_MAX_VECS pages, multiple bios are chained with `ibr->pending`
-tracking them all. The last bio's `iblock_bio_done()` triggers `target_complete_cmd()`.
 
 ---
 
 ## Key takeaways
 
-- iblock converts the `se_cmd` SGL into one or more bios and calls `submit_bio()` — async.
-  `iblock_bio_done()` is called by the block layer when done. `ibr->pending` tracks all in-flight
-  bios; the last completion calls `target_complete_cmd(SAM_STAT_GOOD)`.
-- fileio calls `vfs_iter_write()` / `vfs_iter_read()` synchronously in the `target_submission_wq`
-  worker. Simpler but blocks the worker thread for the I/O duration.
-- pSCSI calls `scsi_execute_cmd()` — the same slow path used for PR on the initiator. Blocks
-  the worker thread. Only for low-throughput pass-through devices.
-- All three call `target_complete_cmd()` when done — this is the only required interface.
-- `GFP_NOIO` for bio allocation prevents deadlocks: allocating memory during I/O must not
-  trigger page reclaim that itself needs I/O.
-- iblock's `bio_set` (`ibd_bio_set`) pre-allocates bios, ensuring allocation never fails even
-  under memory pressure — required for a target that must make forward progress.
-
----
-
-## Week 3 complete
-
-Days 15–21 now cover the complete target core stack: structs (15) → submit path (16) →
-completion path (17) → iSCSI RX thread (18) → TX thread and state machine (19) → PR (20) →
-backends (21). You can now trace any command from TCP socket receipt through target_core to
-backend I/O and back to the response PDU.
-
-Ready to continue with **Week 4: TMF, ALUA, configfs, session teardown, NVMe-oF, and sense data**.
+- LIO is fabric/backend split: same iSCSI fabric works with iblock, fileio, ramdisk, pscsi.
+- `target_backend_ops.execute_cmd` is the entry point. Called via `target_submission_wq` for
+  data I/O; called inline for emulated short commands.
+- `iblock` allocates bios, walks the SGL, chains bios when one fills up. Completion via
+  `iblock_bio_done` decrements pending count; last bio triggers `target_complete_cmd`.
+- `fileio` uses `vfs_iter_read/write` (or `call_read_iter`/`call_write_iter` in newer code).
+  Synchronous — runs on submission workqueue.
+- `ramdisk` is pure memcpy. Lowest latency.
+- `pscsi` proxies CDBs to an underlying SCSI device via passthrough — no LIO emulation of PR/ALUA.
+- PR is fully emulated by LIO core (`target_core_pr.c`), independent of backend (except pscsi).
+  Same goes for ALUA. So fencing semantics work uniformly across iblock/fileio/ramdisk.
 
 ---
 

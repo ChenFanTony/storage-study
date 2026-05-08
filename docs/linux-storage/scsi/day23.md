@@ -1,296 +1,266 @@
 # Day 23 — ALUA
 
-**Week 4**: Deep Cuts — TMF, ALUA, configfs, NVMe-oF, Sense Data
-**Time**: 1–2 hours
-**Reference**: `drivers/target/target_core_alua.c`
+**Week 4**: Advanced Topics  
+**Time**: 1–2 hours  
+**Reference**: `drivers/target/target_core_alua.c`, `include/target/target_core_base.h`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-ALUA (Asymmetric Logical Unit Access) is the mechanism by which a storage target exposes
-different access states on different target ports. It is the foundation of active-active and
-active-passive HA configurations. On the initiator side, dm-multipath uses ALUA state information
-to select optimized paths. On the target side, LIO implements ALUA via Target Port Groups (TPGs)
-and per-port access states. Every incoming I/O command is checked against the ALUA state of the
-target port it arrived on.
+ALUA — Asymmetric Logical Unit Access (SPC-4 §5.11) — lets a target advertise per-port-group
+state for each LUN: which paths are optimized for I/O, which are standby, which are
+transitioning. dm-multipath uses this information through `scsi_dh_alua` to bias path selection.
+For fencing, ALUA states are an alternative or complement to PR: a target can move a LUN's port
+group to UNAVAILABLE for the fenced node and to ACTIVE/OPTIMIZED for the surviving node, and the
+multipath layer handles the rest.
 
 ---
 
-## ALUA concepts
-
-```
-Target Port Group (TPGT):
-    A set of target ports with the same access state.
-    Access state applies to the WHOLE group simultaneously.
-
-Access states (per TPGT):
-    Active/Optimized (A/O)     = preferred path, full performance
-    Active/Non-Optimized (A/N) = working but suboptimal (secondary path)
-    Standby                    = not processing I/O, will transition if needed
-    Unavailable                = not accessible
-    Offline (vendor-specific)  = administratively disabled
-    Transitioning              = changing between states
-
-Initiator behavior:
-    dm-multipath selects Active/Optimized paths first.
-    Falls back to Active/Non-Optimized if A/O paths fail.
-    Does not use Standby/Unavailable paths.
-```
-
----
-
-## Key structs — `drivers/target/target_core_alua.c`
+## ALUA states — `include/target/target_core_base.h`
 
 ```c
-/*
- * t10_alua: per-device ALUA state.
- * Embedded in se_device.
- */
-struct t10_alua {
-    enum alua_type          alua_type;        /* ALUA_ACCESS_TYPE_* */
-    spinlock_t              lock;
+/* SPC-4 §5.11.2.7 — Asymmetric access state values */
+#define ALUA_ACCESS_STATE_ACTIVE_OPTIMIZED       0x0
+#define ALUA_ACCESS_STATE_ACTIVE_NON_OPTIMIZED   0x1
+#define ALUA_ACCESS_STATE_STANDBY                0x2
+#define ALUA_ACCESS_STATE_UNAVAILABLE            0x3
+#define ALUA_ACCESS_STATE_LBA_DEPENDENT          0x4
+#define ALUA_ACCESS_STATE_OFFLINE                0xE
+#define ALUA_ACCESS_STATE_TRANSITION             0xF
+```
 
-    /* list of all target port groups for this device */
-    struct list_head        tg_pt_gps_list;
-    u32                     alua_tg_pt_gps_count;
-};
+What each state means for I/O:
 
-/*
- * t10_alua_tg_pt_gp: one target port group.
- * A group has an ID, an access state, and a list of ports in the group.
- */
+| State | I/O allowed? | dm-multipath behavior |
+|---|---|---|
+| ACTIVE_OPTIMIZED (0x0) | yes, fast path | preferred — full bandwidth |
+| ACTIVE_NON_OPTIMIZED (0x1) | yes, slower | usable; commands get optional `alua_nonop_delay_msec` delay |
+| STANDBY (0x2) | no, NOT_READY | path failed; multipath retries elsewhere |
+| UNAVAILABLE (0x3) | no, NOT_READY | path failed |
+| LBA_DEPENDENT (0x4) | depends per LBA | rare — used for federated/ranged setups |
+| OFFLINE (0xE) | no | path failed |
+| TRANSITION (0xF) | no, NOT_READY | path is moving between states; retry |
+
+For NOT_READY states the target sends sense `NOT READY (0x02) / 0x04 / <ascq>` where ASCQ
+distinguishes:
+- `0x0A` ASYMMETRIC ACCESS STATE TRANSITION
+- `0x0B` TARGET PORT IN STANDBY STATE
+- `0x0C` TARGET PORT IN UNAVAILABLE STATE
+
+The initiator's `scsi_check_sense()` (day 5) maps these to NEEDS_RETRY → blk-mq requeue → another
+path attempt by dm-multipath.
+
+---
+
+## struct t10_alua_tg_pt_gp — target port group
+
+```c
+/* include/target/target_core_base.h */
 struct t10_alua_tg_pt_gp {
-    u16                     tg_pt_gp_id;          /* group ID (1-based) */
+    char                    tg_pt_gp_name[ALUA_GROUP_NAME_LEN];
 
     /*
-     * Current access state for all ports in this group.
-     * ALUA_ACCESS_STATE_* values:
-     *   0x0 = Active/Optimized
-     *   0x1 = Active/Non-Optimized
-     *   0x2 = Standby
-     *   0x3 = Unavailable
-     *   0xf = Offline (LIO extension)
+     * The current ALUA state for this group.
      */
     int                     tg_pt_gp_alua_access_state;
 
-    /* for transition: pending target state */
-    int                     tg_pt_gp_alua_pending_state;
-    int                     tg_pt_gp_alua_previous_state;
+    /*
+     * Implicit vs explicit transitions:
+     *   implicit — target moves states on its own (e.g., based on
+     *              backend events, controller failover)
+     *   explicit — initiator moves states via SET TARGET PORT GROUPS CDB
+     */
+    int                     tg_pt_gp_alua_access_type;     /* TPGS_IMPLICIT_ALUA / EXPLICIT */
 
     /*
-     * Non-optimized delay: ms to sleep before processing I/O
-     * on an Active/Non-Optimized path. Forces initiator to prefer A/O.
-     * Default: 100ms.
+     * Configurable delay (ms) imposed on commands going through a
+     * non-optimized path. Encourages multipath to drift toward optimized.
      */
-    int                     tg_pt_gp_nonop_delay_msecs;
-
-    /* transition delay: ms between state change checks */
+    int                     tg_pt_gp_alua_nonop_delay_msecs;
     int                     tg_pt_gp_trans_delay_msecs;
 
-    /* transition work item */
-    struct delayed_work      tg_pt_gp_transition_work;
+    /*
+     * Group ID — what the initiator sees in REPORT TARGET PORT GROUPS.
+     */
+    u16                     tg_pt_gp_id;
 
-    struct list_head         tg_pt_gp_list;       /* link in t10_alua.tg_pt_gps_list */
-    struct list_head         tg_pt_gp_mem_list;   /* all ports in this group */
+    /*
+     * Members — the LUN ports that belong to this group.
+     * Populated via configfs (echo /backstores/.../<dev>/alua/default_tg_pt_gp/...).
+     */
+    struct list_head        tg_pt_gp_lun_list;
+    spinlock_t              tg_pt_gp_lock;
 
-    atomic_t                 tg_pt_gp_ref_cnt;
+    /*
+     * Pending state transition, if any.
+     */
+    struct delayed_work     tg_pt_gp_transition_work;
+    int                     tg_pt_gp_alua_pending_state;
 
-    /* configfs */
-    struct config_group      tg_pt_gp_group;
-    struct se_device         *tg_pt_gp_dev;
+    /*
+     * Counters for outstanding I/O during transition (must drain
+     * before transition completes).
+     */
+    atomic_t                tg_pt_gp_ref_cnt;
+    atomic_t                tg_pt_gp_alua_pending_count;
+
+    struct se_device        *tg_pt_gp_dev;
 };
 ```
 
+A LUN belongs to exactly one tg_pt_gp at any time. Multiple LUNs can share a group; moving the
+group's state moves all member LUNs together — the typical pattern for a controller failover
+that affects many LUNs.
+
 ---
 
-## core_alua_state_check — called on every command
+## State check on every command — `core_alua_state_check`
 
 ```c
-/*
- * Called from target_submit_cmd() for every incoming SCSI command.
- * Checks the ALUA state of the target port this command arrived on.
- *
- * Returns:
- *   TCM_NO_SENSE (0)         = access allowed
- *   TCM_ALU_TG_PT_STANDBY    = port in Standby state → NOT READY
- *   TCM_ALUA_TG_PT_UNAVAILABLE = port Unavailable → NOT READY
- *   TCM_CHECK_CONDITION_UNIT_ATTENTION = transitioning → UA
- */
-sense_reason_t core_alua_state_check(struct se_cmd *cmd)
+/* Simplified — see drivers/target/target_core_alua.c. */
+sense_reason_t core_alua_state_check(struct se_cmd *cmd, char *cdb,
+                                       u8 *alua_ascq)
 {
-    struct se_device *dev  = cmd->se_dev;
-    struct se_lun    *lun  = cmd->se_lun;
+    struct se_lun *lun = cmd->se_lun;
     struct t10_alua_tg_pt_gp *tg_pt_gp;
-    int out_alua_state, nonop;
-
-    if (!lun->lun_tg_pt_gp)
-        return TCM_NO_SENSE;  /* no ALUA configured — allow all */
-
-    tg_pt_gp = lun->lun_tg_pt_gp;
+    int alua_access_state;
 
     /*
-     * Read the current access state atomically.
-     * No lock needed for reading — state changes are atomic.
+     * Some CDBs are always allowed regardless of ALUA state per SPC-4
+     * §5.11.2.7 Table 36:
+     *   INQUIRY, REPORT LUNS, REPORT TARGET PORT GROUPS,
+     *   SET TARGET PORT GROUPS, READ MEDIA SERIAL NUMBER,
+     *   REQUEST SENSE, RECEIVE DIAGNOSTIC RESULTS, SEND DIAGNOSTIC,
+     *   PERSISTENT RESERVE IN, PERSISTENT RESERVE OUT, ACCESS CONTROL IN,
+     *   ACCESS CONTROL OUT, etc.
+     *
+     * Without these always-allowed commands, ALUA discovery and PR-based
+     * fencing would deadlock when a path is in STANDBY.
      */
-    out_alua_state = tg_pt_gp->tg_pt_gp_alua_access_state;
+    if (target_alua_cdb_always_allowed(cdb))
+        return 0;
 
-    switch (out_alua_state) {
+    spin_lock(&lun->lun_tg_pt_gp_lock);
+    tg_pt_gp = lun->lun_tg_pt_gp;
+    if (!tg_pt_gp) {
+        spin_unlock(&lun->lun_tg_pt_gp_lock);
+        return 0;  /* no ALUA configured */
+    }
+    alua_access_state = tg_pt_gp->tg_pt_gp_alua_access_state;
+    spin_unlock(&lun->lun_tg_pt_gp_lock);
+
+    switch (alua_access_state) {
     case ALUA_ACCESS_STATE_ACTIVE_OPTIMIZED:
-        /*
-         * Best case: full speed, no delay.
-         * Allow all commands immediately.
-         */
-        return TCM_NO_SENSE;
+        return 0;  /* fast path */
 
     case ALUA_ACCESS_STATE_ACTIVE_NON_OPTIMIZED:
         /*
-         * Non-optimized: I/O is allowed but we delay it slightly
-         * to encourage the initiator to use an optimized path instead.
-         *
-         * tg_pt_gp_nonop_delay_msecs (default 100ms):
-         * The command is still executed, just with a delay.
-         * dm-multipath notices the latency and prefers A/O paths.
+         * Optionally apply nonop_delay_msec — slows commands on this
+         * path. msleep_interruptible so signals (TMF, abort) can wake.
          */
-        nonop = tg_pt_gp->tg_pt_gp_nonop_delay_msecs;
-        if (nonop > 0)
-            msleep(nonop);
-        return TCM_NO_SENSE;
+        if (tg_pt_gp->tg_pt_gp_alua_nonop_delay_msecs)
+            msleep_interruptible(tg_pt_gp->tg_pt_gp_alua_nonop_delay_msecs);
+        return 0;
 
     case ALUA_ACCESS_STATE_STANDBY:
-        /*
-         * Standby: port is not processing I/O.
-         *
-         * Returns TCM_ALUA_TG_PT_STANDBY →
-         *   transport_generic_request_failure() →
-         *   sense: NOT READY, ASC=0x04, ASCQ=0x0B
-         *          (LOGICAL UNIT NOT ACCESSIBLE, TARGET PORT IN STANDBY STATE)
-         *
-         * Initiator receives CHECK CONDITION with this sense.
-         * dm-multipath: NOT_READY → path failure → tries another group.
-         */
-        return TCM_ALUA_TG_PT_STANDBY;
+        *alua_ascq = ASCQ_04H_ALUA_TGT_PORT_STANDBY;
+        return TCM_CHECK_CONDITION_NOT_READY;
 
     case ALUA_ACCESS_STATE_UNAVAILABLE:
+        *alua_ascq = ASCQ_04H_ALUA_TGT_PORT_UNAVAILABLE;
+        return TCM_CHECK_CONDITION_NOT_READY;
+
+    case ALUA_ACCESS_STATE_TRANSITION:    /* 0xF */
+        *alua_ascq = ASCQ_04H_ALUA_STATE_TRANSITION;
+        return TCM_CHECK_CONDITION_NOT_READY;
+
+    case ALUA_ACCESS_STATE_OFFLINE:       /* 0xE */
+        *alua_ascq = ASCQ_04H_ALUA_OFFLINE;
+        return TCM_CHECK_CONDITION_NOT_READY;
+
+    case ALUA_ACCESS_STATE_LBA_DEPENDENT:
         /*
-         * Unavailable: sense NOT READY, ASC=0x04, ASCQ=0x0C
-         *              (LOGICAL UNIT NOT ACCESSIBLE, TARGET PORT IN UNAVAILABLE STATE)
+         * Per-LBA decision. Rare. Caller (target_setup_cmd_from_cdb)
+         * checks each LBA against the group's table.
          */
-        return TCM_ALUA_TG_PT_UNAVAILABLE;
-
-    case ALUA_ACCESS_STATE_TRANSITION:
-        /*
-         * ALUA state transition in progress.
-         * Returns UNIT ATTENTION: ALUA TG PT TRANSITIONING
-         * sense key=UNIT_ATTENTION, ASC=0x29, ASCQ=0x06
-         *
-         * Initiator should retry after the transition completes.
-         */
-        return TCM_CHECK_CONDITION_UNIT_ATTENTION;
-
-    case ALUA_ACCESS_STATE_OFFLINE:
-        /* LIO-specific: administratively offline */
-        return TCM_ALUA_TG_PT_UNAVAILABLE;
-
-    default:
-        return TCM_NO_SENSE;
+        return target_alua_lba_dependent_check(cmd);
     }
+
+    return 0;
 }
 ```
 
----
-
-## core_alua_check_nonop_delay — implementing the delay
-
-```c
-/*
- * For Active/Non-Optimized paths, LIO adds a configurable delay
- * to each command to discourage initiators from using this path.
- *
- * The delay is implemented with msleep() inside the target_submission_wq
- * worker thread. This is acceptable because:
- *   1. Non-optimized paths carry less traffic by design
- *   2. The delay is short (default 100ms) and configurable
- *   3. The target_submission_wq has unlimited workers (WQ_MEM_RECLAIM, 0)
- *      so other commands are not blocked by this sleep
- */
-static void core_alua_check_nonop_delay(struct t10_alua_tg_pt_gp *tg_pt_gp)
-{
-    if (!tg_pt_gp->tg_pt_gp_nonop_delay_msecs)
-        return;
-
-    if (in_interrupt())
-        return;  /* can't sleep in interrupt context */
-
-    /*
-     * msleep_interruptible: sleep but can be woken by signal.
-     * If a TMF abort arrives for this command during the delay,
-     * the signal will wake msleep and the abort can proceed.
-     */
-    msleep_interruptible(tg_pt_gp->tg_pt_gp_nonop_delay_msecs);
-}
-```
+This check runs in `target_setup_cmd_from_cdb()` (day 16) — before the reservation check.
+A path in STANDBY rejects every I/O before any backend work.
 
 ---
 
-## core_alua_do_port_transition — state change — `drivers/target/target_core_alua.c`
-
-Admin or automated transition (e.g. on path failure):
+## State transitions — explicit (initiator-driven)
 
 ```c
-int core_alua_do_port_transition(struct t10_alua_tg_pt_gp *l_tg_pt_gp,
-                                  struct se_device *l_dev,
-                                  struct se_port *l_port,
-                                  struct se_node_acl *l_nacl,
-                                  int new_state,
-                                  int explicit)
+/* Simplified — see core_alua_do_port_transition. */
+int core_alua_do_port_transition(struct se_device *dev,
+                                   struct t10_alua_tg_pt_gp *tg_pt_gp,
+                                   int explicit, int new_state)
 {
-    struct se_device *dev;
-    struct t10_alua_tg_pt_gp *tg_pt_gp;
-    int prev_state;
+    int old_state, transition_allowed;
+
+    spin_lock(&tg_pt_gp->tg_pt_gp_lock);
+    old_state = tg_pt_gp->tg_pt_gp_alua_access_state;
 
     /*
-     * Set state to TRANSITIONING atomically.
-     * Commands arriving during transition get UNIT ATTENTION (transitioning).
+     * Validate the transition. Some moves are illegal (e.g., from
+     * UNAVAILABLE directly to ACTIVE_OPTIMIZED without going through
+     * TRANSITION first).
      */
-    prev_state = l_tg_pt_gp->tg_pt_gp_alua_access_state;
-    l_tg_pt_gp->tg_pt_gp_alua_access_state = ALUA_ACCESS_STATE_TRANSITION;
-
-    /*
-     * Wait for transition delay (tg_pt_gp_trans_delay_msecs, default 3000ms).
-     * This gives in-flight I/O time to complete before the state switches.
-     */
-    if (l_tg_pt_gp->tg_pt_gp_trans_delay_msecs)
-        msleep_interruptible(l_tg_pt_gp->tg_pt_gp_trans_delay_msecs);
-
-    /*
-     * Apply new state.
-     * All subsequent commands on this TPG will see the new state.
-     */
-    l_tg_pt_gp->tg_pt_gp_alua_access_state = new_state;
-    l_tg_pt_gp->tg_pt_gp_alua_previous_state = prev_state;
-
-    /*
-     * Issue UNIT ATTENTION to ALL sessions accessing this device.
-     * UA: ASYMMETRIC ACCESS STATE CHANGED
-     * sense key=UNIT_ATTENTION, ASC=0x2A, ASCQ=0x06
-     *
-     * Every initiator's next command will get CHECK CONDITION.
-     * dm-multipath: on UNIT ATTENTION → retry → re-query ALUA state
-     * → discovers new preferred paths → updates routing.
-     */
-    core_scsi3_ua_allocate_non_block(l_dev, l_nacl, 0x2A, 0x06);
-
-    /*
-     * If IMPLICIT ALUA transition (not explicit from host):
-     * log the transition for management visibility.
-     */
-    if (!explicit) {
-        pr_debug("ALUA[%s]: Implicit transition from %s to %s\n",
-                 l_tg_pt_gp->tg_pt_gp_group.cg_item.ci_name,
-                 core_alua_dump_state(prev_state),
-                 core_alua_dump_state(new_state));
+    transition_allowed = core_alua_check_transition(old_state, new_state);
+    if (!transition_allowed) {
+        spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
+        return -EINVAL;
     }
+
+    /*
+     * Set state to TRANSITION first.
+     * During this window, all I/O on this path returns NOT_READY/
+     * STATE_TRANSITION — initiator retries on other paths.
+     */
+    tg_pt_gp->tg_pt_gp_alua_pending_state = new_state;
+    tg_pt_gp->tg_pt_gp_alua_access_state =
+        ALUA_ACCESS_STATE_TRANSITION;
+    spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
+
+    /*
+     * Queue UNIT ATTENTION on every initiator using LUNs in this group:
+     *   06h/2Ah/06h = ASYMMETRIC ACCESS STATE CHANGED
+     * This signals "rediscover ALUA state on next command".
+     */
+    list_for_each_entry(lun, &tg_pt_gp->tg_pt_gp_lun_list, lun_tg_pt_gp_link) {
+        list_for_each_entry(sess, &dev->dev_sess_list, sess_list) {
+            /*
+             * core_scsi3_ua_allocate() walks the session's nexus
+             * device entries and queues a UA for the LUN.
+             */
+            core_scsi3_ua_allocate(sess->se_node_acl,
+                                     lun->unpacked_lun, 0x2A, 0x06);
+        }
+    }
+
+    /*
+     * Wait for in-flight commands targeting this group to drain.
+     * Drainage is bounded by trans_delay_msecs.
+     */
+    if (tg_pt_gp->tg_pt_gp_trans_delay_msecs)
+        msleep_interruptible(tg_pt_gp->tg_pt_gp_trans_delay_msecs);
+
+    /*
+     * Commit the new state.
+     */
+    spin_lock(&tg_pt_gp->tg_pt_gp_lock);
+    tg_pt_gp->tg_pt_gp_alua_access_state = new_state;
+    tg_pt_gp->tg_pt_gp_alua_pending_state = 0;
+    spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
 
     return 0;
 }
@@ -298,125 +268,147 @@ int core_alua_do_port_transition(struct t10_alua_tg_pt_gp *l_tg_pt_gp,
 
 ---
 
-## REPORT TARGET PORT GROUPS — SCSI command
+## SET TARGET PORT GROUPS CDB — `target_emulate_set_target_port_groups`
 
-Initiators discover ALUA state via the `REPORT TARGET PORT GROUPS` command (opcode `0xA3/0x0A`).
-LIO emulates this command entirely in target_core_alua.c:
+The wire CDB that explicit-mode initiators use:
+
+```
+opcode 0xA4 (MAINTENANCE OUT), service action 0x0A (SET TARGET PORT GROUPS)
+parameter list per target port group:
+  byte 0: ASYMMETRIC ACCESS STATE (4 bits — new state)
+  bytes 2-3: TARGET PORT GROUP (16 bits — group ID)
+```
+
+Userspace `multipathd` can drive this through SG_IO when `multipath.conf` has
+`hardware_handler "1 alua"` and the target advertises explicit ALUA.
+
+---
+
+## Implicit transitions — target-driven
+
+The target can move states on its own — for example, when a backend goes offline:
 
 ```c
-/*
- * core_emulate_report_target_port_groups() builds the response:
- *
- * For each target port group:
- *   Byte 0[7:4] = PREF (preferred group flag)
- *   Byte 0[3:0] = ALUA_ACCESS_STATE_*
- *   Byte 1      = ALUA_SUPPORT_* flags (T_SUP, U_SUP, S_SUP, AN_SUP, AO_SUP)
- *   Bytes 2-3   = Target Port Group ID (big-endian)
- *   Byte 4      = Status code (active, standby, unavailable, transitioning, ...)
- *   Byte 5      = Vendor Specific
- *   Byte 6      = Initiator ports count
- *   Byte 7      = (reserved)
- *   [port descriptor list: each port's Relative Target Port ID]
- *
- * dm-multipath reads this response via pg_init to determine which
- * paths are optimized and which are non-optimized.
- */
+/* Pseudocode — illustrating the trigger pattern. */
+void backend_failure_handler(struct se_device *dev)
+{
+    struct t10_alua_tg_pt_gp *tg_pt_gp = dev->t10_alua.default_tg_pt_gp;
+
+    if (!tg_pt_gp)
+        return;
+
+    /*
+     * Backend just failed. Move the group to UNAVAILABLE so the
+     * initiators stop sending I/O down this path.
+     */
+    core_alua_do_port_transition(dev, tg_pt_gp, false /* implicit */,
+                                   ALUA_ACCESS_STATE_UNAVAILABLE);
+}
+```
+
+Implicit transitions don't require SET TARGET PORT GROUPS from the initiator; the target just
+moves state and queues UA. Initiators discover via REPORT TARGET PORT GROUPS or via the UA on
+their next command.
+
+---
+
+## REPORT TARGET PORT GROUPS — initiator's discovery CDB
+
+```
+opcode 0xA3 (MAINTENANCE IN), service action 0x0A
+returns: per-group descriptors with:
+  - asymmetric access state
+  - status code (last reason for state change)
+  - target port group ID
+  - target port count + descriptors
+```
+
+`scsi_dh_alua` (the kernel's ALUA device handler) issues this command after seeing a
+state-changed UA. The result populates dm-multipath's per-path state — paths in STANDBY/UNAV are
+moved out of the active priority group automatically.
+
+---
+
+## ALUA + dm-multipath integration
+
+```
+multipath device created
+    │
+    ▼
+multipath.conf has hardware_handler "1 alua"
+    │
+    ▼
+each path's scsi_device gets attached to scsi_dh_alua
+    │
+    ▼
+scsi_dh_alua sends INQUIRY → reads TPGS bits (implicit/explicit support)
+    │
+    ▼
+scsi_dh_alua sends REPORT TARGET PORT GROUPS
+    │
+    ▼
+for each path:
+    state = ACTIVE_OPTIMIZED → assign to high-priority pg
+    state = ACTIVE_NON_OPTIMIZED → assign to low-priority pg
+    state = STANDBY/UNAV → mark path failed initially
+    │
+    ▼
+choose_pgpath() prefers high-priority pg → sends I/O to optimized paths only
+    │
+    ▼
+Target moves state (implicit) → sends UA on next command
+    │
+    ▼
+scsi_dh_alua sees UA, re-reads TPG, updates path priorities
+    │
+    ▼
+multipathd reconfigures pg priorities → I/O migrates to new optimized paths
 ```
 
 ---
 
-## SET TARGET PORT GROUPS — explicit ALUA transition
+## ALUA-based fencing
 
-```c
-/*
- * Initiator can request an ALUA state change via:
- *   SET TARGET PORT GROUPS (opcode 0xA4/0x0A)
- *
- * Only allowed if ALUA type is EXPLICIT or BOTH.
- * Target validates the requested state transitions and applies them.
- *
- * Used by cluster software (Pacemaker, Corosync) to explicitly
- * promote/demote paths when doing planned failover.
- *
- * Example workflow:
- *   1. Controller A going down (planned)
- *   2. Controller B sends SET TARGET PORT GROUPS to promote its ports to A/O
- *   3. All initiators get UNIT ATTENTION (state changed)
- *   4. Initiators re-query REPORT TARGET PORT GROUPS
- *   5. dm-multipath switches to Controller B's ports
- */
-```
+A target-side admin can implement fencing without PR:
 
----
+1. Cluster decides node A is fenced.
+2. Target removes node A's ACL OR target moves node A's LUN port group to
+   ALUA_ACCESS_STATE_UNAVAILABLE.
+3. Node A's commands return NOT_READY/UNAVAILABLE.
+4. dm-multipath on node A retries on other paths — but those are also UNAVAILABLE for node A.
+5. After `no_path_retry` exhausts: bios queue (`queue_if_no_path=1`) or fail (-EIO).
 
-## ALUA and dm-multipath interaction
+ALUA-based fencing is "soft" like PR fencing: connectivity is maintained, only access is
+restricted. It's simpler than PR (no key management, no `multipathd` PR plugin) but per-LUN
+granularity is courser (per-group, not per-initiator).
 
-```c
-/*
- * When dm-multipath does path checking (via the path_checker polling):
- *
- * 1. Issues TEST UNIT READY to each path
- * 2. If TUR returns CHECK CONDITION / NOT_READY (STANDBY/UNAVAILABLE):
- *    → path marked as failing → pg_init triggered
- *
- * pg_init: dm-multipath queries ALUA state:
- *    Issues REPORT TARGET PORT GROUPS
- *    Parses response: which ports are A/O, A/N, Standby, etc.
- *    Updates path priorities:
- *      A/O paths get priority 50 (preferred)
- *      A/N paths get priority 10 (fallback)
- *      Standby/Unavailable: excluded from active pool
- *
- * After pg_init: multipath_map_bio() uses the updated path priorities
- * to route I/O to A/O paths preferentially.
- *
- * The nonop_delay in LIO reinforces this: if an initiator accidentally
- * sends I/O to an A/N path, the 100ms delay makes it "slow" enough
- * that the path selector switches to A/O.
- */
-```
-
----
-
-## Admin control via configfs
-
-```bash
-# View current ALUA state
-cat /sys/kernel/config/target/iscsi/<iqn>/tpgt_1/param/AllaMode
-
-# Change ALUA state for a target port group via sysfs
-echo "Active/NonOptimized" > \
-  /sys/kernel/config/target/core/iblock_0/<device>/alua/default_tg_pt_gp/alua_access_state
-
-# Valid state strings:
-#   Active/Optimized
-#   Active/NonOptimized
-#   Standby
-#   Unavailable
-#   Offline
-```
-
-Each write to `alua_access_state` calls `core_alua_do_port_transition()` with `explicit=1`.
+PR vs ALUA tradeoff:
+- **PR**: fine-grained per-initiator control. Cluster-driven from any node. Survives target
+  reboots (with APTPL). Initiators must register and `multipathd` must support PR.
+- **ALUA**: target-side decision. Coarser (per group). No client-side support needed beyond
+  `scsi_dh_alua`. Doesn't survive target reboot unless the orchestrator re-applies state.
 
 ---
 
 ## Key takeaways
 
-- ALUA state is per-Target Port Group (TPGT), not per-LUN. All ports in a group share the state.
-- `core_alua_state_check()` is called for every incoming command in `target_submit_cmd()`.
-  Active/Optimized: immediate. Non-Optimized: delayed (default 100ms). Standby/Unavailable:
-  CHECK CONDITION NOT_READY. Transitioning: UNIT ATTENTION.
-- `core_alua_do_port_transition()` sets TRANSITIONING state, waits for delay, then sets new
-  state and issues UNIT ATTENTION to all initiators.
-- `REPORT TARGET PORT GROUPS` is the SCSI command dm-multipath uses (via pg_init) to discover
-  which paths are optimized. LIO emulates this entirely in target_core_alua.c.
-- The non-optimized delay (default 100ms) encourages initiators to prefer A/O paths without
-  blocking I/O on A/N paths entirely.
-- ALUA is how active-active HA is implemented: two controllers each have their own TPGT in
-  Active/Optimized state for different LUNs. Failover = state transition + UNIT ATTENTION.
+- ALUA states (`ALUA_ACCESS_STATE_*`) tell initiators which paths to use. ACTIVE_OPTIMIZED is
+  the fast path; STANDBY/UNAVAILABLE/OFFLINE/TRANSITION are reasons to retry elsewhere.
+- `core_alua_state_check()` runs in `target_setup_cmd_from_cdb()` and returns
+  TCM_CHECK_CONDITION_NOT_READY with appropriate ASCQ for inactive states. Always-allowed CDBs
+  (INQUIRY, REPORT LUNS, REPORT TARGET PORT GROUPS, REQUEST SENSE, PR IN/OUT, etc.) bypass.
+- `t10_alua_tg_pt_gp` is the per-group state. LUNs belong to exactly one group. Moving the
+  group's state moves all member LUNs together.
+- Transitions: explicit (initiator-driven via SET TARGET PORT GROUPS CDB) or implicit
+  (target-driven). State change queues UA `06h/2Ah/06h` so initiators rediscover.
+- `scsi_dh_alua` (initiator-side device handler) consumes REPORT TARGET PORT GROUPS results
+  and biases dm-multipath path selection.
+- ALUA-based fencing is an alternative to PR: target moves a node's group to UNAVAILABLE.
+  Simpler than PR but coarser (per-group) and doesn't survive target reboot without external
+  state.
 
 ---
 
 ## Previous / Next
 
-[Day 22 — Task Management Functions](day22.md) | [Day 24 — configfs: LIO control plane](day24.md)
+[Day 22 — Task Management Functions](day22.md) | [Day 24 — configfs control plane](day24.md)

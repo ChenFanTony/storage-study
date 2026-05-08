@@ -1,384 +1,329 @@
 # Day 28 — ERL1 and ERL2 error recovery
 
-**Week 4**: Deep Cuts — TMF, ALUA, configfs, NVMe-oF, Sense Data
-**Time**: 1–2 hours
-**Reference**: `drivers/target/iscsi/iscsi_target_erl0.c`, `drivers/target/iscsi/iscsi_target_erl1.c`, `drivers/target/iscsi/iscsi_target_erl2.c`
+**Week 4**: Advanced Topics  
+**Time**: 1–2 hours  
+**Reference**: `drivers/target/iscsi/iscsi_target_erl1.c`, `iscsi_target_erl2.c`, `drivers/scsi/libiscsi.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-iSCSI defines three Error Recovery Levels (ERL). ERL=0 is what almost all production deployments
-use — connection drop means restart. ERL=1 and ERL=2 add digest-error retransmission and
-session-level task reassignment. Reading these files shows exactly what ERL=0 deliberately does
-NOT handle, and how `ICF_OOO_CMDSN` and `ICF_GOT_LAST_DATAOUT` interact with recovery. It also
-reveals the ICF_OOO_CMDSN + data interaction that was referenced in day 18.
+iSCSI defines three Error Recovery Levels (ERL):
+
+- **ERL=0**: session-level only. Any fatal error → drop session → reconnect.
+- **ERL=1**: within-connection recovery. SNACK-based PDU retransmission for digest errors.
+- **ERL=2**: connection recovery. Tasks can be reassigned to a new connection without restart.
+
+In practice ERL=0 dominates production. ERL=1 is supported but rarely enabled in real workloads.
+ERL=2 is partially implemented in LIO and largely deprecated on the initiator side after Mike
+Christie's 2017 cleanup. Today's content covers what does exist for ERL>0 — useful when
+diagnosing logs that mention SNACK or task reassign.
 
 ---
 
-## ERL=0: Connection-level recovery — `drivers/target/iscsi/iscsi_target_erl0.c`
+## SNACK PDU — RFC 7143 §10.16
 
-ERL=0 is the baseline. On any transport error, the connection is dropped and all commands on it
-are abandoned. The initiator reconnects and re-issues commands.
+SNACK is the recovery primitive for ERL=1. Sent by initiator (RX side) when it detects a
+problem:
+
+```
+opcode 0x10 (SNACK Request)
+flags:
+  byte 1 bits 0-3: SNACK Type
+    0x0 = Data/R2T SNACK    — request retransmission of Data-In or R2T
+    0x1 = Status SNACK      — request retransmission of SCSI Response
+    0x2 = DataACK           — acknowledge received Data-In (initiator → target)
+    0x3 = R-Data SNACK      — request retransmission of Data-In with discrepancy
+
+ITT:        the command this SNACK refers to
+TargetTransferTag:  TTT to identify which R2T/transfer we mean
+BegRun:     starting BegRun (DataSN or StatSN)
+RunLength:  how many sequential PDUs we want
+ExpStatSN:  next StatSN we expect
+```
+
+Use case: HeaderDigest or DataDigest CRC32C mismatch. Initiator's RX detects bad CRC, drops the
+PDU, and sends a SNACK to ask for retransmission.
+
+---
+
+## Initiator side: detecting and requesting retransmit
 
 ```c
-/*
- * iscsit_handle_erl0_recovery() — called when the connection drops.
- *
- * For ERL=0: there is nothing to recover.
- * All in-flight commands on this connection are "lost" from the
- * target's perspective — they will not be retransmitted.
- *
- * iscsit_release_commands_from_conn() (day 25) already sets
- * CMD_T_ABORTED on all commands. Those commands complete without
- * a response PDU (CMD_T_FABRIC_STOP set).
- *
- * The initiator's SCSI layer sees DID_NO_CONNECT for all in-flight
- * commands when the session recovery times out (day 12).
- */
-static void iscsit_handle_erl0_recovery(struct iscsi_conn *conn)
+/* Simplified — illustrative; the libiscsi RX handles digest verification
+ * and may issue a SNACK or fail the connection depending on negotiated ERL. */
+static int iscsi_check_data_digest(struct iscsi_conn *conn,
+                                     struct iscsi_segment *segment)
 {
-    /*
-     * Reset the connection state machine.
-     * No PDU retransmission. No SNACK. Just close and wait for reconnect.
-     */
-    iscsit_cause_connection_reinstatement(conn, 0);
+    u32 expected, actual;
+
+    expected = segment->recv_digest;
+    actual   = compute_crc32c(segment->data, segment->copied);
+
+    if (expected == actual)
+        return 0;  /* good */
+
+    /* digest mismatch — corruption */
+
+    if (conn->session->sess_ops->ErrorRecoveryLevel >= 1) {
+        /* ERL>=1 — send SNACK, expect retransmission */
+        iscsi_send_snack_recovery(conn, current_task);
+        return -EAGAIN;  /* retry */
+    } else {
+        /* ERL=0 — drop session */
+        iscsi_conn_failure(conn, ISCSI_ERR_DATA_DGST_ERROR);
+        return -EIO;
+    }
 }
 ```
 
-Key implication for fencing: ERL=0 means once the TCP connection drops, the target does NOT
-try to retransmit any response PDUs. The initiator gets no responses for in-flight commands —
-they timeout via `replacement_timeout` and then fail with `DID_TRANSPORT_FAILFAST`. This is
-the behavior we rely on for clean fencing.
-
 ---
 
-## ERL=1: Digest error recovery — `drivers/target/iscsi/iscsi_target_erl1.c`
-
-ERL=1 allows recovery from Header or Data digest mismatches without dropping the connection.
-
-### SNACK — Selective Negative Acknowledgement
+## Target side: handling SNACK — `drivers/target/iscsi/iscsi_target_erl1.c`
 
 ```c
-/*
- * iscsit_handle_r2t_snack() — initiator requests R2T retransmission.
- *
- * If the initiator receives a corrupted R2T PDU (HeaderDigest mismatch),
- * it sends a SNACK (opcode 0x10) with:
- *   RunLength = number of missing PDUs
- *   BegRun    = starting DataSN or R2TSN of the missing range
- *
- * The target retransmits the requested R2T PDUs.
- */
-int iscsit_handle_r2t_snack(struct iscsi_conn *conn,
-                              unsigned char *buf)
+/* Simplified — see drivers/target/iscsi/iscsi_target_erl1.c. */
+int iscsit_handle_snack(struct iscsit_conn *conn, unsigned char *buf)
 {
     struct iscsi_snack *hdr = (struct iscsi_snack *)buf;
-    struct iscsit_cmd *cmd;
-    u32 beg_run = be32_to_cpu(hdr->begrun);
-    u32 run_len = be32_to_cpu(hdr->runlength);
+    u8 type = hdr->flags & ISCSI_FLAG_SNACK_TYPE_MASK;
+    int ret;
 
     /*
-     * Find the command by ITT (Initiator Task Tag from SNACK PDU).
+     * Verify ERL>=1 was negotiated.
      */
-    cmd = iscsit_find_cmd_from_itt(conn, hdr->itt);
-    if (!cmd) {
-        pr_err("SNACK: ITT 0x%08x not found\n", hdr->itt);
-        return -1;
+    if (conn->sess->sess_ops->ErrorRecoveryLevel < 1) {
+        return iscsit_reject_cmd(conn, ISCSI_REASON_PROTOCOL_ERROR, buf);
     }
 
-    /*
-     * Retransmit R2T PDUs in the range [beg_run, beg_run + run_len).
-     * These PDUs were lost due to network corruption.
-     *
-     * The r2t_pool for this command still holds the R2T data,
-     * so we can regenerate them without involving the backend again.
-     */
-    return iscsit_retransmit_r2ts(cmd, beg_run, run_len);
+    switch (type) {
+    case ISCSI_FLAG_SNACK_TYPE_DATA_OR_R2T:
+        /*
+         * Retransmit Data-In or R2T PDUs identified by BegRun..BegRun+RunLength.
+         */
+        ret = iscsit_handle_data_or_r2t_snack(conn, hdr);
+        break;
+
+    case ISCSI_FLAG_SNACK_TYPE_STATUS:
+        /*
+         * Retransmit SCSI Response PDUs identified by BegRun=StatSN.
+         */
+        ret = iscsit_handle_status_snack(conn, hdr);
+        break;
+
+    case ISCSI_FLAG_SNACK_TYPE_DATA_ACK:
+        /*
+         * Initiator is ACKing receipt of Data-In PDUs.
+         * Allows target to drop retained copies (memory cleanup).
+         */
+        ret = iscsit_handle_data_ack(conn, hdr);
+        break;
+
+    case ISCSI_FLAG_SNACK_TYPE_RDATA:
+        /* R-Data SNACK — handled similarly to DATA_OR_R2T */
+        ret = iscsit_handle_data_or_r2t_snack(conn, hdr);
+        break;
+
+    default:
+        ret = iscsit_reject_cmd(conn, ISCSI_REASON_PROTOCOL_ERROR, buf);
+    }
+
+    return ret;
 }
 ```
 
+For Status SNACK, the target must have retained the SCSI Response PDU after sending it (in case
+the initiator misses it). Retention is controlled by negotiated parameters
+`MaxOutstandingUnexpectedStatuses` and similar. Memory cost: typically modest (a few KB per
+session) but adds up if many sessions are open with ERL>=1.
+
+---
+
+## DataACK — initiator clears target's retransmit buffers
+
 ```c
-/*
- * iscsit_handle_data_ack() — called when initiator ACKs received data.
- *
- * For ERL=1 with DataDigest: initiator ACKs each Data-In PDU.
- * Target tracks DataACK SNACK responses to know which data was received.
- * If ACK is missing for a PDU: retransmit that PDU.
- *
- * ICF_GOT_DATACK_SNACK flag: set when a DataACK SNACK is received.
- * This flag is checked in the TX path to know we need to retransmit.
- */
-static int iscsit_handle_data_ack(struct iscsi_conn *conn,
-                                   struct iscsi_snack *hdr)
+/* Simplified — illustrative shape. */
+static int iscsit_handle_data_ack(struct iscsit_conn *conn,
+                                    struct iscsi_snack *hdr)
 {
+    u32 begrun = be32_to_cpu(hdr->begrun);
     struct iscsit_cmd *cmd;
-    u32 ack_sn = be32_to_cpu(hdr->begrun);
 
     cmd = iscsit_find_cmd_from_itt(conn, hdr->itt);
     if (!cmd)
         return -1;
 
     /*
-     * Mark that we received a DataACK SNACK.
-     * ICF_GOT_DATACK_SNACK tells the TX path that the initiator
-     * has confirmed receipt of data up to ack_sn.
+     * Target had retained Data-In PDUs ≥ begrun in its retransmit buffer.
+     * Initiator now ACKs receipt — drop them.
      */
-    cmd->cmd_flags |= ICF_GOT_DATACK_SNACK;
-    cmd->acked_data_sn = ack_sn;
+    iscsit_drop_retained_data_in_pdus(cmd, begrun);
 
     return 0;
 }
 ```
 
----
-
-## ICF_OOO_CMDSN — out-of-order CmdSN interaction with data
-
-The interaction between out-of-order CmdSN and write data that we referenced in day 18:
-
-```c
-/*
- * Scenario: initiator sends commands in order A(CmdSN=5), B(CmdSN=6).
- * Network delivers B before A. Target receives B first.
- *
- * iscsit_handle_scsi_cmd() for B:
- *   iscsit_sequence_cmd() → CMDSN_HIGHER_THAN_EXP (5 expected, got 6)
- *   cmd_B queued on sess->ooo_cmdsn_list
- *   ICF_OOO_CMDSN set on cmd_B
- *   iscsit_process_scsi_cmd() NOT called yet for cmd_B
- *
- * If cmd_B is a WRITE with InitialR2T=No:
- *   Problem: the target called target_submit_cmd() and set up Data-Out receive,
- *   but we haven't called target_submit_cmd() yet (cmd is OOO-queued).
- *
- * Solution: when cmd_A finally arrives and its CmdSN fills the gap,
- *   iscsit_execute_cmd() is called to re-drive cmd_B.
- *   At that point, if ICF_GOT_LAST_DATAOUT is ALSO set on cmd_B
- *   (all write data arrived while it was OOO-queued):
- *     target_execute_cmd() is called directly — data is ready.
- *   If ICF_GOT_LAST_DATAOUT is NOT set:
- *     target_submit_cmd() is called and the write data path begins.
- */
-
-static int iscsit_execute_cmd(struct iscsit_cmd *cmd, int ooo)
-{
-    struct se_cmd *se_cmd = &cmd->se_cmd;
-    struct iscsi_conn *conn = cmd->conn;
-    int ret;
-
-    /*
-     * Re-drive an out-of-order command after its CmdSN gap is filled.
-     * ooo=1: this was an OOO command being re-driven.
-     */
-    if (cmd->data_direction == DMA_TO_DEVICE) {
-        if (cmd->cmd_flags & ICF_GOT_LAST_DATAOUT) {
-            /*
-             * All write data arrived (via Data-Out PDUs) while the
-             * command was OOO-queued. We can execute directly.
-             *
-             * This is the only place where ICF_GOT_LAST_DATAOUT is
-             * checked OUTSIDE of iscsit_check_dataout_payload().
-             */
-            target_execute_cmd(se_cmd);
-            return 0;
-        }
-        /*
-         * Data not yet complete — call target_submit_cmd() to set up
-         * the write data receive path. Data-Out PDUs will follow.
-         */
-    }
-
-    ret = iscsit_process_scsi_cmd(conn, cmd,
-                                   (struct iscsi_scsi_req *)cmd->pdu);
-    return ret;
-}
-```
-
-This is the complete ICF_OOO_CMDSN + ICF_GOT_LAST_DATAOUT interaction:
-
-```
-Write command arrives OOO (CmdSN=6, expected=5):
-    iscsit_handle_scsi_cmd()
-    → CMDSN_HIGHER_THAN_EXP
-    → ICF_OOO_CMDSN set on cmd
-    → cmd queued on ooo_cmdsn_list
-    → iscsit_process_scsi_cmd() NOT called
-
-Data-Out PDUs arrive for this command (same ITT):
-    iscsit_handle_data_out()
-    → iscsit_check_dataout_payload()
-    → F-bit=1, write_data_done == data_length
-    → ICF_GOT_LAST_DATAOUT set
-    → NORMALLY: target_execute_cmd() called
-    → BUT: ICF_OOO_CMDSN is set → skip target_execute_cmd()
-    →      (command is still OOO-queued, can't execute yet)
-
-CmdSN=5 (the gap) finally arrives:
-    iscsit_handle_scsi_cmd() for CmdSN=5
-    → CMDSN_NORMAL_OPERATION
-    → iscsit_process_scsi_cmd() called for CmdSN=5
-
-Gap filled: iscsit_execute_ooo_cmdsn() re-drives CmdSN=6:
-    iscsit_execute_cmd(cmd_6, ooo=1)
-    → cmd_6->cmd_flags & ICF_GOT_LAST_DATAOUT is TRUE
-    → target_execute_cmd() called directly
-    → backend I/O begins
-```
+Without DataACK, the target retains every Data-In until... when? The spec says until the
+command completes (Status ACK). DataACK lets the initiator say "I've safely processed up
+through BegRun, so you can free buffers". Reduces target memory pressure.
 
 ---
 
-## ERL=2: Session-level recovery — `drivers/target/iscsi/iscsi_target_erl2.c`
+## ERL=2: connection recovery and task reassignment
 
-ERL=2 allows commands to survive connection drops via TASK_REASSIGN TMF.
-
-```c
-/*
- * iscsit_handle_task_reassign() — ERL=2 only.
- *
- * When a connection drops (ERL=2), the initiator can:
- *   1. Reconnect and establish a new connection on the same session
- *   2. Send TASK_REASSIGN TMF for each in-flight command
- *   3. Target reassigns the command to the new connection
- *   4. Resume Data-Out or Data-In from where it left off
- *
- * This is extremely complex and rarely implemented.
- * Almost no iSCSI deployments use ERL=2 in production.
- */
-int iscsit_handle_task_reassign(struct iscsi_conn *conn,
-                                 unsigned char *buf)
-{
-    struct iscsi_tm *hdr = (struct iscsi_tm *)buf;
-    struct iscsit_cmd *cmd;
-
-    /*
-     * Find the command being reassigned by Referenced Task Tag (rtt).
-     * The command must still be active on the old connection.
-     */
-    cmd = iscsit_find_cmd_from_rtt(conn->sess, hdr->rtt);
-    if (!cmd) {
-        /*
-         * Command not found: either already completed or never existed.
-         * Return TMR_TASK_DOES_NOT_EXIST.
-         */
-        return iscsit_task_reassign_complete(conn, hdr,
-                                              TASK_REASSIGN_DOES_NOT_EXIST);
-    }
-
-    /*
-     * Check ICF_GOT_LAST_DATAOUT to decide reassignment behavior:
-     *
-     * If ICF_GOT_LAST_DATAOUT is SET:
-     *   All write data was already received before the connection dropped.
-     *   The command is in the backend (or awaiting dispatch).
-     *   Reassignment just moves the response path to the new connection.
-     *   No need to re-collect write data.
-     *
-     * If ICF_GOT_LAST_DATAOUT is NOT set (write command, data incomplete):
-     *   Data collection must restart.
-     *   Target resets write_data_done to the checkpoint.
-     *   Initiator will re-send Data-Out PDUs from the checkpoint offset.
-     */
-    if (cmd->cmd_flags & ICF_GOT_LAST_DATAOUT) {
-        /*
-         * Data complete. Just reassign the connection and
-         * let the response go to the new connection.
-         */
-        return iscsit_task_reassign_complete_write(cmd, hdr, conn);
-    }
-
-    /*
-     * Data incomplete. Reassign and restart data collection.
-     * The DataSN and offset checkpoint is stored in cmd->write_data_done.
-     */
-    return iscsit_task_reassign_complete(conn, hdr,
-                                          TASK_REASSIGN_REASSIGNED);
-}
-```
+ERL=2 lets a session migrate active tasks to a new connection within the session, without
+restarting the SCSI commands. Useful when one TCP connection of a multi-connection session
+fails.
 
 ```c
-/*
- * iscsit_task_reassign_complete_write() — ERL=2 write reassignment
- * when ICF_GOT_LAST_DATAOUT is set.
- */
-static int iscsit_task_reassign_complete_write(struct iscsit_cmd *cmd,
-                                                struct iscsi_tm *hdr,
-                                                struct iscsi_conn *conn)
+/* Simplified — see drivers/target/iscsi/iscsi_target_erl2.c.
+ * LIO target's ERL=2 support is partial; the function is named
+ * iscsit_task_reassign_complete_*; semantics handle the typical cases.
+ * Production deployments rarely exercise this code. */
+int iscsit_task_reassign_complete_write(struct iscsit_cmd *cmd,
+                                          struct iscsi_task_mgmt *tmf)
 {
     /*
-     * Move the command to the new connection.
-     * The se_cmd is still valid — it may be in target_submission_wq
-     * or already executing in the backend.
+     * Task is being moved from old connection to new one (reassigned).
+     * For a write task in mid-flight:
+     *   - any Data-Out PDUs received on old connection are kept
+     *   - new R2Ts will go on the new connection
+     *   - state continuity preserved across the connection break
      */
-    iscsit_reassign_cmd_to_conn(cmd, conn);
-
-    /*
-     * Since ICF_GOT_LAST_DATAOUT is set, we know the backend I/O
-     * was already submitted (or is about to be submitted).
-     * The response will now go to the new connection when it arrives.
-     */
+    cmd->cmd_flags |= ICF_REASSIGNED;
+    /* re-arm any pending R2T on the new connection */
+    iscsit_send_r2ts_to_fe(cmd, /* new conn */, false);
     return 0;
 }
 ```
 
----
+The TASK REASSIGN TMF (function code 0x08) is the trigger. Initiator side stops the old
+connection, opens a new one within the same session (same TSIH), and issues TASK REASSIGN to
+move each in-flight ITT.
 
-## ERL comparison table
-
-| Feature | ERL=0 | ERL=1 | ERL=2 |
-|---|---|---|---|
-| Header digest recovery | No — drop connection | Yes — SNACK retransmit | Yes |
-| Data digest recovery | No — drop connection | Yes — Data-Out re-request | Yes |
-| Command recovery across connection drop | No | No | Yes — TASK_REASSIGN |
-| ICF_GOT_LAST_DATAOUT usage | Gate for execute | Gate for execute | Gate for reassign path |
-| ICF_OOO_CMDSN interaction | Deferred execute | Same | Same |
-| Production usage | Ubiquitous | Rare | Almost never |
-| Complexity | Low | Medium | Very high |
-| LIO implementation | Complete | Complete | Partial (basic) |
+In practice: very few deployments use this. Multi-connection iSCSI itself is rare; using ERL=2
+on top of MC/S even rarer. The code paths exist and are exercised by interop test suites.
 
 ---
 
-## ERL=0 and fencing
+## OOO_CMDSN handling — CmdSN window with gaps
 
-For our fencing context, ERL=0 behavior is exactly what we want:
+When commands arrive out of order (different connections in MC/S, or initiator reordering), the
+target must buffer them until the gap closes:
 
+```c
+/* Simplified — see drivers/target/iscsi/iscsi_target_util.c.
+ * The actual function is iscsit_execute_ooo_cmdsns(). */
+int iscsit_execute_ooo_cmdsns(struct iscsi_session *sess)
+{
+    struct iscsit_cmd *cmd, *cmd_p;
+    struct iscsi_ooo_cmdsn *ooo_cmdsn;
+    u32 ooo_count = 0;
+
+    /*
+     * sess->ooo_cmdsn_list holds out-of-order commands.
+     * After each in-order command's exp_cmd_sn advances, walk the list
+     * and execute any commands that are now in-order.
+     */
+    list_for_each_entry_safe(ooo_cmdsn, ..., &sess->ooo_cmdsn_list, ooo_list) {
+        if (ooo_cmdsn->cmdsn != sess->exp_cmd_sn)
+            break;  /* still gaps */
+
+        cmd = ooo_cmdsn->cmd;
+
+        /* now in-order — execute */
+        cmd->cmd_flags |= ICF_GOT_LAST_DATAOUT;  /* if applicable */
+        target_submit_cmd_map_sgls(&cmd->se_cmd, ...);
+
+        /* advance window */
+        sess->exp_cmd_sn++;
+        ooo_count++;
+
+        list_del(&ooo_cmdsn->ooo_list);
+        kfree(ooo_cmdsn);
+    }
+
+    return ooo_count;
+}
 ```
-Connection drop (TCP RST from target after ACL removal):
-    ERL=0 behavior:
-    → No SNACK, no retransmit, no task reassignment
-    → iscsit_release_commands_from_conn() aborts all commands
-    → All aborted commands complete without response (CMD_T_FABRIC_STOP)
-    → Initiator: all in-flight commands → DID_NO_CONNECT (after EH)
-    → dm-multipath: fail_path() after replacement_timeout
 
-ERL=1/2 would complicate fencing:
-    ERL=1: initiator might SNACK for retransmission after reconnect
-           But reconnect is blocked (ACL removed) → SNACK never arrives
-           → same end result, just with extra retry attempts
-    ERL=2: initiator might attempt TASK_REASSIGN on new connection
-           But new connection blocked (ACL removed) → TASK_REASSIGN never sent
-           → same end result
+`ICF_OOO_CMDSN` is a marker the target uses to remember "this command was out-of-order when
+received". After the gap closes and `iscsit_execute_ooo_cmdsns()` advances the queue, the
+command is dispatched normally — the bit lets the TX path recognize that it's processing a
+delayed-but-now-ordered command.
 
-Conclusion: ERL=0 is the cleanest for fencing. ERL=1/2 add complexity
-but don't change the end result when the ACL is removed.
-```
+The interaction between `ICF_OOO_CMDSN` and `ICF_GOT_LAST_DATAOUT` is the key insight for OOO
+write handling: a write command may have arrived OOO, all its Data-Out PDUs may have arrived
+(both before and after the gap closed), but the target must wait for both conditions before
+executing — the command must be in-order in the CmdSN window AND all data must be received.
+
+---
+
+## Why most production stays on ERL=0
+
+The trade-offs:
+
+| ERL=0 | ERL=1 | ERL=2 |
+|---|---|---|
+| Simple state | SNACK retransmit machinery | Full task reassignment state |
+| Drop session on any error | Retransmit individual PDUs | Move tasks across connections |
+| Recovery via reconnect | Recovery within session | Recovery within session, no restart |
+| Trivially correct | Digest-driven retransmit | Complex synchronization |
+| All initiators support | Most initiators support | Few deployments use |
+| Replacement_timeout bound | No timeout for SNACK retry | Per-task reassign timeout |
+
+For modern Ethernet (where digest errors are extremely rare — TCP checksums + Ethernet FCS
+catch nearly everything), ERL>0 buys little. The code exists for completeness and historical
+compatibility (legacy iSCSI HBAs that needed it).
+
+For fencing analysis, ERL=0 is the correct mental model. Session drops cleanly on any failure;
+recovery is the dm-multipath / replacement_timeout story (day 12).
+
+---
+
+## Why ERL>0 might be enabled
+
+Niche reasons it might be turned on:
+- Slow / lossy WAN iSCSI (rare; usually you'd run RDMA over WAN instead).
+- Compliance requirement to support all RFC features.
+- Interop testing of different vendors' implementations.
+- Legacy applications that can't tolerate session resets.
+
+For everyone else: leave at ERL=0. open-iscsi default is ERL=0, LIO accepts whatever the
+initiator offers (capped at the kernel's max supported level).
+
+---
+
+## Diagnostic value
+
+When debugging, knowing what ERL is negotiated tells you what to expect in logs:
+
+- `Login parameters` showing `ErrorRecoveryLevel=0` → expect session drops, no SNACK/Reassign
+  log lines.
+- `ErrorRecoveryLevel=1` → may see "SNACK received" or "retransmit" log lines on digest errors.
+- `ErrorRecoveryLevel=2` → may see "Task Reassign" log lines on connection failover.
+
+If you see ERL=1/2 log lines but expected ERL=0, check your `iscsid.conf` and target config —
+something has been overridden.
 
 ---
 
 ## Key takeaways
 
-- ERL=0: connection drop → all commands lost, no recovery. Production standard.
-- ERL=1: digest errors → SNACK → retransmit. `ICF_GOT_DATACK_SNACK` tracks ACKed data.
-- ERL=2: connection drop → TASK_REASSIGN → command moves to new connection. Almost never used.
-- `ICF_OOO_CMDSN` + `ICF_GOT_LAST_DATAOUT` interaction: when a write command arrives OOO and its
-  data arrives while it's still queued (OOO), the data is buffered and `ICF_GOT_LAST_DATAOUT`
-  is set but `target_execute_cmd()` is skipped. When `iscsit_execute_cmd()` re-drives the command
-  (after gap fills), it sees `ICF_GOT_LAST_DATAOUT` and calls `target_execute_cmd()` directly.
-- In ERL=2's `iscsit_task_reassign_complete_write()`, `ICF_GOT_LAST_DATAOUT` determines whether
-  data collection needs to restart — the only other place besides `iscsit_check_dataout_payload()`
-  where this flag is the decision point.
-- For fencing: ERL=0 is cleanest. ERL=1/2 add retry complexity but blocked reconnect (ACL
-  removed) ensures the same end result — `DID_TRANSPORT_FAILFAST` → `fail_path()`.
+- ERL levels: 0 (session), 1 (PDU/SNACK), 2 (task reassignment). ERL=0 dominates production.
+- SNACK (opcode 0x10) is the ERL=1 recovery primitive. Types: Data/R2T, Status, DataACK,
+  R-Data.
+- Status SNACK retransmission requires target to retain SCSI Response PDUs — small memory cost.
+- DataACK lets initiator tell target "I have these PDUs, you can drop the retained copies".
+- ERL=2 task reassignment is implemented in LIO partially, in libiscsi initiator largely
+  removed in 2017 cleanup. Rarely exercised.
+- OOO_CMDSN handling buffers commands that arrived before earlier ones; releases them as gaps
+  close. `ICF_OOO_CMDSN` flag tracks this state. The interaction with `ICF_GOT_LAST_DATAOUT`
+  matters for OOO writes.
+- Modern Ethernet rarely has digest errors → ERL>0 buys little. Default to ERL=0.
+- For fencing reasoning, ERL=0 is the right model — session drops, replacement_timeout
+  governs recovery time.
 
 ---
 

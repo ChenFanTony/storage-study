@@ -1,508 +1,547 @@
 # Day 20 — LIO Persistent Reservations
 
-**Week 3**: LIO Target Core — Fabric to Backend
-**Time**: 1–2 hours
-**Reference**: `drivers/target/target_core_pr.c`
+**Week 3**: LIO Target Kernel Code  
+**Time**: 1–2 hours  
+**Reference**: `drivers/target/target_core_pr.c`, `include/target/target_core_base.h`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-This is the target-side counterpart to day 13 (initiator side). `target_core_pr.c` implements the
-complete SCSI SPC-4 Persistent Reservation state machine. It owns the registration list, the
-reservation holder, and the `core_scsi3_pr_seq_non_holder()` function that generates
-`RESERVATION CONFLICT`. Understanding this file tells you exactly how PR-based fencing works on
-the target, and what you would need to replace if implementing an alternative.
+The PR state machine in LIO is the heart of every fencing strategy. When the cluster says
+"prevent node A from writing", the surviving node sends a `PERSISTENT RESERVE OUT PREEMPT`
+that ends up here. Day 13/14 covered the initiator side; today is what happens on the target.
 
 ---
 
-## PR state overview — two-level structure
+## struct t10_reservation — `include/target/target_core_base.h`
 
-SCSI PR has two levels:
-
-```
-Level 1: Registration
-    Each initiator registers a 64-bit key with the target.
-    Registration != reservation. It's just "I exist and here's my key."
-    Stored in: se_device->t10_pr_reg_list (list of t10_pr_registration)
-
-Level 2: Reservation
-    One registered initiator then acquires the reservation.
-    The reservation has a type that determines access rules.
-    Stored in: se_device->dev_pr_res_holder (single t10_pr_registration)
-
-PR OUT service actions:
-    REGISTER (0x00)      → add/update/remove a registration
-    RESERVE  (0x01)      → acquire the reservation (must be registered first)
-    RELEASE  (0x02)      → release the reservation
-    CLEAR    (0x03)      → clear all registrations AND reservation
-    PREEMPT  (0x04)      → steal reservation from another holder
-    PREEMPT AND ABORT (0x05) → steal + abort holder's commands
-    REGISTER AND IGNORE EXISTING KEY (0x06)
-    REGISTER AND MOVE (0x07)
-```
-
----
-
-## core_scsi3_emulate_pro — `drivers/target/target_core_pr.c`
-
-Entry point for PERSISTENT RESERVE OUT. Called from `target_execute_cmd_work()` via
-`cmd->execute_cmd`:
+The per-device PR state, embedded in `se_device`:
 
 ```c
-sense_reason_t core_scsi3_emulate_pro(struct se_cmd *cmd)
-{
-    u32 sa;
+struct t10_reservation {
     /*
-     * Service action is in CDB byte 1 bits[4:0].
-     * CDB: [0x5F][SA][TYPE<<4|SCOPE][0][0][0][0][PLLen_hi][PLLen_lo][CTL]
+     * Generation counter — incremented on any change to PR state.
+     * Initiators read it via PERSISTENT RESERVE IN READ KEYS to detect
+     * stale views.
      */
-    sa = (cmd->t_task_cdb[1] & 0x1f);
+    u32                         pr_generation;
 
     /*
-     * Parameter list is in the SGL (set up by transport_generic_new_cmd).
-     * For RESERVE/RELEASE: 24 bytes.
-     * Read it into a local buffer for parsing.
+     * Linked list of all registrations on this device.
+     * One entry per (initiator IQN, ISID) tuple.
      */
+    struct list_head            registration_list;
+    spinlock_t                  registration_lock;
+
+    /*
+     * The current reservation holder (if any).
+     * Points into registration_list.
+     */
+    struct t10_pr_registration  *pr_res_holder;
+    int                         pr_res_type;       /* SCSI type byte: 0x01–0x08 */
+    int                         pr_res_scope;      /* always LU_SCOPE = 0 */
+
+    /*
+     * APTPL — Activate Persist Through Power Loss.
+     * If set, registrations and reservation survive target reboots.
+     * Stored in /var/target/pr/ via configfs hooks.
+     */
+    int                         pr_aptpl_active;
+    char                        pr_aptpl_buf[PR_APTPL_MAX_IPORT_LEN];
+
+    /*
+     * Holder's I_T nexus pointers (cached for fast checks in hot path).
+     */
+    struct se_node_acl          *pr_res_holder_acl;
+    u64                         pr_res_holder_sa_res_key;
+};
+```
+
+---
+
+## struct t10_pr_registration — per-registration state
+
+```c
+struct t10_pr_registration {
+    char                        pr_iport[PR_APTPL_MAX_IPORT_LEN];   /* IQN+ISID */
+    char                        pr_tport[PR_APTPL_MAX_TPORT_LEN];   /* target portal */
+
+    u64                         pr_res_key;        /* the registered key */
+    u64                         pr_res_mapped_lun; /* LUN this is for */
+    u32                         pr_res_generation;
+
+    /*
+     * Linkage: the I_T nexus this registration represents.
+     */
+    struct se_node_acl          *pr_reg_nacl;
+    struct se_lun               *pr_reg_lun;
+    struct se_dev_entry         *pr_reg_deve;
+
+    /*
+     * Holder flag: 1 if this registration currently holds the reservation.
+     * Otherwise pr_res_holder in t10_reservation points to a different entry.
+     */
+    int                         pr_reg_all_tg_pt;  /* registered on all paths? */
+
+    struct list_head            pr_reg_list;
+    struct list_head            pr_reg_aptpl_list;
+};
+```
+
+A registration represents one initiator-port to target-port path with a key. When an initiator
+issues PR REGISTER on each of N paths, N entries are created — same `pr_iport` (IQN), same key,
+different `pr_tport`s.
+
+---
+
+## CDB dispatch — target_core_pr.c
+
+```c
+/* Simplified — see drivers/target/target_core_pr.c. */
+sense_reason_t target_scsi3_emulate_pr_out(struct se_cmd *cmd)
+{
+    unsigned char *cdb = cmd->t_task_cdb;
+    u8 sa = cdb[1] & 0x1f;       /* service action — low 5 bits of byte 1 */
+    u8 type = cdb[2] & 0x0f;     /* type — low 4 bits of byte 2 */
+    u8 scope = (cdb[2] >> 4);    /* scope — high 4 bits — must be 0 (LU) */
+
+    if (scope != PR_SCOPE_LU_SCOPE)
+        return TCM_INVALID_CDB_FIELD;
 
     switch (sa) {
-    case PRO_REGISTER:
-    case PRO_REGISTER_AND_IGNORE_EXISTING_KEY:
-        return core_scsi3_pro_register(cmd, sa);
-
-    case PRO_RESERVE:
-        return core_scsi3_pro_reserve(cmd, sa);
-
-    case PRO_RELEASE:
-        return core_scsi3_pro_release(cmd, sa);
-
-    case PRO_CLEAR:
-        return core_scsi3_pro_clear(cmd, sa);
-
-    case PRO_PREEMPT:
-    case PRO_PREEMPT_AND_ABORT:
-        return core_scsi3_pro_preempt(cmd, sa,
-            (sa == PRO_PREEMPT_AND_ABORT));
-
-    case PRO_REGISTER_AND_MOVE:
-        return core_scsi3_pro_register_and_move(cmd, sa);
-
+    case PRO_REGISTER:                /* 0x00 */
+        return core_scsi3_emulate_pro_register(cmd, ...);
+    case PRO_RESERVE:                 /* 0x01 */
+        return core_scsi3_emulate_pro_reserve(cmd, type, ...);
+    case PRO_RELEASE:                 /* 0x02 */
+        return core_scsi3_emulate_pro_release(cmd, type, ...);
+    case PRO_CLEAR:                   /* 0x03 */
+        return core_scsi3_emulate_pro_clear(cmd, ...);
+    case PRO_PREEMPT:                 /* 0x04 */
+        return core_scsi3_emulate_pro_preempt(cmd, type, false);
+    case PRO_PREEMPT_AND_ABORT:       /* 0x05 */
+        return core_scsi3_emulate_pro_preempt(cmd, type, true);
+    case PRO_REGISTER_AND_IGNORE:     /* 0x06 */
+        return core_scsi3_emulate_pro_register(cmd, ..., true /* ignore */);
+    case PRO_REGISTER_AND_MOVE:       /* 0x07 */
+        return core_scsi3_emulate_pro_register_and_move(cmd, ...);
     default:
         return TCM_INVALID_CDB_FIELD;
     }
 }
 ```
 
-All these functions run synchronously in the `target_submission_wq` worker. They operate on
-in-memory lists with spinlocks — no disk I/O unless APTPL persistence is enabled.
-
 ---
 
-## core_scsi3_pro_register — `drivers/target/target_core_pr.c`
+## REGISTER service action
 
 ```c
-static sense_reason_t core_scsi3_pro_register(struct se_cmd *cmd, u32 sa)
+/* Simplified — illustrative; the real function handles many edge cases. */
+static sense_reason_t core_scsi3_emulate_pro_register(struct se_cmd *cmd,
+                                                       u64 res_key,
+                                                       u64 sa_res_key,
+                                                       int aptpl,
+                                                       int all_tg_pt,
+                                                       int spec_i_pt,
+                                                       bool ignore_key)
 {
-    struct se_device *dev  = cmd->se_dev;
-    struct se_session *sess = cmd->se_sess;
-    struct se_node_acl *nacl = sess->se_node_acl;
-    struct t10_pr_registration *pr_reg;
-    unsigned char *buf;
-    u64 res_key, sa_res_key;
-    int aptpl;
+    struct se_device *dev = cmd->se_dev;
+    struct se_session *se_sess = cmd->se_sess;
+    struct t10_pr_registration *pr_reg, *pr_reg_e;
+    sense_reason_t ret = 0;
 
-    /*
-     * Parse the 24-byte PR OUT parameter list from the SGL.
-     * Bytes 0-7:  Reservation Key (the key already registered, 0 if new)
-     * Bytes 8-15: Service Action Reservation Key (new key to register)
-     * Byte 16[0]: APTPL (Activate Persist Through Power Loss)
-     */
-    buf = transport_kmap_data_sg(cmd);
-    if (!buf)
-        return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
-
-    res_key    = get_unaligned_be64(&buf[0]);  /* current key (0 for new) */
-    sa_res_key = get_unaligned_be64(&buf[8]);  /* new key */
-    aptpl      = (buf[20] & 0x01);
-
-    transport_kunmap_data_sg(cmd);
-
-    spin_lock(&dev->dev_reservation_lock);
+    spin_lock(&dev->t10_pr.registration_lock);
 
     /*
      * Find existing registration for this I_T nexus.
-     * Key = (nacl, lun) pair — one registration per initiator per LUN.
      */
-    pr_reg = core_scsi3_locate_pr_reg(dev, nacl,
-                                       cmd->se_lun->unpacked_lun);
+    pr_reg_e = __core_scsi3_locate_pr_reg(dev, se_sess);
 
-    if (!pr_reg) {
+    if (pr_reg_e) {
         /*
-         * No existing registration.
-         * If res_key != 0: error — can't modify non-existent registration.
-         * If res_key == 0: create new registration with sa_res_key.
+         * Existing registration found — must match res_key (unless ignore_key).
          */
-        if (res_key != 0) {
-            spin_unlock(&dev->dev_reservation_lock);
-            return TCM_RESERVATION_CONFLICT;
-        }
-
-        if (sa_res_key == 0) {
-            /* both keys 0: no-op (unregister of non-existent) */
-            spin_unlock(&dev->dev_reservation_lock);
-            goto out;
-        }
-
-        /* Create new t10_pr_registration */
-        pr_reg = kzalloc(sizeof(*pr_reg), GFP_ATOMIC);
-        if (!pr_reg) {
-            spin_unlock(&dev->dev_reservation_lock);
-            return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
-        }
-
-        pr_reg->pr_res_key   = sa_res_key;  /* the key being registered */
-        pr_reg->pr_reg_nacl  = nacl;
-        pr_reg->pr_reg_deve  = cmd->se_lun;
-        pr_reg->pr_res_mapped_lun = cmd->se_lun->unpacked_lun;
-        pr_reg->pr_reg_aptpl = aptpl;
-
-        /*
-         * Add to device's registration list.
-         * Protected by dev_reservation_lock.
-         */
-        list_add_tail(&pr_reg->pr_reg_list, &dev->t10_pr_reg_list);
-
-    } else {
-        /*
-         * Existing registration found.
-         * Verify the presented res_key matches the registered key.
-         */
-        if (pr_reg->pr_res_key != res_key) {
-            spin_unlock(&dev->dev_reservation_lock);
+        if (!ignore_key && pr_reg_e->pr_res_key != res_key) {
+            spin_unlock(&dev->t10_pr.registration_lock);
             return TCM_RESERVATION_CONFLICT;
         }
 
         if (sa_res_key == 0) {
             /*
-             * Unregister: remove this registration.
-             * If this initiator held the reservation, release it.
+             * sa_res_key=0 → unregister this initiator.
+             * If this initiator was the holder, release the reservation.
              */
-            if (dev->dev_pr_res_holder == pr_reg) {
-                dev->dev_pr_res_holder = NULL;
-                dev->dev_t10_pr.pr_res_type = 0;
-            }
-            list_del(&pr_reg->pr_reg_list);
-            kfree(pr_reg);
-            pr_reg = NULL;
+            if (dev->t10_pr.pr_res_holder == pr_reg_e)
+                __core_scsi3_complete_pro_release(dev, ...);
+
+            list_del(&pr_reg_e->pr_reg_list);
+            kmem_cache_free(t10_pr_reg_cache, pr_reg_e);
         } else {
-            /* update key */
-            pr_reg->pr_res_key = sa_res_key;
+            /*
+             * sa_res_key != 0 → update the key.
+             */
+            pr_reg_e->pr_res_key = sa_res_key;
         }
+    } else {
+        /*
+         * No existing registration — create one.
+         */
+        if (sa_res_key == 0) {
+            spin_unlock(&dev->t10_pr.registration_lock);
+            return TCM_RESERVATION_CONFLICT;
+        }
+
+        /* GFP_KERNEL is appropriate here — we're in process context */
+        pr_reg = kmem_cache_zalloc(t10_pr_reg_cache, GFP_KERNEL);
+        if (!pr_reg) {
+            spin_unlock(&dev->t10_pr.registration_lock);
+            return TCM_OUT_OF_RESOURCES;
+        }
+
+        pr_reg->pr_res_key = sa_res_key;
+        pr_reg->pr_reg_nacl = se_sess->se_node_acl;
+        snprintf(pr_reg->pr_iport, ..., "%s,i,0x%s",
+                 se_sess->se_node_acl->initiatorname, ...);
+
+        list_add_tail(&pr_reg->pr_reg_list,
+                       &dev->t10_pr.registration_list);
     }
 
-    spin_unlock(&dev->dev_reservation_lock);
+    /*
+     * Increment the generation counter — initiators see this in
+     * READ_KEYS responses.
+     */
+    dev->t10_pr.pr_generation++;
 
-out:
-    target_complete_cmd(cmd, SAM_STAT_GOOD);
-    return 0;
+    /*
+     * If APTPL=1, persist to /var/target/pr/aptpl_*.
+     */
+    if (aptpl) {
+        ret = core_scsi3_update_and_write_aptpl(dev, true);
+    }
+
+    spin_unlock(&dev->t10_pr.registration_lock);
+    return ret;
 }
 ```
 
 ---
 
-## core_scsi3_pro_reserve — `drivers/target/target_core_pr.c`
+## PREEMPT — the fencing primitive
 
 ```c
-static sense_reason_t core_scsi3_pro_reserve(struct se_cmd *cmd, u32 sa)
+/* Simplified. */
+static sense_reason_t core_scsi3_emulate_pro_preempt(struct se_cmd *cmd,
+                                                      int type,
+                                                      bool abort)
 {
-    struct se_device *dev  = cmd->se_dev;
-    struct se_session *sess = cmd->se_sess;
-    struct se_node_acl *nacl = sess->se_node_acl;
-    struct t10_pr_registration *pr_reg;
-    unsigned char *buf;
-    u64 res_key;
-    u8 type;
+    struct se_device *dev = cmd->se_dev;
+    struct se_session *se_sess = cmd->se_sess;
+    struct t10_pr_registration *pr_reg, *pr_reg_n;
+    struct t10_pr_registration *pr_holder;
+    u64 res_key, sa_res_key;
+    sense_reason_t ret;
 
-    buf     = transport_kmap_data_sg(cmd);
-    res_key = get_unaligned_be64(&buf[0]);
-    type    = (cmd->t_task_cdb[2] & 0x0f);  /* reservation type from CDB byte 2 */
-    transport_kunmap_data_sg(cmd);
+    /*
+     * Parse parameter list:
+     *   res_key    = our existing key (must match our registration)
+     *   sa_res_key = key of registration to preempt
+     */
+
+    spin_lock(&dev->t10_pr.registration_lock);
+
+    pr_reg_n = __core_scsi3_locate_pr_reg(dev, se_sess);
+    if (!pr_reg_n) {
+        spin_unlock(&dev->t10_pr.registration_lock);
+        return TCM_RESERVATION_CONFLICT;  /* we're not registered */
+    }
+    if (pr_reg_n->pr_res_key != res_key) {
+        spin_unlock(&dev->t10_pr.registration_lock);
+        return TCM_RESERVATION_CONFLICT;  /* wrong key */
+    }
+
+    pr_holder = dev->t10_pr.pr_res_holder;
+
+    /*
+     * For *_ALL_REGS types: sa_res_key=0 is allowed and means "preempt all
+     * other registrations".
+     */
+    if (sa_res_key == 0 && !type_is_all_regs(dev->t10_pr.pr_res_type)) {
+        spin_unlock(&dev->t10_pr.registration_lock);
+        return TCM_INVALID_PARAMETER_LIST;
+    }
+
+    /*
+     * Walk registration_list, removing every entry whose key matches
+     * sa_res_key (or all of them for the all-regs case).
+     */
+    list_for_each_entry_safe(pr_reg, pr_reg_n,
+                              &dev->t10_pr.registration_list,
+                              pr_reg_list) {
+        if (pr_reg == cmd_reg)
+            continue;   /* don't remove our own */
+
+        if (sa_res_key != 0 && pr_reg->pr_res_key != sa_res_key)
+            continue;
+
+        /*
+         * Queue UNIT ATTENTION on the preempted initiator's nexus.
+         * Sense will be: 0x06 / 0x2A / 0x03 = "RESERVATIONS PREEMPTED"
+         * The next command from that initiator gets this UA.
+         */
+        core_scsi3_ua_allocate(pr_reg->pr_reg_nacl,
+                                pr_reg->pr_res_mapped_lun,
+                                0x2A, 0x03);
+
+        /*
+         * If PREEMPT_AND_ABORT (0x05): also abort all in-flight
+         * commands from this initiator. Calls core_tmr_abort_task()
+         * walking sess_cmd_list.
+         */
+        if (abort)
+            core_scsi3_aborted_task_set(dev, pr_reg);
+
+        list_del(&pr_reg->pr_reg_list);
+        kmem_cache_free(t10_pr_reg_cache, pr_reg);
+    }
+
+    /*
+     * If we preempted the holder: WE become the new holder.
+     * Set type and scope from this PREEMPT command.
+     */
+    if (pr_holder && pr_holder_was_preempted) {
+        dev->t10_pr.pr_res_holder = pr_reg_n;
+        dev->t10_pr.pr_res_type = type;
+        dev->t10_pr.pr_res_scope = PR_SCOPE_LU_SCOPE;
+    }
+
+    dev->t10_pr.pr_generation++;
+
+    if (dev->t10_pr.pr_aptpl_active)
+        core_scsi3_update_and_write_aptpl(dev, true);
+
+    spin_unlock(&dev->t10_pr.registration_lock);
+    return 0;
+}
+```
+
+After this function returns, the preempted initiator's I_T nexus is no longer registered. Any
+subsequent READ/WRITE from that initiator hits `target_check_reservation()` (day 16) and gets
+`TCM_RESERVATION_CONFLICT` → status byte 0x18.
+
+---
+
+## The reservation check — `target_check_reservation`
+
+```c
+/* Simplified — illustrative shape; real function in drivers/target/target_core_pr.c. */
+sense_reason_t target_check_reservation(struct se_cmd *cmd)
+{
+    struct se_device *dev = cmd->se_dev;
+    struct t10_pr_registration *holder;
+    u8 *cdb = cmd->t_task_cdb;
+    u8 op = cdb[0];
+
+    if (!dev->t10_pr.pr_res_holder)
+        return 0;  /* no reservation — anyone can do anything */
+
+    /*
+     * Always-allowed CDBs per SPC-4 §5.8.6 (regardless of reservation):
+     *   INQUIRY (0x12)
+     *   REPORT LUNS (0xA0)
+     *   REQUEST SENSE (0x03)
+     *   RELEASE (6/10) (0x17/0x57)
+     *   PERSISTENT RESERVE IN (0x5E)
+     *   PERSISTENT RESERVE OUT (0x5F)
+     *   READ CAPACITY (0x25/0x9E)
+     *   START STOP UNIT (0x1B) — varies by config
+     *   TEST UNIT READY (0x00)
+     *
+     * Without this list, fencing breaks: a fenced initiator must still
+     * be able to call PR IN to read keys, REPORT LUNS to discover, etc.
+     */
+    if (target_pr_cdb_always_allowed(op))
+        return 0;
 
     spin_lock(&dev->dev_reservation_lock);
 
-    /*
-     * Find the registration for this initiator.
-     * Must be registered before reserving.
-     */
-    pr_reg = core_scsi3_locate_pr_reg(dev, nacl,
-                                       cmd->se_lun->unpacked_lun);
-    if (!pr_reg) {
+    holder = dev->t10_pr.pr_res_holder;
+
+    /* Are we the holder? */
+    if (target_check_reservation_holder(cmd, holder)) {
         spin_unlock(&dev->dev_reservation_lock);
-        return TCM_RESERVATION_CONFLICT;  /* not registered */
+        return 0;
     }
 
-    /* verify key matches registration */
-    if (pr_reg->pr_res_key != res_key) {
+    /* Type-specific access:
+     *   PR_WRITE_EXCLUSIVE          : non-holders can read, not write
+     *   PR_EXCLUSIVE_ACCESS         : non-holders cannot read or write
+     *   PR_*_REG_ONLY               : registered non-holders share access
+     *   PR_*_ALL_REGS               : every registered initiator shares
+     */
+    if (target_check_reservation_type_allows(cmd, holder)) {
         spin_unlock(&dev->dev_reservation_lock);
-        return TCM_RESERVATION_CONFLICT;
+        return 0;
     }
-
-    /*
-     * Check if device already has a reservation.
-     */
-    if (dev->dev_pr_res_holder) {
-        /*
-         * Device already reserved.
-         * If this initiator already holds the reservation: idempotent OK.
-         * If another initiator holds it: RESERVATION CONFLICT.
-         */
-        if (dev->dev_pr_res_holder == pr_reg) {
-            /* already our reservation — check type matches */
-            if (dev->dev_pr_res_holder->pr_res_type == type) {
-                spin_unlock(&dev->dev_reservation_lock);
-                goto out_complete;
-            }
-            spin_unlock(&dev->dev_reservation_lock);
-            return TCM_RESERVATION_CONFLICT; /* type mismatch */
-        }
-
-        /*
-         * Another initiator holds the reservation.
-         *
-         * Some reservation types allow sharing:
-         *   WRITE_EXCLUSIVE_ALL_REGS (0x07): all registered initiators can write
-         *   EXCLUSIVE_ACCESS_ALL_REGS (0x08): only registered initiators
-         *
-         * Check core_scsi3_pr_check_type_conflict() for full rules.
-         */
-        if (core_scsi3_pr_check_type_conflict(dev, pr_reg, type)) {
-            spin_unlock(&dev->dev_reservation_lock);
-            return TCM_RESERVATION_CONFLICT;
-        }
-    }
-
-    /*
-     * Acquire the reservation.
-     * Set dev_pr_res_holder to this initiator's registration.
-     */
-    dev->dev_pr_res_holder               = pr_reg;
-    dev->dev_t10_pr.pr_res_type          = type;
-    dev->dev_t10_pr.pr_res_scope         = (cmd->t_task_cdb[2] >> 4) & 0x0f;
-    pr_reg->pr_res_type                  = type;
 
     spin_unlock(&dev->dev_reservation_lock);
 
-out_complete:
-    target_complete_cmd(cmd, SAM_STAT_GOOD);
-    return 0;
+    /*
+     * Conflict — return TCM_RESERVATION_CONFLICT.
+     * scsi_status will become SAM_STAT_RESERVATION_CONFLICT (0x18).
+     * No backend I/O. No sense data attached.
+     */
+    return TCM_RESERVATION_CONFLICT;
 }
 ```
 
----
-
-## core_scsi3_pr_seq_non_holder — the access check — `drivers/target/target_core_pr.c`
-
-Called from `target_submit_cmd()` for every incoming command when a reservation exists:
-
-```c
-sense_reason_t core_scsi3_pr_seq_non_holder(struct se_cmd *cmd,
-                                              unsigned char *cdb,
-                                              u32 pr_res_type)
-{
-    struct se_device *dev  = cmd->se_dev;
-    struct se_session *sess = cmd->se_sess;
-    struct se_node_acl *nacl = sess->se_node_acl;
-    struct t10_pr_registration *pr_reg;
-    bool registered = false;
-
-    /*
-     * Check if the command's initiator is registered with this device.
-     * "Registered" means has an entry in dev->t10_pr_reg_list.
-     */
-    pr_reg = core_scsi3_locate_pr_reg(dev, nacl,
-                                       cmd->se_lun->unpacked_lun);
-    registered = (pr_reg != NULL);
-
-    /*
-     * Access rules depend on the reservation type:
-     *
-     * WRITE_EXCLUSIVE (0x01):
-     *   Reads: ALL initiators allowed (registered or not)
-     *   Writes: ONLY reservation holder allowed
-     *
-     * EXCLUSIVE_ACCESS (0x03):
-     *   Reads: ALL registered initiators allowed
-     *   Writes: ONLY reservation holder allowed
-     *   Non-registered initiators: RESERVATION CONFLICT for all I/O
-     *
-     * WRITE_EXCLUSIVE_REG_ONLY (0x05):
-     *   All I/O: ALL registered initiators allowed
-     *   Non-registered: RESERVATION CONFLICT for writes, allowed for reads
-     *
-     * EXCLUSIVE_ACCESS_REG_ONLY (0x06):
-     *   All I/O: ALL registered initiators allowed
-     *   Non-registered: RESERVATION CONFLICT for ALL I/O
-     *
-     * WRITE_EXCLUSIVE_ALL_REGS (0x07):
-     *   All I/O: ALL registered initiators allowed
-     *   Non-registered: RESERVATION CONFLICT for writes
-     *
-     * EXCLUSIVE_ACCESS_ALL_REGS (0x08):
-     *   All I/O: ALL registered initiators allowed
-     *   Non-registered: RESERVATION CONFLICT for ALL I/O
-     */
-
-    switch (pr_res_type) {
-    case PR_TYPE_WRITE_EXCLUSIVE:
-        if (dev->dev_pr_res_holder->pr_reg_nacl == nacl)
-            return 0;   /* we are the holder — all access allowed */
-
-        /*
-         * Check if this is a READ command.
-         * WRITE_EXCLUSIVE allows reads from anyone.
-         */
-        if (cmd->data_direction == DMA_FROM_DEVICE)
-            return 0;   /* read — allowed */
-
-        /* write from non-holder: CONFLICT */
-        return TCM_RESERVATION_CONFLICT;
-
-    case PR_TYPE_EXCLUSIVE_ACCESS:
-        if (dev->dev_pr_res_holder->pr_reg_nacl == nacl)
-            return 0;   /* we are the holder */
-
-        /*
-         * Exclusive Access: even reads from non-holders are blocked
-         * if they are not registered.
-         */
-        if (!registered)
-            return TCM_RESERVATION_CONFLICT;
-
-        /* registered non-holder with read: check command */
-        if (cmd->data_direction == DMA_FROM_DEVICE && registered)
-            return 0;
-
-        return TCM_RESERVATION_CONFLICT;
-
-    case PR_TYPE_WRITE_EXCLUSIVE_REGONLY:
-        if (registered)
-            return 0;   /* all registered initiators: full access */
-        /* non-registered write: CONFLICT */
-        if (cmd->data_direction == DMA_TO_DEVICE)
-            return TCM_RESERVATION_CONFLICT;
-        return 0;
-
-    case PR_TYPE_EXCLUSIVE_ACCESS_REGONLY:
-    case PR_TYPE_EXCLUSIVE_ACCESS_ALLREG:
-        if (registered)
-            return 0;
-        return TCM_RESERVATION_CONFLICT;
-
-    case PR_TYPE_WRITE_EXCLUSIVE_ALLREG:
-        if (registered)
-            return 0;
-        if (cmd->data_direction == DMA_TO_DEVICE)
-            return TCM_RESERVATION_CONFLICT;
-        return 0;
-
-    default:
-        return TCM_RESERVATION_CONFLICT;
-    }
-}
-```
+The PR check is synchronous and runs before backend dispatch. Cost: a single spinlock + list
+walk. Latency: well under 1µs even for hundreds of registrations. PR conflict generation does
+not consume backend I/O resources.
 
 ---
 
-## How RESERVATION CONFLICT flows from here to the initiator
+## Why PR fencing is robust
+
+The full chain when a fencing PREEMPT arrives:
 
 ```
-core_scsi3_pr_seq_non_holder() returns TCM_RESERVATION_CONFLICT
+Surviving node sends PR PREEMPT (initiator side, day 13)
     │
-    ▼  (in target_submit_cmd):
-transport_generic_request_failure(cmd, TCM_RESERVATION_CONFLICT)
-    │  cmd->scsi_status = SAM_STAT_RESERVATION_CONFLICT (0x18)
-    │  no sense buffer written
     ▼
-target_complete_cmd(cmd, SAM_STAT_RESERVATION_CONFLICT)
-    │  INIT_WORK(&cmd->work, target_complete_failure_work)
-    │  queue_work(target_completion_wq, &cmd->work)
+Initiator: scsi_execute_cmd() → blk_execute_rq() → iscsi_queuecommand()
+TX → TCP → target
+    │
     ▼
-[target_completion_wq worker]
-target_complete_failure_work()
-    │  → transport_complete_qf()
+Target RX thread → iscsit_handle_scsi_cmd() (day 18)
+    │
     ▼
-cmd->se_tfo->queue_status(cmd)
-    │  = iscsit_queue_status()
-    │  cmd->i_state = ISTATE_SEND_STATUS
-    │  wake TX thread
+target_submit_cmd() → target_setup_cmd_from_cdb()
+    │  CDB = 0x5F PR OUT, sa=0x04 PREEMPT
+    │  parse_cdb routes to target_scsi3_emulate_pr_out
     ▼
-[TX kthread]
-iscsit_send_response()
-    │  hdr->cmd_status = 0x18
-    │  DataSegmentLength = 0 (no sense)
-    │  kernel_sendmsg() → TCP socket
+core_scsi3_emulate_pro_preempt()
+    │  walks registration_list
+    │  removes fenced node's registration
+    │  queues UNIT ATTENTION on fenced node's nacl
+    │  abort=true (PREEMPT_AND_ABORT) → aborts in-flight from fenced node
+    │  if fenced node was holder → surviving node becomes holder
+    │
     ▼
-Initiator receives SCSI Response PDU with status 0x18
-    │  iscsi_scsi_cmd_rsp(): sc->result = DID_OK | 0x18
-    │  sc->scsi_done(sc)
+return TCM_NO_SENSE → status GOOD
     ▼
-scsi_done() → scsi_complete() [passthrough path for PR commands]
-    │  blk_end_sync_rq() → wakes blk_execute_rq()
+target_complete_cmd(SAM_STAT_GOOD) → response sent
     ▼
-scsi_execute_cmd() returns -EIO (or the conflict status)
-    │  sd_pr_reserve() returns error
-    ▼
-ioctl(IOC_PR_RESERVE) returns -ENODEV to userspace
+Surviving node: PR succeeded. From this moment:
+    - fenced node's READ/WRITE → RESERVATION CONFLICT (status 0x18)
+    - fenced node sees BLK_STS_RESV_CONFLICT (modern kernels)
+    - blk_path_error() returns false → multipath does NOT fail path
+    - application gets -EIO immediately on each I/O
 ```
+
+The fenced node may still have a healthy TCP session — `iscsi_conn_failure()` doesn't fire,
+sessions don't drop. PR is "soft" fencing: connectivity remains, only reservation-protected
+I/O is blocked. If the cluster also wants hard isolation (e.g. node removed from network), a
+separate STONITH action is needed.
 
 ---
 
-## core_scsi3_locate_pr_reg — O(n) list search
+## APTPL — surviving target reboots
 
 ```c
-struct t10_pr_registration *core_scsi3_locate_pr_reg(
-    struct se_device *dev,
-    struct se_node_acl *nacl,
-    u64 mapped_lun)
+/* Simplified. */
+int core_scsi3_update_and_write_aptpl(struct se_device *dev, bool active)
 {
-    struct t10_pr_registration *pr_reg;
+    char *aptpl_buf;
+    int len;
 
     /*
-     * Linear search of dev->t10_pr_reg_list.
-     * Key: (nacl pointer, mapped_lun).
-     * In practice: small number of registrations per device.
-     * Protected by caller holding dev_reservation_lock.
+     * Format:
+     *   PR_REG_START
+     *   initiator_iqn
+     *   key
+     *   ... per registration
+     *   PR_REG_END
+     *   reservation_holder_iport
+     *   reservation_type
+     *   ... etc
+     *
+     * Write to /var/target/pr/aptpl_<dev_alias>.
+     * This is read at target startup by core_scsi3_load_pr_aptpl().
      */
-    list_for_each_entry(pr_reg, &dev->t10_pr_reg_list, pr_reg_list) {
-        if (pr_reg->pr_reg_nacl == nacl &&
-            pr_reg->pr_res_mapped_lun == mapped_lun)
-            return pr_reg;
-    }
-    return NULL;
+    aptpl_buf = kzalloc(PR_APTPL_MAX_IPORT_LEN * 2, GFP_KERNEL);
+    /* ... build buffer ... */
+
+    return core_scsi3_update_aptpl_buf(dev, aptpl_buf, len);
 }
 ```
 
-For the PR check on EVERY command, this is called under `dev_reservation_lock`. With a small
-number of registered initiators (typical: 2-8) this is fast. At scale (hundreds of initiators)
-it could be a bottleneck — one reason why alternative fencing mechanisms (session drop + ACL)
-are sometimes preferred.
+When `target_core_pr_aptpl_active=1` is set on the device via configfs, every PR change is
+persisted. After a reboot, `core_scsi3_load_pr_aptpl()` rebuilds `t10_reservation` from the file
+— the cluster's fencing state survives target restarts.
+
+---
+
+## Why PR commands are not subject to no_path_retry=queue
+
+A common confusion: "are PR commands themselves immune to the multipath hang?" The answer is
+**yes, but for the right reason**:
+
+- PR commands flow on the *initiator* via `dm_pr_ops` → `sd_pr_ops` → `scsi_execute_cmd()` →
+  `blk_execute_rq()` (day 13/14). They never go through `multipath_map_bio()`, so they cannot
+  enter `m->queued_bios`.
+- On the *target* side, PR commands DO go through `target_submission_wq` like every other
+  command. There is no special workqueue bypass.
+- The "immunity" is structural at the initiator: PR uses a different code path entirely. As long
+  as at least one TCP session is alive, the PR command reaches the target and gets a response.
+
+This is the property that makes PR-based fencing reliable when normal I/O is hung. The fenced
+node's normal I/O queues forever in `m->queued_bios`; the surviving node's PR commands fly
+through unrelated to that queue.
+
+---
+
+## Reservation type semantics — the SCSI type byte
+
+| Linux PR_* | Wire byte | Holder | Registered non-holder | Unregistered |
+|---|---|---|---|---|
+| WRITE_EXCLUSIVE | 0x01 | RW | R | R |
+| EXCLUSIVE_ACCESS | 0x03 | RW | — | — |
+| WRITE_EXCLUSIVE_REG_ONLY | 0x05 | RW | RW | R |
+| EXCLUSIVE_ACCESS_REG_ONLY | 0x06 | RW | RW | — |
+| WRITE_EXCLUSIVE_ALL_REGS | 0x07 | RW | RW | R |
+| EXCLUSIVE_ACCESS_ALL_REGS | 0x08 | RW | RW | — |
+
+For multipath fencing the typical type is `WRITE_EXCLUSIVE_ALL_REGS` (0x07): every registered
+node has full read/write, unregistered nodes can only read. PREEMPT removes a registration →
+that node becomes "unregistered" → can no longer write.
+
+Always-allowed commands (INQUIRY, REPORT LUNS, REQUEST SENSE, PR IN/OUT, RELEASE) bypass these
+rules so the fenced node can still discover the topology and observe state.
 
 ---
 
 ## Key takeaways
 
-- PR state is two-level: registrations (all initiators with a key) + reservation (one holder).
-- `t10_pr_reg_list` = all registrations. `dev_pr_res_holder` = current reservation holder.
-- `core_scsi3_emulate_pro()` dispatches by service action. All operations are synchronous
-  (spinlock + list ops) — no disk I/O for in-memory PR state.
-- `core_scsi3_pro_reserve()` sets `dev->dev_pr_res_holder`. Only one holder at a time (except
-  ALL_REGS types where all registered initiators are considered holders).
-- `core_scsi3_pr_seq_non_holder()` is called for EVERY command on a reserved device. Access rules
-  depend on reservation type — EXCLUSIVE_ACCESS (0x03) is the strictest.
-- `TCM_RESERVATION_CONFLICT` → `transport_generic_request_failure()` → `target_complete_cmd()`
-  → `target_completion_wq` → `queue_status()` → `iscsit_send_response()` with `cmd_status=0x18`.
-- PR is immune to `no_path_retry=queue` because the conflict is generated and returned before any
-  workqueue involvement — it is processed entirely in the PR check inside `target_submit_cmd()`.
+- `t10_reservation` lives in `se_device`. `registration_list` holds all per-I_T-nexus
+  registrations; `pr_res_holder` points to the current reservation holder.
+- PR OUT service actions: REGISTER, RESERVE, RELEASE, CLEAR, PREEMPT, PREEMPT_AND_ABORT,
+  REGISTER_AND_IGNORE, REGISTER_AND_MOVE.
+- Linux's `enum pr_type` (1–6) is NOT the same as the SCSI on-the-wire type byte (0x01–0x08).
+  `sd_pr_type()` (initiator) and the target dispatcher do the translation.
+- PREEMPT removes registrations matching the supplied key, queues UNIT ATTENTION on each, and
+  optionally aborts in-flight commands (PREEMPT_AND_ABORT).
+- `target_check_reservation()` is the gate. Always-allowed commands per SPC-4 (INQUIRY, REPORT
+  LUNS, REQUEST SENSE, PR IN/OUT, RELEASE) bypass the check.
+- TCM_RESERVATION_CONFLICT → status byte 0x18 → no sense attached by LIO. Modern initiators map
+  to `BLK_STS_RESV_CONFLICT` and `blk_path_error()` returns false (no path failure).
+- APTPL (`Activate Persist Through Power Loss`) persists PR state to
+  `/var/target/pr/aptpl_<dev>` for survival across target reboots.
+- PR commands are not subject to `no_path_retry=queue` because they take the initiator's
+  passthrough path, not the dm-multipath bio path. The surviving node's PR PREEMPT can fly
+  through even when normal I/O is hung.
 
 ---
 
