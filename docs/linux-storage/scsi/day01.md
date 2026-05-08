@@ -3,6 +3,7 @@
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `include/linux/blk_types.h`, `include/linux/blkdev.h`, `block/bio.c`
+**Targets**: Linux mainline, mid-2025 (around v6.10–v6.12). Code shown is illustrative; pin to a specific tag with elixir.bootlin.com when verifying.
 
 ---
 
@@ -48,8 +49,15 @@ struct bio {
 #define REQ_OP_WRITE        1   /* write to device */
 #define REQ_OP_FLUSH        2   /* flush write-back cache */
 #define REQ_OP_DISCARD      3   /* discard sectors */
-#define REQ_OP_DRV_IN      34   /* passthrough read (INQUIRY, TUR, PR IN) */
-#define REQ_OP_DRV_OUT     35   /* passthrough write (PR OUT, MODE SELECT) */
+/*
+ * REQ_OP_DRV_IN and REQ_OP_DRV_OUT are the two passthrough opcodes used
+ * for SCSI passthrough commands (PR, INQUIRY, TUR, MODE SELECT, etc.).
+ * Their numeric values are not stable across kernel versions — they sit
+ * near the end of the enum and shift as zoned/atomic-write opcodes are
+ * added. Always reference them by name, never by number.
+ */
+#define REQ_OP_DRV_IN       /* passthrough read  (e.g. INQUIRY, TUR, PR IN)  */
+#define REQ_OP_DRV_OUT      /* passthrough write (e.g. PR OUT, MODE SELECT) */
 
 /* upper bits = modifier flags */
 #define REQ_SYNC        (1ULL << __REQ_SYNC)     /* hint: no readahead */
@@ -65,9 +73,9 @@ struct bio {
 `REQ_OP_DRV_IN` / `REQ_OP_DRV_OUT` are the flags that mark a request as "passthrough" — used by
 `blk_rq_is_passthrough()` throughout the stack. When these are set, the request:
 - skips the I/O scheduler
-- is injected at the HEAD of the dispatch queue via `blk_execute_rq(at_head=true)`
-- bypasses dm-multipath's normal bio interception
-- is never subject to `no_path_retry=queue`
+- is dispatched via `pr_ops` (for PR commands) or `blk_execute_rq()` (for other passthrough), bypassing `submit_bio()`
+- never enters `multipath_map_bio()` (the dm-mpath bio interception point)
+- is therefore not subject to `no_path_retry=queue` queueing
 
 This is the root reason why PR commands behave fundamentally differently from READ/WRITE.
 
@@ -147,8 +155,15 @@ struct request {
     blk_opf_t               cmd_flags;  /* REQ_OP_* + REQ_* flags (same as bio) */
     req_flags_t             rq_flags;   /* internal RQF_* flags */
 
-    int                     tag;        /* hardware tag (driver-visible) */
-    int                     internal_tag; /* blk-mq internal tag */
+    /*
+     * blk-mq uses two tags when an I/O scheduler is active:
+     *   internal_tag — scheduler tag, allocated at request alloc time
+     *   tag          — driver tag, allocated at dispatch time
+     * When no scheduler is active, only the driver tag is used.
+     * The driver sees and uses `tag` as the in-flight identifier.
+     */
+    int                     tag;        /* driver-visible tag */
+    int                     internal_tag; /* scheduler tag (when scheduler active) */
 
     unsigned int            timeout;    /* command timeout in jiffies */
 
@@ -161,9 +176,13 @@ struct request {
     struct bio              *bio;       /* first bio */
     struct bio              *biotail;   /* last bio */
 
-    /* for SCSI passthrough — CDB and result */
-    unsigned char           *cmd;       /* points to scsi_cmnd->cmnd[] */
-    int                     result;     /* SCSI result (host|msg|status bytes) */
+    /*
+     * Note: in modern kernels (since v5.18, commit be6bfe36db17 removed
+     * the scsi_request wrapper), the SCSI CDB and result are NOT on
+     * struct request itself. They live on struct scsi_cmnd, which is
+     * embedded in the per-driver pdu area accessed via blk_mq_rq_to_pdu(rq).
+     * The request struct itself only carries generic block-layer state.
+     */
 
     /* completion */
     rq_end_io_fn            *end_io;    /* completion callback */
@@ -178,12 +197,22 @@ struct request {
 #define RQF_QUEUED         ((__force req_flags_t)(1 << 2))  /* on dispatch queue */
 #define RQF_FAILED         ((__force req_flags_t)(1 << 10)) /* completed with error */
 #define RQF_QUIET          ((__force req_flags_t)(1 << 11)) /* suppress error messages */
-#define RQF_PREEMPT        ((__force req_flags_t)(1 << 12)) /* head-of-queue insertion */
 #define RQF_DONTPREP       ((__force req_flags_t)(1 << 7))  /* skip prep_rq_fn */
+/*
+ * RQF_PM (formerly RQF_PREEMPT in older kernels): allows this request
+ * to run while the queue is in PM-quiesced state. Used by runtime PM,
+ * NOT for head-of-queue insertion.
+ *
+ * Head-of-queue insertion is controlled separately via the
+ * BLK_MQ_INSERT_AT_HEAD flag passed to blk_mq_insert_request() —
+ * which is what blk_execute_rq(at_head=true) sets.
+ */
+#define RQF_PM             ((__force req_flags_t)(1 << 12))
 ```
 
-`RQF_PREEMPT` is set when `blk_execute_rq(at_head=true)` is called. This causes the request to be
-inserted at the front of `hctx->dispatch`, ahead of all pending I/O.
+`BLK_MQ_INSERT_AT_HEAD` (passed to `blk_mq_insert_request()`) is the flag that causes the request
+to be inserted at the front of `hctx->dispatch`, ahead of all pending I/O.
+`blk_execute_rq(at_head=true)` is the common caller that supplies this flag.
 
 ---
 
@@ -273,7 +302,11 @@ passes the pointer down. The DMA engine and the iSCSI TX path both read the same
   layers.
 - `REQ_OP_DRV_IN` / `REQ_OP_DRV_OUT` mark passthrough requests (PR, INQUIRY, TUR). Every layer
   checks `blk_rq_is_passthrough()` to give these requests special treatment.
-- `RQF_PREEMPT` on a request means head-of-queue insertion — used by the slow path (day 3).
+- `BLK_MQ_INSERT_AT_HEAD` (set by `blk_execute_rq(at_head=true)`) is what causes head-of-queue
+  insertion — this is the slow path's mechanism (day 3).
+- The SCSI CDB and result live on `struct scsi_cmnd` (accessed via `blk_mq_rq_to_pdu(rq)`),
+  not on `struct request` itself. The `scsi_request` wrapper that previously bridged them was
+  removed in v5.18.
 - Data is NEVER copied between layers. All layers share the same physical pages via `bio_vec`.
 
 ---

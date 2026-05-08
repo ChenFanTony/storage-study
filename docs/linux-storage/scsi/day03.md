@@ -3,6 +3,7 @@
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `block/blk-exec.c`, `block/blk-mq.c`, `include/linux/blkdev.h`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative; verify against elixir.bootlin.com for the kernel version you target.
 
 ---
 
@@ -45,7 +46,7 @@ This check appears at multiple key points:
 |---|---|
 | `blk_mq_submit_bio()` | skips I/O scheduler, goes direct |
 | `blk_execute_rq()` | asserts this must be passthrough |
-| `scsi_io_completion()` | skips retry logic, completes directly |
+| `scsi_done()` | short-circuits disposition, completes directly |
 | `blk_mq_sched_dispatch_requests()` | injects at head via `hctx->dispatch` |
 
 A PR command has `REQ_OP_DRV_OUT` set. A READ has `REQ_OP_READ`. This one flag determines the
@@ -73,15 +74,19 @@ blk_status_t blk_execute_rq(struct request *rq, bool at_head)
 
     /*
      * Inject the request into the queue. at_head=true puts it at the
-     * front of hctx->dispatch, ahead of all pending I/O.
+     * front of hctx->dispatch via the BLK_MQ_INSERT_AT_HEAD flag.
      * Then kick the queue — the request is dispatched before we sleep.
      */
     blk_execute_rq_nowait(rq, at_head);
 
     /*
      * Sleep until blk_end_sync_rq() calls complete().
-     * TASK_UNINTERRUPTIBLE | TASK_IO — counts as I/O wait in iostat.
-     * The stack frame stays alive with 'data' and 'wait' on it.
+     *
+     * wait_for_completion_io() uses TASK_UNINTERRUPTIBLE and sets
+     * current->in_iowait = 1 around the io_schedule_timeout() call.
+     * That `in_iowait` flag is what bumps the I/O wait counters seen
+     * in `iostat`, `top`, and /proc/stat — there is no special
+     * task-state bit; it is purely an accounting field.
      */
     wait_for_completion_io(&wait);
 
@@ -124,11 +129,10 @@ void blk_execute_rq_nowait(struct request *rq, bool at_head)
         blk_mq_insert_request(rq, 0);
 
     /*
-     * Kick dispatch immediately (async=false = run inline).
-     * By the time wait_for_completion_io() is called below in the caller,
-     * the request is already on the wire.
+     * Kick dispatch on this hctx (async=false = run inline).
+     * Note: this kicks ONE hctx (rq->mq_hctx), not all hctxs on the queue.
      */
-    blk_mq_run_hw_queues(rq->q, false);
+    blk_mq_run_hw_queue(rq->mq_hctx, false);
 }
 ```
 
@@ -170,7 +174,7 @@ blk_execute_rq(rq, at_head=true)
     ├── blk_execute_rq_nowait(rq, true)
     │       ├── blk_mq_insert_request(rq, AT_HEAD)
     │       │     └── list_add(&rq->queuelist, &hctx->dispatch)  ← HEAD
-    │       └── blk_mq_run_hw_queues(q, async=false)
+    │       └── blk_mq_run_hw_queue(rq->mq_hctx, async=false)
     │             └── __blk_mq_run_hw_queue(hctx)
     │                   └── blk_mq_sched_dispatch_requests(hctx)
     │                         ├── drain hctx->dispatch → finds our rq first
@@ -189,25 +193,31 @@ blk_execute_rq(rq, at_head=true)
 return data.ret  (blk_status_t)
 ```
 
-The key insight: `blk_mq_run_hw_queues()` is called BEFORE `wait_for_completion_io()`. By the time
-the thread goes to sleep, the PR PDU is already transmitted. The thread wakes only when the target
-sends back a response.
+Important: `blk_mq_run_hw_queue()` is called BEFORE `wait_for_completion_io()`. The guarantee
+this provides is that *dispatch is initiated* before the caller sleeps; with `async=false` the
+dispatch usually runs inline, but with a deferred path the request might briefly remain on
+`hctx->dispatch` while the caller is already in `wait_for_completion_io`. The completion-side
+guarantee is: the wait will not return until `blk_end_sync_rq()` runs, which happens only after
+the driver delivers a response.
 
 ---
 
 ## Why no_path_retry=queue cannot affect slow path requests
 
-`no_path_retry=queue` is implemented in `multipath_map_bio()` (day 7) — it intercepts `bio`s
-submitted to the dm device and holds them in `m->queued_ios` when no path is available.
+The dm-multipath bio-queueing path (`m->queued_bios`, set when `queue_if_no_path=1` and
+`nr_valid_paths=0`) is reached via `multipath_map_bio()` — which is on the `submit_bio()` →
+`__split_and_process_bio()` path. PR commands never reach this path because:
 
-PR commands never go through `multipath_map_bio()`. They reach the underlying `/dev/sdX` directly
-via `sd_pr_ops->reserve()` → `sd_pr_reserve()` → `scsi_execute_cmd()`. The dm device is bypassed
-entirely.
+- PR commands are dispatched through `pr_ops`, not `submit_bio()`.
+- For a plain `/dev/sdX` open: `sd_pr_ops.pr_reserve` → `sd_pr_reserve()` →
+  `scsi_execute_cmd()` → `blk_execute_rq()`. The dm device is never touched.
+- For a `/dev/mapper/mpathN` open: `dm_pr_ops.pr_reserve` → `dm_pr_reserve()` iterates the paths
+  via `iterate_devices()`, calling `blk_pr_reserve()` on each `/dev/sdX`. dm uses its
+  `pr_ops` infrastructure (entirely separate from the bio-mapping path) to route PR per-path —
+  see `drivers/md/dm.c` and day 14.
 
-Even if a passthrough request somehow reached the dm device, `blk_rq_is_passthrough()` would
-cause it to skip the I/O scheduler and `multipath_map_bio()` would not be called for it — dm uses
-`dm_make_request()` which calls `__split_and_process_bio()` which calls the target's `map_bio()`,
-but passthrough requests use `dm_dispatch_clone_request()` directly.
+Either way, `multipath_map_bio()` is never invoked for a PR command, so `m->queued_bios` cannot
+hold one.
 
 ---
 
@@ -247,17 +257,20 @@ callback. In the slow path, the calling thread's stack is alive holding `struct 
 
 ## Key takeaways
 
-- `blk_execute_rq()` injects at HEAD of `hctx->dispatch` via `at_head=true`, then sleeps via
-  `wait_for_completion_io()`.
+- `blk_execute_rq()` injects at HEAD of `hctx->dispatch` via the `BLK_MQ_INSERT_AT_HEAD` flag,
+  then sleeps via `wait_for_completion_io()`.
 - `blk_end_sync_rq()` is the completion callback — it stores the result and calls `complete()` to
   wake the sleeping thread.
 - `blk_rq_is_passthrough()` is the discriminator checked at every layer. `REQ_OP_DRV_IN/OUT`
   marks a request as passthrough.
-- `blk_mq_run_hw_queues()` fires BEFORE `wait_for_completion_io()` — the PDU is on the wire
-  before the thread sleeps.
+- `blk_mq_run_hw_queue()` (singular hctx) fires BEFORE `wait_for_completion_io()` — initiating
+  dispatch before the caller sleeps.
+- `wait_for_completion_io()` uses `TASK_UNINTERRUPTIBLE` and bumps `current->in_iowait` for I/O
+  wait accounting; it does not use a special `TASK_IO` flag.
 - The slow path bypasses: I/O scheduler, dm-multipath bio interception, all retry logic.
-- `no_path_retry=queue` cannot affect PR commands — they never reach `multipath_map_bio()`.
-- `wait_for_completion_io()` sets `TASK_UNINTERRUPTIBLE | TASK_IO` — counted as I/O wait in `top`.
+- `no_path_retry=queue` cannot affect PR commands — they reach the underlying `/dev/sdX` either
+  directly (open of `/dev/sdX`) or via `dm_pr_ops` (open of `/dev/mapper/mpathN`); the
+  bio-queue path in `multipath_map_bio()` is never traversed.
 
 ---
 

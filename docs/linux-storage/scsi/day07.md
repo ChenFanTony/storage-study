@@ -3,6 +3,7 @@
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `drivers/md/dm-mpath.c`, `drivers/md/dm-path-selector.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
@@ -11,7 +12,7 @@
 dm-multipath presents multiple physical paths (each a separate `scsi_device` / iSCSI session)
 as a single logical block device. When a path fails it retries on another. `no_path_retry=queue`
 is the mode that causes indefinite I/O hangs when all paths fail simultaneously. Understanding
-the exact code that implements this is the foundation of the fencing problem we started with.
+the exact code that implements this is the foundation of the fencing problem.
 
 ---
 
@@ -47,9 +48,10 @@ struct multipath {
     /*
      * When queue_if_no_path=1 and nr_valid_paths=0,
      * bios are held in this list indefinitely.
+     * (Field renamed from queued_ios to queued_bios in modern code.)
      */
-    struct bio_list         queued_ios;
-    struct work_struct      process_queued_ios;
+    struct bio_list         queued_bios;
+    struct work_struct      process_queued_bios;
 };
 
 struct priority_group {
@@ -87,11 +89,11 @@ The entry point for every bio submitted to the dm-multipath device. This is the 
 implements `no_path_retry=queue`.
 
 ```c
+/* Simplified — see drivers/md/dm-mpath.c for the full implementation. */
 static int multipath_map_bio(struct dm_target *ti, struct bio *bio)
 {
     struct multipath *m = ti->private;
     struct pgpath *pgpath;
-    struct dm_mpath_io *mpio = NULL;
     unsigned long flags;
 
     spin_lock_irqsave(&m->lock, flags);
@@ -107,15 +109,15 @@ static int multipath_map_bio(struct dm_target *ti, struct bio *bio)
             /*
              * *** THIS IS THE EXACT LINE THAT IMPLEMENTS no_path_retry=queue ***
              *
-             * Add the bio to m->queued_ios — it will stay here until:
+             * Add the bio to m->queued_bios — it will stay here until:
              *   a) a path recovers (pg_init_done / reinstate_path), OR
              *   b) queue_if_no_path is set to 0 (admin changes no_path_retry)
              *
              * Return DM_MAPIO_SUBMITTED — tells dm-core the bio was handled.
-             * The bio will NOT complete until drained from queued_ios.
+             * The bio will NOT complete until drained from queued_bios.
              * The application's write() or read() call hangs here.
              */
-            bio_list_add(&m->queued_ios, bio);
+            bio_list_add(&m->queued_bios, bio);
             spin_unlock_irqrestore(&m->lock, flags);
             return DM_MAPIO_SUBMITTED;
         }
@@ -129,14 +131,8 @@ static int multipath_map_bio(struct dm_target *ti, struct bio *bio)
         return DM_MAPIO_KILL;
     }
 
-    /*
-     * Path found — remap the bio to the underlying block device.
-     */
-
     /* attach mpio (dm_mpath_io) to the bio for tracking */
-    mpio = get_mpio_and_lock_bio(bio);
-    mpio->pgpath = pgpath;
-    mpio->nr_bytes = bio->bi_iter.bi_size;
+    /* ... */
 
     /*
      * Redirect bio to the path's block device (e.g. /dev/sdb).
@@ -212,34 +208,38 @@ static struct pgpath *choose_pgpath(struct multipath *m, size_t nr_bytes)
 ## multipath_end_io — completion handler
 
 ```c
-static int multipath_end_io(struct dm_target *ti, struct request *clone,
-                             blk_status_t error)
+static int multipath_end_io_bio(struct dm_target *ti, struct bio *clone,
+                                blk_status_t *error)
 {
     struct multipath *m = ti->private;
-    struct dm_mpath_io *mpio = get_mpio(clone->end_io_data);
+    struct dm_mpath_io *mpio = get_mpio(...);
     struct pgpath *pgpath = mpio->pgpath;
     int r = DM_ENDIO_DONE;
 
-    if (error) {
+    if (*error) {
         /*
          * blk_path_error() returns true for errors that indicate
-         * the PATH is broken (BLK_STS_TRANSPORT, BLK_STS_IOERR from
-         * DID_NO_CONNECT, etc.), not the data itself.
+         * the PATH is broken (BLK_STS_TRANSPORT, BLK_STS_NEXUS, etc.).
+         * It returns false for:
+         *   BLK_STS_NOTSUPP, BLK_STS_NOSPC, BLK_STS_TARGET,
+         *   BLK_STS_RESV_CONFLICT
          *
-         * NOT READY / RESERVATION CONFLICT → blk_path_error() = false
-         *   → treated as a successful path (even though I/O failed)
+         * RESERVATION CONFLICT → BLK_STS_RESV_CONFLICT
+         *   → blk_path_error() = false
+         *   → path NOT marked failed (correct behavior)
          *
-         * Transport failure / DID_NO_CONNECT → blk_path_error() = true
+         * Transport failure / DID_NO_CONNECT → BLK_STS_TRANSPORT or IOERR
+         *   → blk_path_error() = true
          *   → path is marked failed
          */
-        if (pgpath && blk_path_error(error))
+        if (pgpath && blk_path_error(*error))
             fail_path(pgpath);
 
         if (!atomic_read(&m->nr_valid_paths)) {
             if (m->queue_if_no_path) {
                 /*
-                 * Requeue this request to be retried when path recovers.
-                 * The bio goes back to multipath_map_bio() next time.
+                 * Requeue this bio to be retried when path recovers.
+                 * The bio goes back through multipath_map_bio() next time.
                  */
                 r = DM_ENDIO_REQUEUE;
                 goto done;
@@ -248,20 +248,19 @@ static int multipath_end_io(struct dm_target *ti, struct request *clone,
     }
 
 done:
-    if (pgpath)
-        path_release_by_pgpath(pgpath);
-
     return r;
 }
 ```
 
 ```c
+/* include/linux/blk_types.h — current upstream */
 static inline bool blk_path_error(blk_status_t error)
 {
     switch (error) {
     case BLK_STS_NOTSUPP:
     case BLK_STS_NOSPC:
     case BLK_STS_TARGET:
+    case BLK_STS_RESV_CONFLICT:    /* added in v6.0 timeframe */
         /* these indicate target/data errors, not path errors */
         return false;
     }
@@ -269,11 +268,13 @@ static inline bool blk_path_error(blk_status_t error)
 }
 ```
 
-`NOT READY` maps to `BLK_STS_IOERR` via `DID_NO_CONNECT` → `blk_path_error()` returns true →
-`fail_path()` is called. But `RESERVATION CONFLICT` maps to `BLK_STS_IOERR` too → `fail_path()`
-would be called. This is why PR conflicts can confuse multipath if they appear on normal I/O paths.
+A meaningful change from older kernels: `BLK_STS_RESV_CONFLICT` is in the false-list. So a stray
+RESERVATION CONFLICT on normal I/O does NOT cause `fail_path()` and does not propagate as a path
+failure. NOT_READY (which gets retried via EH and may eventually result in `DID_NO_CONNECT` →
+`BLK_STS_IOERR`) still does — but that's after EH exhaustion, not directly from the sense.
 
-For PR commands themselves this doesn't apply — they go through `dm_pr_ops`, not `multipath_map_bio`.
+For PR commands themselves none of this applies — they go through `dm_pr_ops`, not
+`multipath_map_bio` (day 13/14).
 
 ---
 
@@ -300,7 +301,7 @@ static void fail_path(struct pgpath *pgpath)
     /*
      * *** Decrement the valid path counter ***
      * When this reaches 0, choose_pgpath() returns NULL.
-     * From this point on, new bios go into queued_ios (if queue_if_no_path=1).
+     * From this point on, new bios go into queued_bios (if queue_if_no_path=1).
      */
     atomic_dec(&m->nr_valid_paths);
 
@@ -321,13 +322,14 @@ static void fail_path(struct pgpath *pgpath)
 
 ---
 
-## reinstate_path and pg_init_done — recovery
+## reinstate_path — recovery
 
 ```c
 static int reinstate_path(struct pgpath *pgpath)
 {
-    int r = 0;
+    int r = 0, run_queue = 0;
     struct multipath *m = pgpath->pg->m;
+    unsigned int nr_valid_paths;
     unsigned long flags;
 
     spin_lock_irqsave(&m->lock, flags);
@@ -338,31 +340,35 @@ static int reinstate_path(struct pgpath *pgpath)
     }
 
     pgpath->is_active = 1;
-    atomic_inc(&m->nr_valid_paths); /* path is back */
+    nr_valid_paths = atomic_inc_return(&m->nr_valid_paths); /* path is back */
 
     if (!m->current_pgpath)
         m->current_pgpath = pgpath;
 
+    /*
+     * If bios were queued while no path was available,
+     * set run_queue=1 to drain them after releasing the lock.
+     */
+    if (!bio_list_empty(&m->queued_bios))
+        run_queue = 1;
+
     dm_path_uevent(DM_UEVENT_PATH_REINSTATED, m->ti,
-                   pgpath->path.dev->name,
-                   atomic_read(&m->nr_valid_paths));
+                   pgpath->path.dev->name, nr_valid_paths);
 
     schedule_work(&m->trigger_event);
 
     spin_unlock_irqrestore(&m->lock, flags);
 
-    /*
-     * Drain bios that were queued while no path was available.
-     * Each bio gets resubmitted through multipath_map_bio(),
-     * which now finds a valid path via choose_pgpath().
-     */
-    queue_work(kmultipathd, &m->process_queued_ios);
+    if (run_queue) {
+        dm_table_run_md_queue_async(m->ti->table);
+        process_queued_io_list(m);   /* drain queued_bios via the work item */
+    }
 
     return r;
 }
 ```
 
-`process_queued_ios` work item:
+`process_queued_bios` work item:
 
 ```c
 static void process_queued_bios(struct work_struct *work)
@@ -372,7 +378,7 @@ static void process_queued_bios(struct work_struct *work)
     struct bio *bio;
     struct bio_list bios;
     struct multipath *m =
-        container_of(work, struct multipath, process_queued_ios);
+        container_of(work, struct multipath, process_queued_bios);
 
     bio_list_init(&bios);
 
@@ -385,9 +391,9 @@ static void process_queued_bios(struct work_struct *work)
         return;
     }
 
-    /* drain queued_ios into local list */
-    bio_list_merge(&bios, &m->queued_ios);
-    bio_list_init(&m->queued_ios);
+    /* drain queued_bios into local list */
+    bio_list_merge(&bios, &m->queued_bios);
+    bio_list_init(&m->queued_bios);
 
     spin_unlock_irqrestore(&m->lock, flags);
 
@@ -424,7 +430,7 @@ target LUN offlined (admin: echo offline > /sys/kernel/config/target/iscsi/.../e
     │
     ▼  scsi_decide_disposition() → NEEDS_RETRY  (or FAILED → EH → DID_NO_CONNECT)
     │
-    ▼  scsi_result_to_blk_status() → BLK_STS_IOERR
+    ▼  EH eventually exhausts, commands complete with BLK_STS_IOERR
     │
     ▼  multipath_end_io(): blk_path_error(BLK_STS_IOERR) = true
     │                      fail_path(pgpath) for each path
@@ -435,10 +441,10 @@ target LUN offlined (admin: echo offline > /sys/kernel/config/target/iscsi/.../e
     ▼  New bios: multipath_map_bio()
     │               choose_pgpath() → NULL
     │               m->queue_if_no_path = 1
-    │               bio_list_add(&m->queued_ios, bio)  ← HELD HERE
+    │               bio_list_add(&m->queued_bios, bio)  ← HELD HERE
     │               return DM_MAPIO_SUBMITTED
     │
-    ▼  process_queued_ios never runs (no path recovery triggered)
+    ▼  process_queued_bios never runs (no path recovery triggered)
     │
     ▼  Application: write() / read() call never returns
        Any new I/O also queues
@@ -449,16 +455,18 @@ target LUN offlined (admin: echo offline > /sys/kernel/config/target/iscsi/.../e
 
 ## Key takeaways
 
-- `multipath_map_bio()` is the interception point. `bio_list_add(&m->queued_ios, bio)` when
+- `multipath_map_bio()` is the interception point. `bio_list_add(&m->queued_bios, bio)` when
   `queue_if_no_path=1` and `nr_valid_paths=0` is the exact cause of indefinite hangs.
 - `fail_path()` decrements `nr_valid_paths`. When it hits 0, all new bios queue.
 - `reinstate_path()` increments `nr_valid_paths` and triggers `process_queued_bios` to drain
   the queue. This never fires if no path recovers.
-- `blk_path_error()` returns true for transport errors, false for data/target errors. Most errors
-  map to `BLK_STS_IOERR` → `blk_path_error()=true` → `fail_path()` called.
-- Session drop + login rejection → TCP failure → `BLK_STS_TRANSPORT` → `fail_path()` → but also
-  prevents reconnect → after `no_path_retry=N` counts exhaust, bios get `-EIO`. This is cleaner
-  than LUN offline which causes all paths to fail but no recovery signal to fire.
+- `blk_path_error()` returns true for transport errors (`BLK_STS_TRANSPORT`, `BLK_STS_IOERR`,
+  etc.) and false for `BLK_STS_NOTSUPP`, `BLK_STS_NOSPC`, `BLK_STS_TARGET`, and
+  `BLK_STS_RESV_CONFLICT`. Reservation conflict on normal I/O therefore does NOT fail the path.
+- `no_path_retry=N` configures the path-checker retry count. After N retries without a path
+  reinstating, `queue_if_no_path` is cleared and queued bios are flushed with -EIO.
+- Session drop + login rejection → `DID_TRANSPORT_FAILFAST` → `BLK_STS_TRANSPORT` →
+  `fail_path()` is the cleanest path failure signal.
 - `schedule_work(&m->trigger_event)` notifies `multipathd` via udev. `multipathd` runs path
   checkers and may call `reinstate_path()` if a path recovers.
 

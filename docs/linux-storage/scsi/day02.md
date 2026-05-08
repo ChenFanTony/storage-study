@@ -3,6 +3,7 @@
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `block/blk-mq.c`, `block/blk-mq.h`, `block/blk-mq-tag.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted; verify against elixir.bootlin.com for the kernel version you target.
 
 ---
 
@@ -15,8 +16,10 @@ with fast devices (10GbE iSCSI, NVMe), that lock became the bottleneck. blk-mq r
 - **Multiple hardware queues** (`blk_mq_hw_ctx`) — one per NVMe queue or one per iSCSI session
 - **Tag-based flow control** — in-flight count bounded per hardware queue
 
-For iSCSI, there is typically one hardware queue. For NVMe, one per CPU core. blk-mq handles both
-uniformly through the same dispatch machinery.
+Most iSCSI deployments use a single hardware queue per session, but multi-queue iSCSI is
+supported (Mike Christie's series; both `iscsi_tcp` and `iser` honor `nr_hw_queues > 1`). NVMe
+typically uses one hardware queue per CPU core. blk-mq handles both uniformly through the same
+dispatch machinery.
 
 ---
 
@@ -42,7 +45,8 @@ struct blk_mq_ctx {
 Requests submitted on CPU N go into CPU N's `blk_mq_ctx`. The `____cacheline_aligned_in_smp`
 attribute ensures the lock and list are on their own cache line — no false sharing between CPUs.
 
-`HCTX_MAX_TYPES` = 3 (DEFAULT, READ, POLL). For iSCSI only DEFAULT is used.
+`HCTX_MAX_TYPES` = 3 (`HCTX_TYPE_DEFAULT`, `HCTX_TYPE_READ`, `HCTX_TYPE_POLL`). For typical iSCSI
+deployments only `HCTX_TYPE_DEFAULT` is used.
 
 ---
 
@@ -88,25 +92,25 @@ struct blk_mq_hw_ctx {
 
 `hctx->dispatch` is the key list. Requests that the driver could not accept (returned
 `BLK_STS_RESOURCE`) land here. The next dispatch attempt drains this list FIRST before touching
-the I/O scheduler. This is where `no_path_retry=queue` bios accumulate in the multipath context.
+the I/O scheduler. This is where head-injected passthrough requests (via `blk_execute_rq`) are
+queued.
 
-`BLK_MQ_S_STOPPED` is set by dm-multipath when all paths are gone — halting dispatch entirely.
-When a path recovers, `blk_mq_start_stopped_hw_queues()` clears this bit and kicks dispatch.
+`BLK_MQ_S_STOPPED` can be set by drivers (or by dm at the dm layer) to halt dispatch entirely.
+Note that dm-multipath manages queueing at the dm device's level (via `m->queued_bios`); it does
+NOT directly stop the underlying SCSI device's hctx — those continue to dispatch normally.
 
 ---
 
-## blk_mq_submit_bio — `block/blk-mq.c`
+## blk_mq_submit_bio — `block/blk-mq.c` (simplified)
 
 Entry point when `submit_bio()` is called. Converts bio → request and kicks dispatch.
 
 ```c
+/* Simplified — actual implementation uses __blk_mq_alloc_requests() and
+ * is structured differently. See block/blk-mq.c for the real code. */
 void blk_mq_submit_bio(struct bio *bio)
 {
     struct request_queue *q = bdev_get_queue(bio->bi_bdev);
-    struct blk_mq_alloc_data data = {
-        .q      = q,
-        .cmd_flags = bio->bi_opf,
-    };
     struct request *rq;
     struct blk_plug *plug;
 
@@ -122,7 +126,7 @@ void blk_mq_submit_bio(struct bio *bio)
      * software queue. Merging reduces the number of requests sent.
      */
     if (plug && !blk_queue_nomerges(q)) {
-        if (blk_attempt_plug_merge(q, bio, &data))
+        if (blk_attempt_plug_merge(q, bio, nr_segs))
             return;  /* merged — no new request needed */
     }
 
@@ -130,7 +134,7 @@ void blk_mq_submit_bio(struct bio *bio)
      * Allocate a new request from the tag pool.
      * This may block if no tags are available (driver is saturated).
      */
-    rq = blk_mq_get_request(q, bio, &data);
+    rq = __blk_mq_alloc_requests(...);
     if (unlikely(!rq)) {
         bio->bi_status = BLK_STS_RESOURCE;
         bio_endio(bio);
@@ -142,21 +146,17 @@ void blk_mq_submit_bio(struct bio *bio)
 
     if (plug) {
         blk_add_rq_to_plug(plug, rq);  /* batch for later */
-    } else if (q->elevator) {
-        /* hand to I/O scheduler for ordering/merging */
-        q->elevator->type->ops.insert_requests(hctx, &list, false);
-        blk_mq_run_hw_queue(data.hctx, true);
     } else {
-        /* no scheduler — dispatch directly */
-        blk_mq_run_hw_queue(data.hctx, true);
+        /* hand to scheduler (if any) and run the queue */
+        blk_mq_run_hw_queue(rq->mq_hctx, true);
     }
 }
 ```
 
-The plug mechanism is important for sequential write performance. A filesystem can submit 256 bios
-for a 1 MB write without dispatching any until `blk_finish_plug()` — the bios can merge into fewer
-requests. For iSCSI this matters less since commands are typically from applications, not the
-filesystem page-writeback path.
+Plugging is important for sequential write performance regardless of the underlying transport.
+Filesystems can submit hundreds of bios for a large write inside a plug, which then merge into a
+much smaller number of requests when the plug is flushed. This applies to iSCSI just as much as
+to NVMe — any time iSCSI backs a filesystem on the initiator, writeback I/O traverses the plug.
 
 ---
 
@@ -165,12 +165,13 @@ filesystem page-writeback path.
 The core dispatch function. Pulls requests from the list and calls the driver's `queue_rq`.
 
 ```c
+/* Simplified — see block/blk-mq.c for the full implementation. */
 bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx,
                                struct list_head *list,
                                unsigned int nr_budgets)
 {
     struct request_queue *q = hctx->queue;
-    struct request *rq, *nxt;
+    struct request *rq;
     int errors = 0, queued = 0;
     blk_status_t ret = BLK_STS_OK;
 
@@ -206,7 +207,6 @@ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx,
              * Put request back — it will be retried on next dispatch.
              */
             blk_mq_requeue_request(rq, false);
-            blk_mq_set_next_hctx_distance(hctx);
             goto out;
 
         default:
@@ -223,10 +223,9 @@ out:
         list_splice_init(list, &hctx->dispatch);
         spin_unlock(&hctx->lock);
         /*
-         * If driver is busy, set BLK_MQ_S_SCHED_RESTART so the
-         * scheduler knows to kick dispatch when resources free up.
+         * If driver is busy, the scheduler will be re-kicked when
+         * resources free up (e.g. via blk_mq_delay_run_hw_queue).
          */
-        blk_mq_set_next_hctx_distance(hctx);
     }
 
     return queued + errors != 0;
@@ -251,7 +250,7 @@ void blk_mq_run_hw_queues(struct request_queue *q, bool async)
 
     queue_for_each_hw_ctx(q, hctx, i) {
         if (blk_mq_hctx_stopped(hctx))
-            continue;   /* BLK_MQ_S_STOPPED — skip, path is down */
+            continue;   /* BLK_MQ_S_STOPPED — skip */
 
         blk_mq_run_hw_queue(hctx, async);
     }
@@ -314,34 +313,29 @@ Tags are integers [0, queue_depth) that uniquely identify in-flight requests. Th
 to match completions: iSCSI uses the tag as part of ITT, NVMe uses it as command ID.
 
 ```c
+/* Simplified — real function is more involved. See block/blk-mq-tag.c. */
 unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
 {
-    struct blk_mq_tags *tags;
-    unsigned int tag_offset;
+    struct blk_mq_tags *tags = blk_mq_tags_from_data(data);
     int tag;
-
-    tags = blk_mq_tags_from_data(data);
 
     /*
      * Try to atomically allocate a tag from the bitmap.
-     * sbitmap_get() finds and sets a free bit in O(1) amortized.
+     * __sbitmap_queue_get() finds and sets a free bit in O(1) amortized.
+     * If unavailable and blocking is allowed, the call sleeps on
+     * bt_wait_ptr() until a tag is freed.
      */
-    tag = __blk_mq_get_tag(data, tags->bitmap_tags);
-    if (tag != BLK_MQ_NO_TAG)
-        goto found_tag;
+    tag = __sbitmap_queue_get(&tags->bitmap_tags);
+    if (tag < 0 && (data->flags & BLK_MQ_REQ_RESERVED))
+        tag = __sbitmap_queue_get(&tags->breserved_tags);
 
-    /* fall back to reserved tags for internal management requests */
-    if (data->flags & BLK_MQ_REQ_RESERVED)
-        tag = __blk_mq_get_tag(data, tags->breserved_tags);
-
-found_tag:
-    return tag;
+    return tag >= 0 ? tag : BLK_MQ_NO_TAG;
 }
 ```
 
 When `blk_mq_get_tag()` returns `BLK_MQ_NO_TAG`, the driver's in-flight limit is reached. The
 request cannot be dispatched. For iSCSI, tag depth = `cmds_max` configured during session setup
-(typically 128 or 256).
+(open-iscsi default: 128).
 
 Tag release on completion:
 ```c
@@ -371,7 +365,8 @@ After `sbitmap_queue_clear()`, any threads waiting for a tag are woken and dispa
   back to `hctx->dispatch`.
 - `blk_mq_sched_dispatch_requests()` always drains `hctx->dispatch` FIRST, then the scheduler.
   This is why head-injected passthrough requests go immediately.
-- `BLK_MQ_S_STOPPED` on an hctx pauses all dispatch — set by dm-multipath when no paths exist.
+- `BLK_MQ_S_STOPPED` on an hctx pauses all dispatch on that hctx. dm-multipath manages
+  bio queueing at the dm layer (`m->queued_bios`), not by stopping the underlying device's hctx.
 - Tags bound in-flight depth. No tag = no dispatch until a completion returns one.
 - `kblockd` is the fallback kthread for async dispatch when inline dispatch is unsafe.
 

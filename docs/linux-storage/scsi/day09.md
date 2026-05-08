@@ -1,8 +1,9 @@
 # Day 9 — iscsi_queuecommand path
 
-**Week 2**: iSCSI Initiator Kernel Code
-**Time**: 1–2 hours
+**Week 2**: iSCSI Initiator Kernel Code  
+**Time**: 1–2 hours  
 **Reference**: `drivers/scsi/libiscsi.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
@@ -11,13 +12,14 @@
 `iscsi_queuecommand()` is the LLD's `queuecommand()` — registered in `Scsi_Host_Template` and
 called by `scsi_dispatch_cmd()` (day 4) after the SCSI mid layer builds the `scsi_cmnd`. It
 allocates an `iscsi_task`, builds the iSCSI Command PDU BHS (Basic Header Segment), and queues
-the task for the TX kthread. This is where a SCSI command becomes an iSCSI PDU.
+the task for the TX worker. This is where a SCSI command becomes an iSCSI PDU.
 
 ---
 
 ## iscsi_queuecommand — `drivers/scsi/libiscsi.c`
 
 ```c
+/* Simplified — see drivers/scsi/libiscsi.c for the actual implementation. */
 int iscsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *sc)
 {
     struct iscsi_cls_session *cls_session;
@@ -70,7 +72,7 @@ int iscsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *sc)
 
     /*
      * Allocate an iscsi_task from the session's pre-allocated pool.
-     * This is O(1) — pool uses a simple freelist.
+     * This is O(1) — pool uses a simple kfifo of free indices.
      */
     task = iscsi_alloc_task(conn, sc);
     if (!task) {
@@ -88,8 +90,7 @@ int iscsi_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *sc)
     }
 
     /*
-     * Queue the task for the TX thread.
-     * The TX kthread drains cmdqueue and sends the PDU.
+     * Queue the task and wake the TX worker.
      */
     iscsi_requeue_task(task);
 
@@ -104,7 +105,7 @@ reject:
 
 fault:
     spin_unlock_bh(&session->frwd_lock);
-    sc->scsi_done(sc);   /* complete immediately with error */
+    scsi_done(sc);   /* complete immediately with error */
     return 0;
 }
 EXPORT_SYMBOL_GPL(iscsi_queuecommand);
@@ -113,14 +114,15 @@ EXPORT_SYMBOL_GPL(iscsi_queuecommand);
 `SCSI_MLQUEUE_TARGET_BUSY` and `SCSI_MLQUEUE_HOST_BUSY` are NOT errors — they tell blk-mq to put
 the request back on the software queue and retry dispatch later. The command is not failed.
 
-`fault:` path is for permanent session failure — `sc->scsi_done(sc)` calls the completion
-callback immediately, propagating the error up through `scsi_io_completion()` (day 5).
+`fault:` path is for permanent session failure — calls the global `scsi_done(sc)` helper, which
+re-enters the SCSI mid layer at `scsi_io_completion()` (day 5).
 
 ---
 
 ## iscsi_alloc_task — `drivers/scsi/libiscsi.c`
 
 ```c
+/* Simplified. Real implementation manages the kfifo via libiscsi pool helpers. */
 static struct iscsi_task *iscsi_alloc_task(struct iscsi_conn *conn,
                                             struct scsi_cmnd *sc)
 {
@@ -128,24 +130,35 @@ static struct iscsi_task *iscsi_alloc_task(struct iscsi_conn *conn,
     struct iscsi_task *task;
 
     /*
-     * Get a free task from the pool.
-     * iscsi_pool_get() pops from the freelist — O(1), no allocation.
+     * Pop a free task index from the cmdpool kfifo.
+     * O(1), no dynamic allocation.
      */
-    if (!kfifo_out(&session->cmdpool.queue,
-                   (void **)&task, sizeof(void *)))
+    if (!__kfifo_out(&session->cmdpool.queue,
+                     (void *)&task, sizeof(void *)))
         return NULL;  /* pool empty — cmds_max in-flight already */
 
-    sc->SCp.phase = session->age;   /* stamp current session age */
-    sc->SCp.ptr   = (char *)task;   /* link scsi_cmnd → iscsi_task */
+    /*
+     * Stamp the current session age into the per-command private area.
+     * EH later checks this against session->age — if the session has
+     * reconnected since this command was allocated (age incremented),
+     * the command is treated as already gone. This is the modern
+     * replacement for sc->SCp.phase, which was removed in v6.2.
+     */
+    iscsi_cmd(sc)->age  = session->age;
+    iscsi_cmd(sc)->task = task;
 
-    refcount_set(&task->refcount, 1);
+    kref_init(&task->refcount);
     task->state  = ISCSI_TASK_PENDING;
     task->conn   = conn;
     task->sc     = sc;
-    task->have_checked_conn = false;
 
-    /* link back for EH — task can find its scsi_cmnd */
-    task->itt    = ISCSI_RESERVED_TAG;  /* not yet assigned */
+    /*
+     * task->itt was set when this slot was added to the pool, computed
+     * from session->age and a per-task index using ISCSI_AGE_SHIFT and
+     * ISCSI_ITT_MASK. The pool gives stable indices, so itt persists
+     * across alloc/free cycles for the same slot (with age bumping each
+     * reconnect).
+     */
 
     INIT_LIST_HEAD(&task->running);
 
@@ -153,15 +166,16 @@ static struct iscsi_task *iscsi_alloc_task(struct iscsi_conn *conn,
 }
 ```
 
-The pool is a `kfifo` of void pointers. `kfifo_out()` pops one without any locking beyond the
-`frwd_lock` already held by the caller. Task pool exhaustion means `cmds_max` commands are
-already in flight — the driver is at full depth.
+The pool is a `kfifo` of pointers / indices managed by `iscsi_pool_init()` /
+`iscsi_pool_free()`. Pool exhaustion means `cmds_max` commands are already in flight — the driver
+is at full depth.
 
 ---
 
 ## iscsi_prep_scsi_cmd_pdu — building the BHS — `drivers/scsi/libiscsi.c`
 
 ```c
+/* Simplified — see libiscsi.c for the full implementation. */
 static int iscsi_prep_scsi_cmd_pdu(struct iscsi_task *task)
 {
     struct iscsi_conn    *conn    = task->conn;
@@ -172,9 +186,7 @@ static int iscsi_prep_scsi_cmd_pdu(struct iscsi_task *task)
     struct iscsi_scsi_req *hdr =
         (struct iscsi_scsi_req *)task->hdr;
 
-    unsigned hdrlength, transfer_length;
-
-    tt = sc->sc_data_direction;
+    unsigned transfer_length;
 
     memset(hdr, 0, sizeof(*hdr));
 
@@ -185,35 +197,21 @@ static int iscsi_prep_scsi_cmd_pdu(struct iscsi_task *task)
     hdr->opcode = ISCSI_OP_SCSI_CMD;
 
     /*
-     * Task attribute (from sc->device->simple_tags):
-     *   ISCSI_ATTR_SIMPLE    (0x00) — most commands
-     *   ISCSI_ATTR_ORDERED   (0x02) — ordered (e.g. WRITE SAME)
-     *   ISCSI_ATTR_HEAD_OF_QUEUE (0x01) — EH passthrough
-     *   ISCSI_ATTR_ACA       (0x04) — Auto Contingent Allegiance
+     * Task attribute (RFC 7143 §11.2.2):
+     *   ISCSI_ATTR_UNTAGGED          0x00
+     *   ISCSI_ATTR_SIMPLE            0x01
+     *   ISCSI_ATTR_ORDERED           0x02
+     *   ISCSI_ATTR_HEAD_OF_QUEUE     0x03
+     *   ISCSI_ATTR_ACA               0x04
      */
     hdr->flags = ISCSI_ATTR_SIMPLE;
 
     /*
-     * Data direction flags embedded in the command PDU flags field.
-     * These tell the target which direction data flows.
+     * Direction flags in the Command PDU flags field tell the target
+     * which way data flows.
      */
     if (sc->sc_data_direction == DMA_TO_DEVICE) {
         hdr->flags |= ISCSI_FLAG_CMD_WRITE;
-        /*
-         * ImmediateData: can we piggyback write data in this PDU?
-         * If session->imm_data_en=1 AND data_length <= first_burst,
-         * we set the F-bit here and include data in the data segment.
-         */
-        if (session->imm_data_en) {
-            hdr->flags |= ISCSI_FLAG_CMD_IMM_DATA_EN;
-        }
-        /*
-         * InitialR2T=No: we can send unsolicited Data-Out PDUs
-         * without waiting for R2T from the target.
-         */
-        if (!session->initial_r2t_en) {
-            hdr->flags |= ISCSI_FLAG_CMD_UNSOL_DATA_EN;
-        }
     } else if (sc->sc_data_direction == DMA_FROM_DEVICE) {
         hdr->flags |= ISCSI_FLAG_CMD_READ;
     }
@@ -223,48 +221,43 @@ static int iscsi_prep_scsi_cmd_pdu(struct iscsi_task *task)
 
     /*
      * LUN: packed into 8 bytes using SAM LUN format.
-     * e.g. LUN 0 = 0x0000000000000000
-     *      LUN 1 = 0x0001000000000000 (peripheral device addressing)
      */
     int_to_scsilun(sc->device->lun, &hdr->lun);
 
     /*
      * ITT: unique task identifier for this session.
-     * Format: [age(8) | task_index(24)]
-     * The target copies this into every response PDU.
+     * Layout: [age : ISCSI_AGE_MASK bits | task_index : remainder]
+     * (4 bits of age in current libiscsi.) Built by build_itt()
+     * which uses ISCSI_AGE_SHIFT and ISCSI_ITT_MASK.
      */
-    task->itt = build_itt(task, session->age);
+    task->itt = build_itt(task->itt, session->age);
     hdr->itt  = task->itt;
 
     /*
      * CmdSN: command sequence number for this command.
-     * Incremented after assigning (pre-increment for next command).
-     * Immediate commands do NOT increment CmdSN.
+     * Incremented after assigning. Immediate commands do NOT increment CmdSN.
      */
     hdr->cmdsn     = cpu_to_be32(session->cmdsn);
     session->cmdsn++;
-    session->queued_cmdsn++;
+    session->queued_cmdsn = session->cmdsn;
 
     /*
      * ExpStatSN: tell target what StatSN we've received so far.
-     * Target uses this to know which responses we've acknowledged.
      */
     hdr->exp_statsn = cpu_to_be32(conn->exp_statsn);
 
     /*
-     * Data length: total bytes to transfer (in 32-bit big-endian).
-     * For reads: this is how many bytes we want back.
-     * For writes: total write data length.
+     * Data length: total bytes to transfer (32-bit big-endian).
      */
     transfer_length = scsi_transfer_length(sc);
     hdr->data_length = cpu_to_be32(transfer_length);
 
     /*
-     * CDB: copy directly from scsi_cmnd.
-     * cmd_len is 6, 10, 12, 16, or 32 depending on command type.
-     * e.g. READ(10): 10 bytes, WRITE(16): 16 bytes
+     * CDB: copy directly from scsi_cmnd. The iSCSI BHS holds 16 bytes
+     * of CDB inline. CDBs longer than 16 bytes (e.g. CDB32) are carried
+     * in an Additional Header Segment (AHS) per RFC 7143 §10.2.1 — the
+     * iSCSI Command PDU itself has no `cdb_len` field.
      */
-    hdr->cdb_len = sc->cmd_len;
     BUG_ON(sc->cmd_len > sizeof(hdr->cdb));
     memcpy(hdr->cdb, sc->cmnd, sc->cmd_len);
 
@@ -278,29 +271,24 @@ static int iscsi_prep_scsi_cmd_pdu(struct iscsi_task *task)
     task->imm_count = 0;
     if (sc->sc_data_direction == DMA_TO_DEVICE &&
         session->imm_data_en) {
+        hdr->flags |= ISCSI_FLAG_CMD_IMM_DATA_EN;
         task->imm_count = min3(transfer_length,
-                               conn->max_xmit_dlength,
-                               session->first_burst);
+                               (unsigned)conn->max_xmit_dlength,
+                               (unsigned)session->first_burst);
     }
 
     /*
      * Unsolicited Data-Out tracking.
      * If InitialR2T=No, we can send up to first_burst bytes
      * as unsolicited Data-Out PDUs after the Command PDU.
-     * unsol_r2t tracks how many unsolicited bytes remain to send.
      */
     task->unsol_r2t = 0;
     if (sc->sc_data_direction == DMA_TO_DEVICE &&
         !session->initial_r2t_en) {
-        task->unsol_r2t = min(transfer_length, session->first_burst)
+        hdr->flags |= ISCSI_FLAG_CMD_UNSOL_DATA_EN;
+        task->unsol_r2t = min(transfer_length, (unsigned)session->first_burst)
                         - task->imm_count;
     }
-
-    /*
-     * Point task->sdb to the scsi_cmnd's scatter-gather buffer.
-     * The TX path reads this SGL to build Data-Out PDU data segments.
-     */
-    task->sdb = scsi_out(sc);
 
     return 1; /* success */
 }
@@ -340,6 +328,9 @@ Opcode = `0x01` (ISCSI_OP_SCSI_CMD). The Immediate bit (bit 6 of byte 0) is NOT 
 commands — they carry a CmdSN and go through ordering. Management PDUs (NOP-Out, TMF) often set
 the Immediate bit so they skip CmdSN ordering and go out on the wire ASAP.
 
+CDBs longer than 16 bytes (rare — mostly 32-byte VARIABLE LENGTH CDB) are carried in a separate
+AHS; `TotalAHSLength` advertises the AHS bytes that follow the BHS.
+
 ---
 
 ## iscsi_requeue_task — queuing for TX
@@ -350,8 +341,8 @@ void iscsi_requeue_task(struct iscsi_task *task)
     struct iscsi_conn *conn = task->conn;
 
     /*
-     * Add to conn->requeue (highest priority within data commands).
-     * TX thread drains: mgmtqueue → requeue → cmdqueue.
+     * Add to conn->requeue list.
+     * TX worker drains: mgmtqueue → requeue → cmdqueue.
      */
     spin_lock_bh(&conn->taskqueuelock);
     if (list_empty(&task->running)) {
@@ -360,17 +351,16 @@ void iscsi_requeue_task(struct iscsi_task *task)
     }
     spin_unlock_bh(&conn->taskqueuelock);
 
-    /* wake the TX kthread */
-    iscsi_conn_queue_xmit(conn);
-}
-
-static inline void iscsi_conn_queue_xmit(struct iscsi_conn *conn)
-{
-    struct iscsi_cls_conn *cls_conn = conn->cls_conn;
-    if (cls_conn && cls_conn->transport->xmit_task)
-        cls_conn->transport->xmit_task(conn);  /* for iscsi_tcp: wake TX kthread */
+    /*
+     * Schedule the TX work item. In modern libiscsi this is queued on
+     * a workqueue, not signalled to a kthread.
+     */
+    iscsi_conn_queue_work(conn);
 }
 ```
+
+`iscsi_conn_queue_work()` calls `queue_work()` on the iscsi workqueue (or transport-specific
+queue). The TX worker (`iscsi_xmitworker`) runs and drains the lists in priority order (day 10).
 
 ---
 
@@ -378,18 +368,17 @@ static inline void iscsi_conn_queue_xmit(struct iscsi_conn *conn)
 
 ```
 scsi_dispatch_cmd(cmd)                    [drivers/scsi/scsi_lib.c]
-    │  cmd->scsi_done = scsi_done
     │  host->hostt->queuecommand(host, cmd)
     ▼
 iscsi_queuecommand(host, sc)              [drivers/scsi/libiscsi.c]
     │  iscsi_session_chkready()           gate 1: session state
     │  iscsi_cmd_win_closed()             gate 2: CmdSN window
-    │  iscsi_alloc_task()                 pool alloc, link sc↔task
+    │  iscsi_alloc_task()                 pool alloc, age stamp via iscsi_cmd()
     │  iscsi_prep_scsi_cmd_pdu()          build 48-byte BHS
     │  iscsi_requeue_task()               put on conn->requeue
-    │  iscsi_conn_queue_xmit()            wake TX kthread
+    │  iscsi_conn_queue_work()            schedule TX worker
     ▼
-iscsi_xmit_task() / TX kthread            [drivers/scsi/iscsi_tcp.c]  (day 10)
+iscsi_xmitworker()                        [drivers/scsi/iscsi_tcp.c]  (day 10)
     │  sends BHS over TCP socket
     │  sends immediate data (if any)
     │  sends unsolicited Data-Out PDUs (if InitialR2T=No)
@@ -402,17 +391,22 @@ TCP wire → target
 ## Key takeaways
 
 - `iscsi_queuecommand()` has three gates: session state, CmdSN window, TX suspended.
-  If any gate fails: `MLQUEUE_*_BUSY` → blk-mq retries, OR `fault:` → immediate error.
-- `iscsi_alloc_task()` pops from the task pool kfifo — O(1), no dynamic allocation.
+  If any gate fails: `MLQUEUE_*_BUSY` → blk-mq retries, OR `fault:` → immediate error via
+  `scsi_done()`.
+- `iscsi_alloc_task()` pops from the task pool kfifo — O(1), no dynamic allocation. The session
+  age is stamped into the SCSI command's private area (`iscsi_cmd(sc)`) for EH safety.
 - `iscsi_prep_scsi_cmd_pdu()` fills every field of the 48-byte BHS:
   - `opcode = 0x01`, `flags` (R/W/F bits, task attr), `lun`, `itt`, `cmdsn`, `exp_statsn`,
     `data_length`, `cdb[]`.
-- ITT = `(session->age << 24) | task_index` — session age prevents cross-session response matches.
+- The iSCSI BHS holds 16 bytes of CDB inline; longer CDBs use AHS. There is no per-command
+  `cdb_len` field in the BHS itself.
+- ITT layout: `(session->age << ISCSI_AGE_SHIFT) | (task_index & ISCSI_ITT_MASK)` — session age
+  in the high bits prevents cross-session response matches.
 - `imm_count` = bytes piggybacked in Command PDU (ImmediateData=Yes path).
 - `unsol_r2t` = bytes sendable as unsolicited Data-Out (InitialR2T=No path).
 - These two fields directly control which of the five write paths `iscsit_process_scsi_cmd()`
   takes on the target side (day 18).
-- After `iscsi_requeue_task()`, the TX kthread wakes and sends the PDU over TCP.
+- After `iscsi_requeue_task()`, the TX worker is scheduled and sends the PDU over TCP.
 
 ---
 

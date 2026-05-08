@@ -3,6 +3,7 @@
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `drivers/scsi/scsi_lib.c`, `include/scsi/scsi_cmnd.h`, `drivers/scsi/scsi.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
@@ -39,7 +40,7 @@ struct scsi_cmnd {
      * For PERSISTENT RESERVE OUT (from sd_pr_reserve):
      *   cmnd[0] = 0x5F (PERSISTENT_RESERVE_OUT)
      *   cmnd[1] = action (REGISTER, RESERVE, RELEASE...)
-     *   cmnd[2] = type | scope
+     *   cmnd[2] = scope<<4 | type
      *   cmnd[3..6] = 0
      *   cmnd[7..8] = parameter list length
      *   cmnd[9] = 0
@@ -70,7 +71,7 @@ struct scsi_cmnd {
 
     /*
      * result — packed SCSI result code:
-     *   bits 31-24: driver_byte  (unused since 5.x kernels)
+     *   bits 31-24: driver_byte  (deprecated/unused since 5.x)
      *   bits 23-16: host_byte    (DID_OK, DID_NO_CONNECT, DID_TRANSPORT_FAILFAST...)
      *   bits  7- 0: status_byte  (SAM_STAT_GOOD, SAM_STAT_CHECK_CONDITION,
      *                             SAM_STAT_RESERVATION_CONFLICT...)
@@ -85,16 +86,18 @@ struct scsi_cmnd {
 
     /* timing */
     unsigned long        jiffies_at_alloc; /* for timeout calculation */
-    int                  timeout_per_command;
 
     /*
-     * Completion callback — set to scsi_finish_command() for normal I/O.
-     * For passthrough (scsi_execute_cmd), set to a sync completion wrapper.
+     * Note: the legacy `scsi_pointer SCp` field that LLDs once used to stash
+     * private state was removed from struct scsi_cmnd in v6.2 (the Bart
+     * Van Assche cleanup series). Modern LLDs (libiscsi included) store
+     * per-command private state in the area immediately following struct
+     * scsi_cmnd in the request PDU, sized via Scsi_Host_Template.cmd_size
+     * and accessed by helpers such as iscsi_cmd(sc) / scsi_cmd_priv(sc).
+     *
+     * Likewise there is no `cmd->scsi_done` function-pointer member; LLDs
+     * call the global scsi_done(cmd) helper directly when a command finishes.
      */
-    void (*scsi_done)(struct scsi_cmnd *);
-
-    /* LLD private storage — libiscsi stores iscsi_task pointer here */
-    struct scsi_pointer  SCp;
 };
 ```
 
@@ -113,7 +116,9 @@ The `result` field layout:
 #define DID_ABORT           0x05  /* command aborted */
 #define DID_RESET           0x06  /* device was reset */
 #define DID_SOFT_ERROR      0x0b  /* retriable transport error */
-#define DID_TRANSPORT_FAILFAST 0x0e /* non-retriable transport error */
+#define DID_TRANSPORT_FAILFAST  0x0e /* non-retriable transport error */
+#define DID_TRANSPORT_DISRUPTED 0x0f /* transport disrupted, retry possible */
+#define DID_TRANSPORT_MARGINAL  0x11 /* path is degraded but usable */
 
 /* status_byte values — returned by target in SCSI Response PDU */
 #define SAM_STAT_GOOD                 0x00
@@ -129,10 +134,15 @@ The `result` field layout:
 When iSCSI delivers `RESERVATION CONFLICT`:
 - `host_byte = DID_OK` (transport worked fine)
 - `status_byte = SAM_STAT_RESERVATION_CONFLICT` (0x18)
-- No sense data (RESERVATION CONFLICT has no sense key — it is its own status)
+- No sense data attached by LIO (SAM-5 permits sense on any status, but in practice LIO and most
+  targets do not attach sense for RESERVATION CONFLICT — its meaning is conveyed by the status
+  byte alone).
 
-`scsi_decide_disposition()` (day 5) sees `status_byte = 0x18` and returns `SUCCESS` immediately —
-no retry, no EH. The conflict propagates directly to the caller.
+`scsi_decide_disposition()` (day 5) sees `status_byte = 0x18` and routes it via
+`scsi_noretry_cmd()` so the conflict propagates directly to the caller without retry or EH. In
+modern kernels (since the SCSI error mapping work around v6.0) the result also maps to
+`BLK_STS_RESV_CONFLICT`, which `blk_path_error()` treats as NOT a path error — so dm-multipath
+does not fail the path on a stray reservation conflict on normal I/O.
 
 ---
 
@@ -142,23 +152,23 @@ This is the `queue_rq` blk-mq callback registered by the SCSI mid layer. Called 
 `blk_mq_dispatch_rq_list()` for every request.
 
 ```c
+/* Simplified — see drivers/scsi/scsi_lib.c for the actual implementation. */
 static blk_status_t scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
                                    const struct blk_mq_queue_data *bd)
 {
     struct request *req = bd->rq;
     struct request_queue *q = req->q;
-    struct scsi_device *sdev = q->queuedata;  /* scsi_device for this queue */
+    struct scsi_device *sdev = q->queuedata;
     struct Scsi_Host *shost = sdev->host;
     /* scsi_cmnd is embedded directly in the request's PDU area */
     struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
     blk_status_t ret;
-    int reason;
 
     /*
      * Check device state — if device is offline or being deleted,
      * reject the request immediately without sending to the LLD.
      */
-    ret = prep_to_mq(scsi_prep_state_check(sdev, req));
+    ret = scsi_prep_state_check(sdev, req);
     if (ret != BLK_STS_OK)
         goto out_put_budget;
 
@@ -177,7 +187,7 @@ static blk_status_t scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
          * For normal I/O: scsi_setup_fs_cmnd()
          * For passthrough: scsi_setup_scsi_cmnd()
          */
-        ret = prep_to_mq(scsi_prep_fn(q, req));
+        ret = scsi_prep_fn(q, req);
         if (ret != BLK_STS_OK)
             goto out_dec_host_busy;
         req->rq_flags |= RQF_DONTPREP;
@@ -188,8 +198,8 @@ static blk_status_t scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
      * between the prep check and here.
      */
     if (unlikely(!scsi_device_online(sdev))) {
-        scmd->result = DID_NO_CONNECT << 16;
-        scsi_done(cmd);
+        cmd->result = DID_NO_CONNECT << 16;
+        scsi_done(cmd);                /* global helper, not a member */
         return BLK_STS_OK;
     }
 
@@ -231,76 +241,82 @@ shost->tag_set.cmd_size = sizeof(struct scsi_cmnd)
 
 So the memory layout of a blk-mq request for a SCSI device is:
 ```
-[struct request][struct scsi_cmnd][LLD private data (iscsi_task etc.)]
+[struct request][struct scsi_cmnd][LLD private data (e.g. iscsi_task)]
 ```
 
-All in one contiguous allocation. No separate kmalloc for `scsi_cmnd`.
+All in one contiguous allocation. No separate kmalloc for `scsi_cmnd`. LLDs reach their private
+area via helpers — for libiscsi this is `iscsi_cmd(sc)` / `scsi_cmd_priv(sc)`, which return a
+pointer into that trailing region. Older code that referenced `sc->SCp.ptr` no longer compiles
+against modern kernels (the `SCp` field was removed in v6.2).
 
 ---
 
 ## scsi_prep_state_check — device state gating
 
 ```c
-static enum scsi_disposition
+/* Simplified — illustrative shape; the real return type is blk_status_t. */
+static blk_status_t
 scsi_prep_state_check(struct scsi_device *sdev, struct request *req)
 {
     switch (sdev->sdev_state) {
     case SDEV_CREATED:
     case SDEV_RUNNING:
-        return SCSI_MLQUEUE_GOOD;      /* device is ready */
+        return BLK_STS_OK;             /* device is ready */
 
     case SDEV_QUIESCE:
         /*
          * Device is being quiesced (e.g. for EH).
          * Passthrough commands are allowed through (for EH itself to use).
-         * Normal I/O is rejected with MLQUEUE_DEVICE_BUSY (retry later).
+         * Normal I/O is rejected with BLK_STS_RESOURCE (retry later).
          */
         if (blk_rq_is_passthrough(req))
-            return SCSI_MLQUEUE_GOOD;
-        return SCSI_MLQUEUE_DEVICE_BUSY;
+            return BLK_STS_OK;
+        return BLK_STS_RESOURCE;
 
     case SDEV_OFFLINE:
         /*
          * Device taken offline by admin (echo offline > /sys/block/sdX/device/state)
-         * All commands fail immediately.
+         * or by EH after exhausted retries. All commands fail.
          */
-        scmd->result = DID_NO_CONNECT << 16;
-        return SCSI_MLQUEUE_TERMINATE;
+        return BLK_STS_IOERR;
 
     case SDEV_TRANSPORT_OFFLINE:
         /*
-         * iSCSI session dropped — iscsi_conn_failure() sets this.
-         * All commands get DID_NO_CONNECT → EH → path failure.
+         * Transport-level offline (e.g. iSCSI session failed).
+         * Normal I/O is rejected so it can be retried after recovery;
+         * passthrough may be allowed through depending on whether EH
+         * itself needs to issue commands.
          */
-        if (!blk_rq_is_passthrough(req)) {
-            scmd->result = DID_TRANSPORT_DISRUPTED << 16;
-            return SCSI_MLQUEUE_TERMINATE;
-        }
-        return SCSI_MLQUEUE_GOOD;  /* let EH passthrough commands through */
+        if (!blk_rq_is_passthrough(req))
+            return BLK_STS_TRANSPORT;
+        return BLK_STS_OK;
 
     case SDEV_DEL:
-        scmd->result = DID_NO_CONNECT << 16;
-        return SCSI_MLQUEUE_TERMINATE;
+        return BLK_STS_IOERR;
 
     default:
-        return SCSI_MLQUEUE_DEVICE_BUSY;
+        return BLK_STS_RESOURCE;
     }
 }
 ```
 
-`SDEV_TRANSPORT_OFFLINE` is set by `iscsi_conn_failure()` when the TCP session drops. At that
-point, new I/O commands from the filesystem get `DID_TRANSPORT_DISRUPTED` without hitting the
-wire. EH wakes, tries to recover the session, and eventually either reconnects or calls
-`scsi_device_set_state(sdev, SDEV_OFFLINE)` + `DID_NO_CONNECT` on all pending commands.
+`SDEV_TRANSPORT_OFFLINE` is set indirectly by `iscsi_conn_failure()` (day 12) via
+`iscsi_suspend_tx()` → `scsi_target_block()`. At that point new I/O commands from the
+filesystem are held / retried by blk-mq rather than failed immediately. EH wakes, tries to
+recover the session, and eventually either reconnects (and the device transitions back to
+`SDEV_RUNNING`) or — once `replacement_timeout` expires — commands are completed with
+`DID_TRANSPORT_FAILFAST`.
 
 ---
 
 ## scsi_execute_cmd — `drivers/scsi/scsi_lib.c`
 
-The kernel API for synchronous passthrough SCSI commands. Used by `sd_pr_reserve()`, path checkers,
-INQUIRY handlers, etc.
+The kernel API for synchronous passthrough SCSI commands. Used by `sd_pr_reserve()`, path
+checkers, INQUIRY handlers, etc. The `scsi_execute_cmd()` name dates from v6.0 (commit
+`f7068114d45`); earlier kernels used `scsi_execute()` with a different signature.
 
 ```c
+/* Simplified — see drivers/scsi/scsi_lib.c for the real signature/body. */
 int scsi_execute_cmd(struct scsi_device *sdev,
                      const unsigned char *cmd,  /* CDB bytes */
                      blk_opf_t opf,             /* REQ_OP_DRV_IN or REQ_OP_DRV_OUT */
@@ -328,7 +344,7 @@ int scsi_execute_cmd(struct scsi_device *sdev,
 
     /*
      * Copy the CDB into the embedded scsi_cmnd.
-     * For PR OUT: cmd = {0x5F, action, type, 0, 0, 0, 0, 0, 18, 0}
+     * For PR OUT / RESERVE: cmd = {0x5F, 0x01, scope<<4|type, 0,0,0,0,0, 0x18, 0}
      */
     scmd->cmd_len = COMMAND_SIZE(cmd[0]);
     memcpy(scmd->cmnd, cmd, scmd->cmd_len);
@@ -348,13 +364,6 @@ int scsi_execute_cmd(struct scsi_device *sdev,
 
     req->timeout = timeout;
 
-    if (args) {
-        if (args->sense)
-            scmd->sense_buffer = args->sense;
-        if (args->sshdr)
-            scmd->sense_buffer = sense; /* for parsing later */
-    }
-
     /*
      * blk_execute_rq() injects at head and blocks until done.
      * This is the synchronous slow path (day 3).
@@ -371,8 +380,8 @@ int scsi_execute_cmd(struct scsi_device *sdev,
     if (args) {
         if (args->resid)
             *args->resid = scsi_get_resid(scmd);
-        if (args->sense_len)
-            *args->sense_len = scmd->sense_len;
+        if (args->sense)
+            memcpy(args->sense, scmd->sense_buffer, scmd->sense_len);
         if (args->result)
             *args->result = scmd->result;
     }
@@ -384,19 +393,19 @@ out:
 ```
 
 For a PR OUT command, `sd_pr_reserve()` calls this with:
-- `cmd = {0x5F, 0x01, type<<4, 0,0,0,0,0,0x18,0}` — PERSISTENT RESERVE OUT / RESERVE action
+- `cmd = {0x5F, 0x01, scope<<4|type, 0,0,0,0,0, 0x18, 0}` — PERSISTENT RESERVE OUT / RESERVE action
 - `opf = REQ_OP_DRV_OUT`
 - `buffer` = 24-byte PR parameter list (key values)
 - `bufflen = 24`
-- `timeout = 10 * HZ`
-- `retries = 1`
+- `timeout = 30 * HZ` (`SD_TIMEOUT`)
+- `retries = SD_MAX_RETRIES` (5)
 
 The `scsi_cmnd->cmnd[]` array holds these bytes and they are transmitted verbatim as the CDB in
 the iSCSI Command PDU.
 
 ---
 
-## scsi_alloc_sgtable — `drivers/scsi/scsi.c`
+## blk_rq_map_kern — building the SGL — `block/blk-map.c`
 
 For passthrough commands with data, `blk_rq_map_kern()` builds the SGL:
 
@@ -441,6 +450,7 @@ when the iSCSI TX path sends the Data-Out PDU.
 ## scsi_dispatch_cmd — calling the LLD
 
 ```c
+/* Simplified — see drivers/scsi/scsi_lib.c. */
 static int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
 {
     struct Scsi_Host *host = cmd->device->host;
@@ -451,12 +461,9 @@ static int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
     /* check host state again right before calling LLD */
     if (unlikely(host->shost_state == SHOST_DEL)) {
         cmd->result = (DID_NO_CONNECT << 16);
-        scsi_done(cmd);
+        scsi_done(cmd);                 /* global helper */
         return 0;
     }
-
-    /* cmd->scsi_done is the completion callback back to SCSI mid layer */
-    cmd->scsi_done = scsi_done;
 
     /*
      * Call the LLD's queuecommand function.
@@ -479,22 +486,28 @@ static int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
 }
 ```
 
-`scsi_done` (set as `cmd->scsi_done`) is what the LLD calls when it receives the SCSI Response
-PDU from the target — this re-enters the SCSI mid layer at `scsi_io_completion()` (day 5).
+When the LLD has produced a response (e.g. iSCSI received a SCSI Response PDU), it calls the
+global `scsi_done(cmd)` helper. This re-enters the SCSI mid layer at `scsi_io_completion()` /
+`scsi_decide_disposition()` (day 5).
 
 ---
 
 ## Key takeaways
 
 - `scsi_cmnd` is embedded directly in the blk-mq request PDU area — one contiguous allocation.
-- `result` packs `host_byte | status_byte` — each is checked independently in `scsi_decide_disposition()`.
+- The legacy `SCp` and `scsi_done` members of `scsi_cmnd` were removed in v6.2 and earlier
+  cleanups; LLDs use `scsi_cmd_priv(sc)` for private data and call the global `scsi_done(cmd)`
+  helper for completion.
+- `result` packs `host_byte | status_byte` — each is checked independently in
+  `scsi_decide_disposition()`.
 - `scsi_queue_rq()` checks device state, builds `scsi_cmnd`, and calls `scsi_dispatch_cmd()`.
-- `scsi_execute_cmd()` is the passthrough API — CDB goes in `scmd->cmnd[]`, data maps via
-  `blk_rq_map_kern()`, then `blk_execute_rq()` sends synchronously.
-- `SDEV_TRANSPORT_OFFLINE` set by `iscsi_conn_failure()` causes `DID_TRANSPORT_DISRUPTED` on all
-  new commands — they don't touch the wire, EH takes over.
-- `SAM_STAT_RESERVATION_CONFLICT` (0x18) in `status_byte` + `DID_OK` in `host_byte` = immediate
-  error, no retry, no EH.
+- `scsi_execute_cmd()` is the modern (v6.0+) passthrough API — CDB goes in `scmd->cmnd[]`, data
+  maps via `blk_rq_map_kern()`, then `blk_execute_rq()` sends synchronously.
+- `SDEV_TRANSPORT_OFFLINE` (set by `iscsi_suspend_tx()` → `scsi_target_block()`) causes new
+  normal I/O to be held/retried with a transport status until either recovery succeeds or
+  `replacement_timeout` expires and the result becomes `DID_TRANSPORT_FAILFAST`.
+- `SAM_STAT_RESERVATION_CONFLICT` (0x18) propagates via `BLK_STS_RESV_CONFLICT` in modern
+  kernels; `blk_path_error()` returns false for it, so dm-multipath does not fail the path.
 
 ---
 

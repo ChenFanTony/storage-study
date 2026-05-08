@@ -2,16 +2,18 @@
 
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
-**Reference**: `drivers/scsi/scsi_lib.c`
+**Reference**: `drivers/scsi/scsi_lib.c`, `drivers/scsi/scsi_error.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
-When a SCSI command completes, the LLD calls `scsi_done()`. From there, `scsi_io_completion()`
-reads `cmd->result` and sense data, then calls `scsi_decide_disposition()` to determine what to
-do: succeed, retry, or escalate to EH. This is the routing brain of the SCSI mid layer and the
-exact point where `RESERVATION CONFLICT` and `NOT READY` diverge into completely different paths.
+When a SCSI command completes, the LLD calls the global `scsi_done()` helper. From there,
+`scsi_io_completion()` reads `cmd->result` and sense data, then calls `scsi_decide_disposition()`
+to determine what to do: succeed, retry, or escalate to EH. This is the routing brain of the SCSI
+mid layer and the exact point where `RESERVATION CONFLICT` and `NOT READY` diverge into
+completely different paths.
 
 ---
 
@@ -37,7 +39,7 @@ void scsi_done(struct scsi_cmnd *cmd)
      * raise a BLOCK softirq — deferring full completion processing
      * out of the interrupt/softirq context that called scsi_done.
      */
-    blk_complete_request(scsi_cmd_to_rq(cmd));
+    blk_mq_complete_request(scsi_cmd_to_rq(cmd));
 }
 
 /* softirq handler for normal I/O completion */
@@ -74,12 +76,20 @@ wakes `blk_execute_rq()`. No disposition check, no retry, no EH possible.
 ## scsi_decide_disposition — `drivers/scsi/scsi_lib.c`
 
 ```c
+/* Simplified — see scsi_lib.c for the full routing logic. The actual
+ * upstream function:
+ *   1. short-circuits for passthrough (already handled in scsi_done)
+ *   2. checks deferred-error sense
+ *   3. switches on host_byte
+ *   4. switches on status_byte
+ *   5. handles sense for CHECK CONDITION via scsi_check_sense()
+ */
 static enum scsi_disposition scsi_decide_disposition(struct scsi_cmnd *scmd)
 {
     int status = scmd->result;
 
     /*
-     * First check the host_byte — transport-level result.
+     * Step 1: check the host_byte — transport-level result.
      * If host reported an error, SCSI status is irrelevant.
      */
     if (host_byte(status) != DID_OK) {
@@ -89,15 +99,25 @@ static enum scsi_disposition scsi_decide_disposition(struct scsi_cmnd *scmd)
             /*
              * Transport says: don't retry on any path.
              * dm-multipath maps this to a permanent path failure.
-             * Set by libiscsi after replacement_timeout expires.
+             * Set after replacement_timeout expires (day 12).
+             *
+             * Always returns SUCCESS so the result propagates upward
+             * with the host_byte preserved — the whole point of
+             * FAILFAST is "do not retry".
              */
-            if (scmd->retries < scmd->allowed &&
-                !(scmd->cmd_flags & REQ_FAILFAST_MASK))
+            return SUCCESS;
+
+        case DID_TRANSPORT_DISRUPTED:
+            /*
+             * Transport disruption that may be recoverable.
+             * If retries remain, NEEDS_RETRY; otherwise return SUCCESS
+             * with the error so it propagates up.
+             */
+            if (scmd->retries < scmd->allowed)
                 return NEEDS_RETRY;
-            return SUCCESS; /* complete with the error, don't EH */
+            return SUCCESS;
 
         case DID_NO_CONNECT:
-        case DID_TRANSPORT_DISRUPTED:
             return FAILED;  /* → EH */
 
         case DID_SOFT_ERROR:
@@ -115,7 +135,7 @@ static enum scsi_disposition scsi_decide_disposition(struct scsi_cmnd *scmd)
     }
 
     /*
-     * host_byte is DID_OK — check SCSI status from target.
+     * Step 2: host_byte is DID_OK — check SCSI status from target.
      */
     switch (status_byte(status)) {
 
@@ -131,20 +151,21 @@ static enum scsi_disposition scsi_decide_disposition(struct scsi_cmnd *scmd)
 
     case SAM_STAT_RESERVATION_CONFLICT:
         /*
-         * *** KEY CASE FOR OUR FENCING DISCUSSION ***
+         * *** KEY CASE FOR FENCING ***
          *
          * RESERVATION CONFLICT (0x18) means the initiator tried to
          * access a LUN it does not hold a reservation for.
          *
-         * Return SUCCESS — this tells scsi_softirq_done() to call
-         * scsi_finish_command(), which completes the request to blk-mq
-         * with the conflict status in scmd->result.
+         * scsi_noretry_cmd() also returns true for this status, which
+         * keeps the result on the SUCCESS path (no retry). It propagates
+         * to blk-mq with the status byte preserved.
          *
-         * No retry. No EH escalation. No LUN reset.
-         * The error propagates immediately to the caller.
-         *
-         * For normal I/O: the filesystem / dm-multipath sees BLK_STS_IOERR.
-         * For passthrough (PR commands): scsi_execute_cmd() gets -EIO.
+         * For passthrough (PR commands): scsi_execute_cmd() returns -EIO
+         *   to the caller — handled before we get here, via the early
+         *   short-circuit in scsi_done().
+         * For normal I/O: scsi_result_to_blk_status() maps the status to
+         *   BLK_STS_RESV_CONFLICT (modern kernels) — blk_path_error()
+         *   returns false for it, so dm-multipath does NOT fail the path.
          */
         return SUCCESS;
 
@@ -184,9 +205,11 @@ maybe_retry:
 
 ---
 
-## scsi_check_sense — parsing CHECK CONDITION — `drivers/scsi/scsi_lib.c`
+## scsi_check_sense — parsing CHECK CONDITION — `drivers/scsi/scsi_error.c`
 
 ```c
+/* Simplified. Real function lives in scsi_error.c and handles many more
+ * sense keys / quirks; the structure below highlights the common cases. */
 static enum scsi_disposition scsi_check_sense(struct scsi_cmnd *scmd)
 {
     struct scsi_device *sdev = scmd->device;
@@ -196,7 +219,7 @@ static enum scsi_disposition scsi_check_sense(struct scsi_cmnd *scmd)
     if (!scsi_command_normalize_sense(scmd, &sshdr))
         return FAILED;  /* unparseable sense → EH */
 
-    if (scsi_sense_is_deferred(scmd))
+    if (scsi_sense_is_deferred(&sshdr))
         return NEEDS_RETRY;
 
     switch (sshdr.sense_key) {
@@ -205,35 +228,38 @@ static enum scsi_disposition scsi_check_sense(struct scsi_cmnd *scmd)
         return SUCCESS;
 
     case RECOVERED_ERROR:
-        return /* check if error recovery succeeded */ SUCCESS;
+        return SUCCESS;
 
     case NOT_READY:
         /*
          * ASC 0x04 = "LOGICAL UNIT NOT READY"
-         * ASCQ distinguishes the reason:
+         * ASCQ distinguishes the reason. Common values:
          */
         if (sshdr.asc == 0x04) {
             switch (sshdr.ascq) {
             case 0x01:
                 /*
-                 * NOT READY / LOGICAL UNIT IS IN PROCESS OF BECOMING READY
+                 * NOT READY / LU IN PROCESS OF BECOMING READY.
                  * Transient state — retry.
-                 * *** This feeds into no_path_retry=queue hang ***
-                 * All paths return this → all paths fail via EH →
-                 * dm-multipath no valid paths → queue holds bios.
                  */
                 return NEEDS_RETRY;
             case 0x02:
                 /*
-                 * NOT READY / LOGICAL UNIT NOT READY, INITIALIZING CMD REQUIRED
-                 * i.e. LUN was explicitly taken offline by admin.
-                 * → FAILED → EH → DID_NO_CONNECT → path failure.
-                 * Still causes no_path_retry=queue hang if all paths fail.
+                 * NOT READY / INITIALIZING COMMAND REQUIRED.
+                 * The LUN expects a START STOP UNIT (or similar) to
+                 * bring it online. Conventionally retried (so the SCSI
+                 * mid-layer eventually issues the init via EH).
                  */
-                return FAILED;
+                return NEEDS_RETRY;
             case 0x0a:
                 /* ASYMMETRIC ACCESS STATE TRANSITION — ALUA */
                 return NEEDS_RETRY;
+            case 0x0b:
+                /* TARGET PORT IN STANDBY STATE — ALUA */
+                return NEEDS_RETRY;
+            case 0x12:
+                /* OFFLINE — admin took the LUN offline */
+                return SUCCESS;        /* permanent error, propagate */
             default:
                 return NEEDS_RETRY;
             }
@@ -242,24 +268,15 @@ static enum scsi_disposition scsi_check_sense(struct scsi_cmnd *scmd)
 
     case UNIT_ATTENTION:
         /*
-         * Power on, reset, mode page changed, etc.
-         * Always retry — these are transient events.
-         * The UA is consumed on retry (target clears it).
+         * Power on, reset, mode page changed, ALUA state changed, etc.
+         * Always retry — the UA is consumed on retry (target clears it).
          */
-        if (sdev->expecting_cc_ua) {
-            sdev->expecting_cc_ua = 0;
-            return NEEDS_RETRY;
-        }
-        scsi_handle_sdev_quirk(scmd);
         return NEEDS_RETRY;
 
     case ILLEGAL_REQUEST:
         return SUCCESS;  /* permanent error, no retry */
 
     case ABORTED_COMMAND:
-        /* might be retriable */
-        if (sshdr.asc == 0x10) /* IDNF */
-            return SUCCESS;
         return NEEDS_RETRY;
 
     case MEDIUM_ERROR:
@@ -277,6 +294,10 @@ static enum scsi_disposition scsi_check_sense(struct scsi_cmnd *scmd)
 }
 ```
 
+`NOT_READY ASCQ=0x02` ("INITIALIZING COMMAND REQUIRED") is conventionally retriable in upstream
+SCSI — the LUN is requesting that an initialization command (typically START STOP UNIT) be
+issued. The "admin offline" case is closer to ASCQ=0x12 ("OFFLINE"), which is a permanent error.
+
 ---
 
 ## scsi_queue_insert and scsi_requeue_command
@@ -290,8 +311,6 @@ void scsi_queue_insert(struct scsi_cmnd *cmd, int reason)
     struct request_queue *q = device->request_queue;
     struct request *req = scsi_cmd_to_rq(cmd);
 
-    scsi_unprep_request(req);
-
     /*
      * For SCSI_MLQUEUE_DEVICE_BUSY (TASK_SET_FULL, BUSY status):
      * delay dispatch by SCSI_QUEUE_DELAY (3ms) to avoid hammering
@@ -302,35 +321,26 @@ void scsi_queue_insert(struct scsi_cmnd *cmd, int reason)
 
     blk_mq_requeue_request(req, true);  /* put back in hw queue */
 }
-
-static void scsi_requeue_command(struct request_queue *q, struct scsi_cmnd *cmd)
-{
-    struct request *req = scsi_cmd_to_rq(cmd);
-
-    scsi_unprep_request(req);
-    blk_mq_requeue_request(req, false);
-    blk_mq_run_hw_queue(req->mq_hctx, false);
-}
 ```
 
 `blk_mq_requeue_request()` puts the request back into the hw queue's list. dm-multipath may then
-pick it up via `multipath_map_bio()` and try a different path. If all paths return `NEEDS_RETRY`,
-dm-multipath cycles through all paths, all fail, all go back to the requeue list, and if
-`no_path_retry=queue` the bios accumulate in `m->queued_ios`.
+select a different path on the next dispatch. If all paths return `NEEDS_RETRY` (e.g. NOT READY
+on every path) and they all fail via EH eventually with `DID_TRANSPORT_*`, dm-multipath's
+`fail_path()` runs and — under `no_path_retry=queue` — bios accumulate in `m->queued_bios`.
 
 ---
 
-## The NOT READY → queue hang path vs RESERVATION CONFLICT → immediate error
+## NOT READY → queue hang vs RESERVATION CONFLICT → immediate error
 
 ```
 RESERVATION CONFLICT (PR path)         NOT READY (LUN offline / becoming ready)
 ───────────────────────────────         ────────────────────────────────────────
 Target returns status 0x18              Target returns CHECK CONDITION + sense
-    │                                       │  NOT READY / ASC 04 / ASCQ 01 or 02
+    │                                       │  NOT READY / ASC 04 / ASCQ 01
     ▼                                       ▼
 scsi_done()                             scsi_done()
     │  blk_rq_is_passthrough=true           │  blk_rq_is_passthrough=false
-    │  → scsi_complete() directly           │  → blk_complete_request() → softirq
+    │  → scsi_complete() directly           │  → blk_mq_complete_request() → softirq
     ▼                                       ▼
 blk_end_sync_rq()                       scsi_softirq_done()
     │  complete() wakes caller              │
@@ -341,14 +351,17 @@ scsi_execute_cmd() returns -EIO         scsi_decide_disposition()
 sd_pr_reserve() reports conflict            ▼
     │                                   scsi_queue_insert()
     ▼                                       │  request back in blk-mq
-caller gets -ENODEV immediately             ▼
+caller gets -EIO immediately                ▼
                                         dm-multipath tries next path
                                             │  same result on all paths
                                             ▼
-                                        all pgpaths fail → nr_valid_paths=0
+                                        EH eventually fails → DID_TRANSPORT_FAILFAST
                                             │
+                                        fail_path() per path
+                                            │
+                                            ▼  nr_valid_paths == 0
                                             ▼  (no_path_retry=queue)
-                                        multipath_map_bio(): bio_list_add()
+                                        multipath_map_bio(): bio_list_add(queued_bios)
                                             │
                                             ▼
                                         application hangs forever
@@ -359,28 +372,32 @@ caller gets -ENODEV immediately             ▼
 ## scsi_result_to_blk_status — what dm-multipath sees
 
 ```c
+/* Simplified — actual function lives in scsi_lib.c and is named
+ * __scsi_error_from_host_byte() / scsi_result_to_blk_status() depending
+ * on kernel version. */
 static blk_status_t scsi_result_to_blk_status(struct scsi_cmnd *cmd, int result)
 {
+    /* Reservation conflict has its own dedicated blk_status_t. */
+    if (status_byte(result) == SAM_STAT_RESERVATION_CONFLICT)
+        return BLK_STS_RESV_CONFLICT;
+
     switch (host_byte(result)) {
     case DID_OK:
         if (scsi_status_is_good(result))
             return BLK_STS_OK;
-        return BLK_STS_IOERR;  /* RESERVATION CONFLICT → BLK_STS_IOERR */
+        return BLK_STS_IOERR;
 
     case DID_TRANSPORT_FAILFAST:
-        return BLK_STS_TRANSPORT; /* → dm-multipath permanent path failure */
+        return BLK_STS_TRANSPORT;     /* → dm-mpath permanent path failure */
 
-    case DID_TARGET_FAILURE:
-        return BLK_STS_TARGET;
+    case DID_TRANSPORT_DISRUPTED:
+        return BLK_STS_IOERR;
 
-    case DID_NEXUS_FAILURE:
-        return BLK_STS_NEXUS;
+    case DID_TRANSPORT_MARGINAL:
+        return BLK_STS_AGAIN;
 
-    case DID_MEDIUM_ERROR:
-        return BLK_STS_MEDIUM;
-
-    case DID_ALLOC_FAILURE:
-        return BLK_STS_DEV_RESOURCE; /* → MLQUEUE / retry */
+    case DID_NO_CONNECT:
+        return BLK_STS_IOERR;
 
     default:
         return BLK_STS_IOERR;
@@ -389,8 +406,13 @@ static blk_status_t scsi_result_to_blk_status(struct scsi_cmnd *cmd, int result)
 ```
 
 `BLK_STS_TRANSPORT` from `DID_TRANSPORT_FAILFAST` causes dm-multipath's `multipath_end_io()` to
-call `fail_path()` immediately without retry on another path. This is the behavior after
-`replacement_timeout` expires — the session is declared dead, paths are failed permanently.
+call `fail_path()` immediately. This is the behavior after `replacement_timeout` expires — the
+session is declared dead, paths are failed permanently.
+
+`BLK_STS_RESV_CONFLICT` (added in the v6.0 timeframe) is the dedicated mapping for reservation
+conflict. `blk_path_error()` returns false for `BLK_STS_RESV_CONFLICT`, so dm-multipath does NOT
+fail the path — a stray reservation conflict from one initiator does not cause every other
+initiator's paths to be torn down.
 
 ---
 
@@ -401,11 +423,14 @@ call `fail_path()` immediately without retry on another path. This is the behavi
 - `scsi_decide_disposition()` routes based on `host_byte` and `status_byte`:
   - `RESERVATION CONFLICT (0x18)` → `SUCCESS` → immediate completion, no retry
   - `NOT READY / becoming ready` → `NEEDS_RETRY` → `scsi_queue_insert()` → back to blk-mq
-  - `NOT READY / offline` → `FAILED` → EH → eventually `DID_NO_CONNECT`
-  - `DID_TRANSPORT_FAILFAST` → `BLK_STS_TRANSPORT` → dm-multipath permanent path failure
-- `scsi_queue_insert()` puts failed commands back into blk-mq — this is what feeds the
-  dm-multipath retry loop and ultimately the `no_path_retry=queue` hang.
-- `scsi_result_to_blk_status()` converts SCSI result codes to blk-mq status seen by dm-multipath.
+  - `NOT READY / OFFLINE (ASCQ=0x12)` → `SUCCESS` → propagate, no retry
+  - `DID_TRANSPORT_FAILFAST` → always `SUCCESS` (no retry on FAILFAST) → `BLK_STS_TRANSPORT`
+- `scsi_queue_insert()` puts retry-able commands back into blk-mq — this is what feeds the
+  dm-multipath retry loop and ultimately the `no_path_retry=queue` hang when EH eventually
+  exhausts.
+- `scsi_result_to_blk_status()` converts SCSI result codes to blk_status_t. Modern kernels map
+  reservation conflict to `BLK_STS_RESV_CONFLICT` (not `BLK_STS_IOERR`), and `blk_path_error()`
+  returns false for it — dm-multipath does not fail paths on reservation conflict.
 - `DID_TRANSPORT_FAILFAST` is the key status for clean path failure notification to dm-multipath.
 
 ---

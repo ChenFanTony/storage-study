@@ -3,6 +3,7 @@
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `drivers/scsi/scsi_error.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
@@ -19,11 +20,11 @@ between a TCP session drop and a path failure visible to dm-multipath.
 ## The EH kthread — `drivers/scsi/scsi_error.c`
 
 ```c
+/* Simplified — see drivers/scsi/scsi_error.c for the actual implementation. */
 int scsi_error_handler(void *data)
 {
     struct Scsi_Host *shost = data;
 
-    current->flags |= PF_NOFREEZE; /* don't freeze during suspend */
     set_user_nice(current, -2);    /* slightly elevated priority */
 
     for (;;) {
@@ -31,30 +32,31 @@ int scsi_error_handler(void *data)
          * Sleep until woken by scsi_eh_wakeup().
          * Wakeup sources:
          *   1. scsi_times_out()     — command timer expired
-         *   2. iscsi_conn_failure() — session/connection dropped
+         *   2. iscsi_conn_failure() — session/connection dropped (via scsi_target_block)
          *   3. scsi_abort_command() — explicit EH request
          */
-        wait_event_interruptible(shost->host_wait,
-            (shost->host_failed != shost->host_busy &&
-             shost->host_busy == shost->host_blocked) ||
-            (shost->eh_deadline != -1 &&
-             time_before_eq(shost->last_reset + shost->eh_deadline * HZ,
-                            jiffies)) ||
-            kthread_should_stop());
+        wait_event_freezable(shost->host_wait,
+            scsi_eh_should_run(shost) || kthread_should_stop());
 
         if (kthread_should_stop())
             break;
 
-        scsi_eh_handler(shost);
+        /*
+         * Drain failed commands and try recovery.
+         * The actual entry function in upstream is scsi_unjam_host()
+         * which orchestrates the abort/reset escalation ladder below.
+         */
+        scsi_unjam_host(shost);
     }
 
     return 0;
 }
 ```
 
-`shost->host_failed` counts commands that have been added to EH via `scsi_eh_scmd_add()`.
+`shost->host_failed` counts commands added to EH via `scsi_eh_scmd_add()`.
 `shost->host_busy` counts commands currently dispatched. EH wakes when failed commands exist and
-the host is not processing new ones.
+the host is not processing new ones (the exact condition is checked by helpers like
+`scsi_eh_should_run()` / `scsi_host_eh_past_deadline()` in current source).
 
 ---
 
@@ -73,15 +75,17 @@ void scsi_eh_wakeup(struct Scsi_Host *shost, unsigned int busy)
 }
 ```
 
-For iSCSI, `iscsi_conn_failure()` calls `scsi_report_bus_reset()` or directly sets device state
-to `SDEV_TRANSPORT_OFFLINE` and calls `scsi_eh_wakeup()` to trigger EH.
+For iSCSI, `iscsi_conn_failure()` calls `iscsi_suspend_tx()` which calls `scsi_target_block()`
+which transitions devices toward `SDEV_TRANSPORT_OFFLINE` and indirectly wakes EH for any
+in-flight commands that need to be unblocked or aborted.
 
 ---
 
-## scsi_eh_handler — the recovery sequence
+## scsi_unjam_host — the recovery sequence
 
 ```c
-static void scsi_eh_handler(struct Scsi_Host *shost)
+/* Simplified — see scsi_error.c. */
+void scsi_unjam_host(struct Scsi_Host *shost)
 {
     LIST_HEAD(eh_work_q);
     LIST_HEAD(eh_done_q);
@@ -131,7 +135,7 @@ static void scsi_eh_ready_devs(struct Scsi_Host *shost,
 ## Level 1: abort — scsi_try_to_abort_cmd
 
 ```c
-static enum scsi_eh_timer_return scsi_try_to_abort_cmd(
+static enum scsi_disposition scsi_try_to_abort_cmd(
     struct scsi_host_template *hostt,
     struct scsi_cmnd *scmd)
 {
@@ -145,6 +149,9 @@ static enum scsi_eh_timer_return scsi_try_to_abort_cmd(
 For iSCSI, `eh_abort_handler = iscsi_eh_abort()` in `drivers/scsi/libiscsi.c`:
 
 ```c
+/* Simplified — illustrative of the structure. The actual function uses
+ * scsi_cmd_priv(sc) (or per-LLD helpers) to recover the iscsi_task,
+ * not the legacy sc->SCp pointer that was removed in v6.2. */
 int iscsi_eh_abort(struct scsi_cmnd *sc)
 {
     struct iscsi_cls_session *cls_session =
@@ -171,9 +178,10 @@ int iscsi_eh_abort(struct scsi_cmnd *sc)
 
     /*
      * Find the iscsi_task for this scsi_cmnd.
-     * sc->SCp.ptr was set to the iscsi_task in iscsi_alloc_task().
+     * Modern libiscsi stores the task pointer in the per-command
+     * private area (scsi_cmd_priv()), set up via Scsi_Host_Template.cmd_size.
      */
-    task = (struct iscsi_task *)sc->SCp.ptr;
+    task = iscsi_cmd(sc)->task;
     if (!task || !task->sc) {
         /* task already completed normally — race with completion */
         spin_unlock_bh(&session->frwd_lock);
@@ -244,6 +252,7 @@ int iscsi_eh_recover_target(struct scsi_cmnd *sc)
     struct iscsi_cls_session *cls_session =
         starget_to_session(scsi_target(sc->device));
     struct iscsi_session *session = cls_session->dd_data;
+    struct iscsi_conn *conn;
     int rc;
 
     mutex_lock(&session->eh_mutex);
@@ -253,18 +262,20 @@ int iscsi_eh_recover_target(struct scsi_cmnd *sc)
      * If session is not logged in, drop and reconnect the session.
      * This effectively performs a target reset from the iSCSI perspective.
      */
-    if (session->state == ISCSI_STATE_LOGGED_IN)
-        rc = iscsi_exec_task_mgmt_fn(session->leadconn,
+    if (session->state == ISCSI_STATE_LOGGED_IN) {
+        conn = session->leadconn;
+        rc = iscsi_exec_task_mgmt_fn(conn,
                                       ISCSI_TM_FUNC_TARGET_WARM_RESET,
                                       session->age, 0);
-    else
+    } else {
         rc = FAILED;
+    }
 
     if (rc == FAILED) {
         /*
          * Session is broken — drop and reconnect.
          * This triggers iscsi_conn_failure() → session reconnect.
-         * Replacement_timeout starts counting from here.
+         * replacement_timeout starts counting from the userspace-pushed value.
          */
         iscsi_conn_failure(session->leadconn, ISCSI_ERR_CONN_FAILED);
         rc = SUCCESS; /* signal EH that we handled it */
@@ -282,7 +293,8 @@ int iscsi_eh_recover_target(struct scsi_cmnd *sc)
 ```c
 /*
  * shost->eh_deadline: maximum seconds to attempt EH before giving up.
- * Default: -1 (unlimited — EH may run forever if target stays unreachable).
+ * Default: -1 (unlimited — EH may run as long as the iSCSI session
+ * recovery code lets it).
  *
  * Set via sysfs: echo 30 > /sys/class/scsi_host/hostN/eh_deadline
  */
@@ -297,14 +309,17 @@ static bool scsi_host_eh_past_deadline(struct Scsi_Host *shost)
 }
 ```
 
-With `eh_deadline = -1` (default) and `replacement_timeout = 120s`:
-1. Session drops at T=0
-2. `iscsi_conn_failure()` sets `SDEV_TRANSPORT_OFFLINE`, wakes EH
-3. EH tries abort → LUN reset → target reset → all fail (session is gone)
-4. EH sleeps waiting for session to come back
-5. At T=120s, `replacement_timeout` fires → `iscsi_session_recovery_timedout()`
-6. Session declared dead → all commands get `DID_TRANSPORT_FAILFAST`
-7. dm-multipath sees `BLK_STS_TRANSPORT` → `fail_path()` → path marked failed
+With `eh_deadline = -1` (default), the practical bound on EH time for iSCSI is
+`replacement_timeout` (typically 120s, pushed from open-iscsi userspace via sysfs at session
+creation — it is not a kernel-side default constant). The interaction:
+
+1. Session drops at T=0.
+2. `iscsi_conn_failure()` blocks the SCSI target devices, wakes EH for in-flight commands.
+3. EH tries abort → LUN reset → target reset — all fail because the session is gone.
+4. Commands sit in the "blocked" state while iscsid attempts to reconnect.
+5. At T = `replacement_timeout`, `iscsi_session_recovery_timedout()` fires →
+   `ISCSI_STATE_RECOVERY_FAILED` → all held commands get `DID_TRANSPORT_FAILFAST`.
+6. dm-multipath sees `BLK_STS_TRANSPORT` → `fail_path()` → path marked failed.
 
 ---
 
@@ -313,10 +328,10 @@ With `eh_deadline = -1` (default) and `replacement_timeout = 120s`:
 ```c
 static bool scsi_noretry_cmd(struct scsi_cmnd *scmd)
 {
+    struct request *req = scsi_cmd_to_rq(scmd);
+
     /* commands from callers that set FAILFAST flags skip retry */
-    if ((scmd->request->cmd_flags & REQ_FAILFAST_DEV) ||
-        (scmd->request->cmd_flags & REQ_FAILFAST_TRANSPORT) ||
-        (scmd->request->cmd_flags & REQ_FAILFAST_DRIVER))
+    if (req->cmd_flags & REQ_FAILFAST_MASK)
         return true;
 
     /* RESERVATION CONFLICT — explicitly listed as non-retryable */
@@ -327,9 +342,10 @@ static bool scsi_noretry_cmd(struct scsi_cmnd *scmd)
 }
 ```
 
-Note that this is checked for NORMAL I/O paths too. If a READ or WRITE lands on a PR-protected
+Note that this is checked for normal I/O paths too. If a READ or WRITE lands on a PR-protected
 LUN, it gets `RESERVATION CONFLICT`, `scsi_noretry_cmd()` returns true, and the command completes
-with the error immediately — no EH, no LUN reset triggered.
+with the error immediately — no EH, no LUN reset triggered. (And in modern kernels the result
+flows up as `BLK_STS_RESV_CONFLICT`, which `blk_path_error()` does not treat as a path failure.)
 
 ---
 
@@ -350,8 +366,9 @@ static void scsi_eh_flush_done_q(struct list_head *done_q)
             scsi_queue_insert(scmd, SCSI_MLQUEUE_EH_RETRY);
         } else {
             /*
-             * Cannot recover. Complete with DID_NO_CONNECT.
-             * blk-mq sees BLK_STS_IOERR.
+             * Cannot recover. Complete with DID_NO_CONNECT (or whatever
+             * host_byte was already set by the transport).
+             * blk-mq sees BLK_STS_IOERR (or BLK_STS_TRANSPORT for FAILFAST).
              * dm-multipath sees path failure via multipath_end_io().
              */
             if (!scmd->result)
@@ -362,7 +379,7 @@ static void scsi_eh_flush_done_q(struct list_head *done_q)
 }
 ```
 
-`scsi_finish_command(scmd)` calls `scmd->scsi_done(scmd)` → `scsi_io_completion()` →
+`scsi_finish_command(scmd)` calls `scsi_io_completion()` →
 `blk_mq_complete_request()` → dm-multipath's `multipath_end_io()` → `fail_path()`.
 
 ---
@@ -373,13 +390,14 @@ static void scsi_eh_flush_done_q(struct list_head *done_q)
 - Escalation: abort → LUN reset → target reset → bus reset → offline device.
 - For iSCSI: abort sends ABORT TASK TMF; LUN reset sends LOGICAL_UNIT_RESET TMF; target reset
   drops and reconnects the session.
-- `eh_deadline = -1` (default) means EH may run forever if the target stays unreachable.
-- `replacement_timeout` (default 120s) bounds how long libiscsi waits for reconnect. After timeout,
-  `DID_TRANSPORT_FAILFAST` is set and dm-multipath permanently fails the path.
+- `eh_deadline = -1` (default) means EH itself has no timeout; the practical bound is
+  `replacement_timeout`, which is pushed to the kernel from open-iscsi userspace (typically 120s).
 - `RESERVATION CONFLICT` is in `scsi_noretry_cmd()` — it NEVER enters EH, even for normal I/O.
 - EH unrecoverable commands get `DID_NO_CONNECT` → `BLK_STS_IOERR` → dm-multipath `fail_path()`.
-- Chain: session drop → `iscsi_conn_failure()` → EH wakes → EH exhausted → `DID_NO_CONNECT` →
-  `fail_path()` → `nr_valid_paths=0` → `no_path_retry=queue` takes effect.
+- Modern libiscsi stores the per-command iscsi_task in the SCSI command's private area
+  (`scsi_cmd_priv(sc)`), not in the legacy `sc->SCp.ptr` field which was removed in v6.2.
+- Chain: session drop → `iscsi_conn_failure()` → EH wakes → recovery timeout → DID_TRANSPORT_FAILFAST
+  → `fail_path()` → `nr_valid_paths=0` → `no_path_retry=queue` takes effect.
 
 ---
 

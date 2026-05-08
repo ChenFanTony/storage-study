@@ -1,17 +1,19 @@
 # Day 10 — iscsi_tcp TX path
 
-**Week 2**: iSCSI Initiator Kernel Code
-**Time**: 1–2 hours
+**Week 2**: iSCSI Initiator Kernel Code  
+**Time**: 1–2 hours  
 **Reference**: `drivers/scsi/iscsi_tcp.c`, `drivers/scsi/libiscsi_tcp.c`
+**Targets**: Linux mainline, mid-2025. Code shown is illustrative pseudocode unless explicitly noted.
 
 ---
 
 ## Overview
 
 The TX path converts an `iscsi_task` (with its BHS and SGL) into bytes on a TCP socket. It runs
-in a dedicated kthread per connection. The key challenge is that a single iSCSI PDU may span many
-TCP segments (MSS ~64 KB typically), and the TX must be restartable — if the socket send buffer
-is full, the kthread must save state and resume exactly where it left off on the next wakeup.
+as a workqueue handler — `iscsi_xmitworker` — scheduled per connection. The key challenge is that
+a single iSCSI PDU may span many TCP segments (MSS ~1.5 KB on Ethernet), and the TX must be
+restartable — if the socket send buffer is full, the worker must save state and resume exactly
+where it left off on the next wakeup.
 
 ---
 
@@ -20,17 +22,17 @@ is full, the kthread must save state and resume exactly where it left off on the
 ```
 libiscsi (transport-agnostic)        iscsi_tcp (TCP-specific)
 ─────────────────────────────        ────────────────────────
-iscsi_conn_send_pdu()           →    iscsi_sw_tcp_send_hdr()
-iscsi_tcp_task_xmit()           →    iscsi_sw_tcp_xmit_segment()
-iscsi_segment_seek_sg()              kernel_sendmsg() / kernel_sendpage()
+iscsi_xmitworker (work_struct)  →    iscsi_sw_tcp_xmit_segment()
+iscsi_tcp_task_xmit()           →    sock_sendmsg() / iov_iter
+iscsi_segment_seek_sg()              kernel_sendmsg()
 ```
 
 `libiscsi_tcp.c` contains transport-agnostic TCP framing logic (segment management, SGL walking).
-`iscsi_tcp.c` contains the socket-specific send/receive calls and the TX/RX kthreads.
+`iscsi_tcp.c` contains the socket-specific send/receive calls and the TX/RX work items.
 
 ---
 
-## struct iscsi_tcp_conn — `drivers/scsi/iscsi_tcp.c`
+## struct iscsi_tcp_conn — `drivers/scsi/iscsi_tcp.h`
 
 The LLD-private data for a connection (stored in `conn->dd_data`):
 
@@ -48,7 +50,7 @@ struct iscsi_tcp_conn {
 
     /* recv buffer for BHS */
     struct iscsi_hdr        hdr;          /* staged BHS buffer */
-    char                    hdrext[4*ISCSI_ECRC_LEN]; /* AHS + digest */
+    char                    hdrext[4*ISCSI_DIGEST_SIZE]; /* AHS + digest */
 
     /* socket callbacks (saved originals) */
     void                    (*old_write_space)(struct sock *);
@@ -75,62 +77,30 @@ struct iscsi_segment {
      * For data segments: instead of a flat buffer, segment may walk an SGL.
      * sg/sg_offset track position in the scsi_cmnd's bio_vec list.
      */
-    struct scatterlist      *sg;          /* current SGL entry */
-    unsigned int            sg_offset;   /* offset within current sg entry */
-    unsigned int            sg_mapped;   /* bytes mapped from current sg */
+    struct scatterlist      *sg;
+    void                    *sg_mapped;
+    unsigned int            sg_offset;
 
     /* digest (CRC32C if DataDigest=CRC32C) */
-    struct hash_desc        *hash;
-    unsigned char           recv_digest[ISCSI_DIGEST_SIZE]; /* received digest */
-    unsigned char           digest[ISCSI_DIGEST_SIZE];      /* computed digest */
-    bool                    digest_len;   /* digest present? */
+    struct ahash_request    *hash;
+    unsigned char           recv_digest[ISCSI_DIGEST_SIZE];
+    unsigned char           digest[ISCSI_DIGEST_SIZE];
+    unsigned int            digest_len;
 };
 ```
 
-`copied` is the restart point. If `kernel_sendmsg()` sends only part of the segment (socket send
-buffer full), the TX kthread saves `copied` and resumes from there on next wakeup.
+`copied` is the restart point. If the socket send returns a partial result, the TX worker saves
+`copied` and resumes from there on next wakeup.
 
 ---
 
-## TX kthread — `drivers/scsi/iscsi_tcp.c`
+## TX worker — `drivers/scsi/iscsi_tcp.c`
+
+The TX side runs as a `work_struct` handler scheduled via `iscsi_conn_queue_work()`.
+There is no dedicated kthread per connection in modern libiscsi.
 
 ```c
-static int iscsi_sw_tcp_pdu_xmit(struct iscsi_task *task)
-{
-    struct iscsi_conn *conn = task->conn;
-    unsigned int noreclaim_flag;
-    struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-    int rc = 0;
-
-    noreclaim_flag = memalloc_noreclaim_save();
-
-    /*
-     * Send the PDU header (BHS + optional AHS).
-     * This is always first — target cannot process data without header.
-     */
-    while (!iscsi_tcp_xmit_queuelen(conn)) {
-        rc = iscsi_sw_tcp_xmit_segment(tcp_conn, &tcp_conn->out);
-        if (rc < 0)
-            goto done;
-
-        if (rc > 0) {
-            /* partial send — socket full, stop and retry on next wakeup */
-            rc = -EAGAIN;
-            goto done;
-        }
-        /* rc = 0: segment fully sent, move to next */
-        break;
-    }
-
-done:
-    memalloc_noreclaim_restore(noreclaim_flag);
-    return rc;
-}
-```
-
-The TX kthread loop in `iscsi_xmitworker()`:
-
-```c
+/* Simplified — see drivers/scsi/iscsi_tcp.c / libiscsi.c. */
 static void iscsi_xmitworker(struct work_struct *work)
 {
     struct iscsi_conn *conn =
@@ -141,7 +111,7 @@ static void iscsi_xmitworker(struct work_struct *work)
     /*
      * Drain in priority order:
      *   1. mgmtqueue (NOP-Out, TMF, Logout)
-     *   2. requeue   (commands being retried)
+     *   2. requeue   (commands being retried / partial sends)
      *   3. cmdqueue  (normal SCSI commands)
      */
     for (;;) {
@@ -205,8 +175,7 @@ out:
 ## iscsi_xmit_task — sending one task's PDUs — `drivers/scsi/libiscsi.c`
 
 ```c
-static int iscsi_xmit_task(struct iscsi_conn *conn,
-                             struct iscsi_task *task, bool was_requeued)
+static int iscsi_xmit_task(struct iscsi_conn *conn, struct iscsi_task *task)
 {
     int rc;
 
@@ -238,28 +207,27 @@ static int iscsi_xmit_task(struct iscsi_conn *conn,
 }
 ```
 
-For `iscsi_tcp`, `tt->xmit_task` = `iscsi_tcp_task_xmit()`:
+For `iscsi_tcp`, `tt->xmit_task` ultimately runs the three-phase send:
 
 ```c
+/* Simplified phase outline — actual upstream code uses iov_iter and
+ * sock_sendmsg, with state machines that resume mid-segment. */
 static int iscsi_tcp_task_xmit(struct iscsi_task *task)
 {
     struct iscsi_conn *conn = task->conn;
-    struct iscsi_tcp_task *tcp_task = task->dd_data;
     int rc = 0;
 
     /*
      * Three phases per task:
-     *   Phase 1: Send the PDU header (BHS)
+     *   Phase 1: Send the PDU header (BHS + optional AHS + optional HeaderDigest)
      *   Phase 2: Send immediate data (if any — piggybacked in Command PDU)
      *   Phase 3: Send unsolicited Data-Out PDUs (if InitialR2T=No)
      */
 
     /* Phase 1: BHS */
-    if (task->hdr_len) {
-        rc = iscsi_tcp_send_hdr(conn, task);
-        if (rc)
-            return rc;
-    }
+    rc = iscsi_tcp_send_hdr(conn, task);
+    if (rc)
+        return rc;
 
     /* Phase 2: immediate data in Command PDU data segment */
     if (task->imm_count) {
@@ -283,36 +251,38 @@ static int iscsi_tcp_task_xmit(struct iscsi_task *task)
 
 ## iscsi_sw_tcp_xmit_segment — `drivers/scsi/iscsi_tcp.c`
 
-The lowest-level send function. Writes bytes from a `iscsi_segment` into the TCP socket.
+The lowest-level send function. Writes bytes from an `iscsi_segment` into the TCP socket using
+`sock_sendmsg()` with an iov_iter built from the SGL.
 
 ```c
+/* Simplified — see iscsi_tcp.c for the real iov_iter setup and digest
+ * computation. Older code used kernel_sendpage; modern code builds a
+ * BVEC iov_iter and calls sock_sendmsg. */
 static int iscsi_sw_tcp_xmit_segment(struct iscsi_tcp_conn *tcp_conn,
                                       struct iscsi_segment *segment)
 {
-    unsigned int copied = 0;
-    int r = 0;
+    struct socket *sock = tcp_conn->sock;
+    int r;
 
-    while (!iscsi_tcp_segment_done(segment, 0, r)) {
+    while (!iscsi_tcp_segment_done(tcp_conn, segment, 0, r)) {
         struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
         struct kvec iov;
+        unsigned int len;
 
-        /* get a slice of the current segment to send */
         iscsi_tcp_segment_map(segment, 0);
 
-        iov.iov_base = segment->sg_mapped + segment->sg_offset;
-        iov.iov_len  = min(segment->size - segment->copied,
-                           segment->sg_mapped - segment->sg_offset);
+        iov.iov_base = segment->data + segment->copied;
+        iov.iov_len  = segment->size - segment->copied;
+        len          = iov.iov_len;
 
         /*
-         * kernel_sendmsg() writes to the TCP socket.
-         * May return less than requested if socket send buffer is full.
+         * sock_sendmsg() / kernel_sendmsg() writes to the TCP socket.
          * MSG_DONTWAIT: non-blocking — returns -EAGAIN if would block.
          */
-        r = kernel_sendmsg(tcp_conn->sock, &msg, &iov, 1, iov.iov_len);
+        r = kernel_sendmsg(sock, &msg, &iov, 1, len);
 
         if (r > 0) {
             segment->copied += r;
-            copied += r;
         } else if (r == -EAGAIN) {
             /* socket full — stop, save state, return partial */
             return 1;  /* caller will requeue task */
@@ -330,12 +300,15 @@ static int iscsi_sw_tcp_xmit_segment(struct iscsi_tcp_conn *tcp_conn,
 `segment->sg` and `segment->sg_offset` to point to the next piece of the SGL. This is how the
 TX path walks the bio_vec SGL from the `scsi_cmnd` without copying data.
 
+When data digest is enabled, an additional 4-byte CRC32C trailer is computed over the data
+segment and sent after it; the digest is computed during the same SGL walk.
+
 ---
 
 ## write_space callback — restart after socket-full
 
-When `kernel_sendmsg()` returns `-EAGAIN`, the TX kthread puts the task back on `conn->requeue`
-and stops. It restarts when the socket's send buffer drains:
+When the socket send returns `-EAGAIN`, the TX worker puts the task back on `conn->requeue` and
+stops. It restarts when the socket's send buffer drains:
 
 ```c
 static void iscsi_write_space(struct sock *sk)
@@ -346,15 +319,13 @@ static void iscsi_write_space(struct sock *sk)
     /* call original write_space first (wakes select/poll waiters) */
     tcp_conn->old_write_space(sk);
 
-    ISCSI_DBG_TCP(conn, "iscsi_write_space\n");
-
     /* re-schedule the TX worker — socket has space again */
-    iscsi_conn_queue_xmit(conn);
+    iscsi_conn_queue_work(conn);
 }
 ```
 
 This callback is registered on the socket via `sk->sk_write_space = iscsi_write_space` during
-`iscsi_conn_set_callbacks()`. It ensures the TX kthread resumes exactly when socket space is
+`iscsi_conn_set_callbacks()`. It ensures the TX worker resumes exactly when socket space is
 available — no polling, no spinning.
 
 ---
@@ -369,12 +340,12 @@ Wire order:
 [SCSI Command PDU]                  48-byte BHS
   opcode=0x01, W=1, F=1
   data_length=1MB, CDB=WRITE(16)
-  ITT=0x01000042, CmdSN=100
+  ITT (built from session age + index), CmdSN=N
   DataSegmentLength = 0 (no immediate data if ImmediateData=No)
 
 [Data-Out PDU #0]                   48-byte BHS + 256KB data
   opcode=0x05
-  ITT=0x01000042 (same ITT, links to command)
+  ITT (same as Command PDU, links to command)
   TargetTransferTag = TTT from R2T (if solicited)
   DataSN=0
   BufferOffset=0
@@ -396,19 +367,20 @@ Wire order:
 ```
 
 The `F=1` on the last Data-Out PDU is what the target's `iscsit_decide_dataout_action()` watches
-for, together with `write_data_done == data_length`, to call `target_submit_cmd()` (day 18).
+for, together with `write_data_done == data_length`, to call `target_execute_cmd()` (day 18).
 
 ---
 
 ## Key takeaways
 
-- TX runs in a dedicated kthread per connection (`iscsi_xmitworker`), dispatched as a work item.
+- TX runs as a workqueue handler (`iscsi_xmitworker`), not a kthread per connection.
 - Queue priority: mgmtqueue (NOP/TMF) → requeue (partial) → cmdqueue (new commands).
 - `iscsi_tcp_task_xmit()` sends in three phases: BHS → immediate data → unsolicited Data-Out.
 - `iscsi_sw_tcp_xmit_segment()` calls `kernel_sendmsg()` which may return partial writes.
   On partial: save state via `segment->copied`, return `-EAGAIN`, put task on requeue.
 - `write_space` socket callback re-schedules the TX worker when socket buffer drains.
-- The SGL (`bio_vec` from `scsi_cmnd->sdb`) is walked directly — no data copying.
+- The SGL (`bio_vec` from `scsi_cmnd->sdb`) is walked directly — no data copying for the bulk
+  data path. (HeaderDigest / DataDigest CRC32C computation reads the same pages.)
 - `F=1` in the last Data-Out PDU BHS is the signal the target uses to know all data arrived.
 - `DataSegmentLength` is bounded by `min(MaxXmitDataSegmentLength, remaining_data)`.
 
