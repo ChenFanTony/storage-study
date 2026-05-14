@@ -137,13 +137,14 @@ Waste data enters bcache:
 **bcache sequential cutoff:**
 ```bash
 # bcache has a built-in protection: sequential I/O bypass
-# Sequential reads above this threshold bypass the SSD cache
+# Sequential reads ABOVE this threshold bypass the SSD cache.
+# i.e. cutoff = 4MB means I/O streams longer than 4MB will bypass.
 cat /sys/block/bcache0/bcache/sequential_cutoff
 # default: 4MB
 
-# This means: large sequential reads don't pollute the cache
-# But if your workload has many medium-size sequential reads < 4MB
-# they will still enter the cache
+# This means: large sequential reads don't pollute the cache.
+# But if your workload has many medium-size sequential reads SMALLER
+# than the cutoff, they will still enter the cache.
 ```
 
 **dm-cache equivalent protection:**
@@ -260,7 +261,7 @@ void page_cache_async_ra(struct readahead_control *ractl,
 3. `sequential_cutoff` bypasses the SSD cache for I/O sequences longer than the threshold (default 4MB). Prevents large sequential scans from evicting random-access hot data.
 4. `0` or as low as possible. Random workload has no benefit from read-ahead, only cache pollution.
 5. The async trigger is set at a fraction of the current window. When the app reaches that page, the next window is submitted async (no stall). It exists to overlap storage I/O with application consumption, hiding latency.
-6. Raise bcache `sequential_cutoff` below your scan I/O size — sequential reads above cutoff bypass the SSD entirely. Alternatively, use `fadvise(POSIX_FADV_NOREUSE)` to hint the page cache to not retain these pages, combined with bcache sequential bypass.
+6. Set bcache `sequential_cutoff` to a value **smaller than** your scan I/O size — sequential streams above the cutoff bypass the SSD entirely. (If your scans are 8MB reads and cutoff is 4MB, they bypass. If your scans are 1MB reads, you need to lower cutoff below 1MB to make them bypass.) Alternatively, use `fadvise(POSIX_FADV_NOREUSE)` to hint the page cache not to retain these pages, combined with bcache sequential bypass.
 
 ---
 

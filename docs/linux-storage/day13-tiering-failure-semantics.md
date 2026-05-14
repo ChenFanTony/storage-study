@@ -94,7 +94,7 @@ The journal only needs to restore metadata consistency, not data.
 
 ---
 
-## 3. Failure Injection Lab
+## 3. Failure Injection Lab — bcache
 
 ```bash
 # Setup: loopback devices for safe testing
@@ -110,6 +110,7 @@ sleep 2
 
 BCACHE=/dev/bcache0
 mkfs.ext4 $BCACHE
+mkdir -p /mnt/test
 mount $BCACHE /mnt/test
 ```
 
@@ -123,8 +124,10 @@ echo writethrough > /sys/block/bcache0/bcache/cache_mode
 dd if=/dev/urandom of=/mnt/test/data_wt bs=1M count=128 && sync
 md5sum /mnt/test/data_wt > /tmp/wt_expected.md5
 
-# "Kill" the cache device (simulate failure via loopback detach)
+# Stop bcache cleanly first (releases the cache loopback), then "kill" the
+# cache device (loopback detach simulates the SSD vanishing).
 umount /mnt/test
+echo 1 > /sys/block/bcache0/bcache/stop 2>/dev/null || true
 losetup -d $CACHE   # detach cache loopback (simulates device gone)
 
 # Can we still access via HDD directly?
@@ -155,14 +158,14 @@ echo "Dirty data on SSD: $DIRTY"
 
 md5sum /mnt/test/data_wb > /tmp/wb_expected.md5
 
-# "Kill" cache — abandon dirty data
+# Force-abandon dirty data: detach immediately, then drop the cache device
 umount -l /mnt/test
 echo 1 > /sys/block/bcache0/bcache/detach 2>/dev/null || true
 losetup -d $CACHE
 
 # Try to access via HDD
 mount $ORIGIN /mnt/test 2>/dev/null || echo "Mount failed (expected — fs inconsistent)"
-# If mounts: check if data is correct
+# If it mounts: check if data is correct
 md5sum -c /tmp/wb_expected.md5 2>/dev/null && echo "Data intact" \
     || echo "WRITEBACK: Data loss confirmed — dirty data was on SSD"
 
@@ -181,36 +184,40 @@ dd if=/dev/zero of=/tmp/thin_meta.img bs=1M count=64
 DATA=$(losetup --find --show /tmp/thin_data.img)
 META=$(losetup --find --show /tmp/thin_meta.img)
 
-# Create thin pool (manual dmsetup)
-DATA_SIZE=$(blockdev --getsz $DATA)
-echo "0 $DATA_SIZE thin-pool $META $DATA 128 0" \
-    | dmsetup create test_pool
+# Make sure the metadata superblock area is zeroed (lets the kernel format it)
+dd if=/dev/zero of=$META bs=4096 count=1
 
-# Create thin LV (device id 1, 1GB)
-echo "0 2097152 thin /dev/mapper/test_pool 1" \
-    | dmsetup create thin_lv1
+# Create thin pool: table "<start> <length> thin-pool <meta> <data> <block_sectors> <low_water>"
+DATA_SIZE=$(blockdev --getsz $DATA)
+dmsetup create test_pool --table "0 $DATA_SIZE thin-pool $META $DATA 128 0"
+
+# Allocate dev-id 1 in the pool, then activate it (1GB virtual size).
+dmsetup message /dev/mapper/test_pool 0 "create_thin 1"
+dmsetup create thin_lv1 --table "0 2097152 thin /dev/mapper/test_pool 1"
 
 mkfs.ext4 /dev/mapper/thin_lv1
+mkdir -p /mnt/thin_test
 mount /dev/mapper/thin_lv1 /mnt/thin_test
 
 dd if=/dev/urandom of=/mnt/thin_test/testfile bs=1M count=128
 md5sum /mnt/thin_test/testfile > /tmp/thin_expected.md5
 sync
 
-# Take metadata backup NOW (before simulated failure)
+# Take metadata backup NOW (before simulated failure).
+# Pool must be inactive for thin_dump.
 umount /mnt/thin_test
 dmsetup remove thin_lv1
 dmsetup remove test_pool
 thin_dump $META > /tmp/meta_backup.xml
 thin_check $META && echo "Metadata clean before failure"
 
-# Simulate metadata corruption
+# Simulate metadata corruption (overwrite a btree node area)
 dd if=/dev/urandom of=$META bs=4096 count=1 seek=2 conv=notrunc
 echo "Metadata corrupted"
 
 # Attempt to start pool with corrupt metadata
-echo "0 $DATA_SIZE thin-pool $META $DATA 128 0" \
-    | dmsetup create test_pool 2>&1 && echo "Pool started (may have errors)" \
+dmsetup create test_pool --table "0 $DATA_SIZE thin-pool $META $DATA 128 0" 2>&1 \
+    && echo "Pool started (may have errors)" \
     || echo "Pool failed to start (expected)"
 
 # Repair using backup
@@ -218,11 +225,11 @@ dmsetup remove test_pool 2>/dev/null; true
 thin_restore -i /tmp/meta_backup.xml -o $META
 thin_check $META && echo "Metadata restored"
 
-# Restart pool
-echo "0 $DATA_SIZE thin-pool $META $DATA 128 0" \
-    | dmsetup create test_pool
-echo "0 2097152 thin /dev/mapper/test_pool 1" \
-    | dmsetup create thin_lv1
+# Restart pool — same two-step LV activation as before
+dmsetup create test_pool --table "0 $DATA_SIZE thin-pool $META $DATA 128 0"
+# Note: create_thin is NOT needed again — the dev-id is already recorded in
+# the restored metadata; we just need to re-activate the thin target.
+dmsetup create thin_lv1 --table "0 2097152 thin /dev/mapper/test_pool 1"
 
 mount /dev/mapper/thin_lv1 /mnt/thin_test
 md5sum -c /tmp/thin_expected.md5 && echo "Data recovered successfully"

@@ -78,6 +78,7 @@ Fill in the sizing rules you learned this week:
 
 **dm-thin metadata device:**
 - Sizing formula: ?
+- Hard upper limit: ?
 - Protection requirement: ?
 
 ---
@@ -281,18 +282,28 @@ COW + sequential scan competes for HDD bandwidth. Mitigation: schedule snapshot
 rotation — keep only 6 snapshots (not 24) per LV to reduce COW overhead.
 
 **4. Metadata sizing:**
-dm-thin metadata:
-- 200 VMs × 300GB / 512KB block size = 200 × ~600K blocks = 120M block mappings
-- 120M × 48 bytes = ~5.7GB minimum
-- With 24 snapshots: multiply by ~3 for snapshot overhead = ~17GB
-- Use 32GB dm-thin metadata device, RAID-1 (two small NVMe partitions)
 
-dm-cache metadata:
+*dm-thin metadata:*
+- Mapping formula: 48 bytes per allocated data block.
+- 200 VMs × 300GB / 512KB block size = 200 × ~600K blocks = ~120M block mappings
+- 120M × 48 bytes ≈ ~5.7GB minimum (assuming the full 300GB per VM gets allocated)
+- With 24 snapshots and snapshot-induced COW: roughly 2–3× this → ~12–17GB
+- **Hard limit: the dm-thin metadata format only uses up to 16GB.** Anything
+  beyond that is wasted. So provision a **16GB** metadata device — provisioning
+  32GB does not buy you more usable space.
+- If the math suggests you might exceed 16GB worth of mappings, the right move
+  is to reduce snapshot retention or increase the data block size (which
+  reduces total block count); throwing more metadata device at it does
+  not help past 16GB.
+- RAID-1 mandatory (mirror across two NVMe partitions on different devices).
+
+*dm-cache metadata:*
 - 4TB NVMe / 512KB cache block = ~8M cache blocks
-- 8M × 64 bytes (dm-cache metadata per block) = ~512MB
-- Use 2GB dm-cache metadata device (headroom), RAID-1
+- ~64 bytes per dm-cache mapping ≈ ~512MB
+- Provision a 2GB metadata device for headroom. RAID-1 mandatory.
 
-Both metadata devices: RAID-1 mandatory. Metadata loss = all LVs inaccessible.
+Metadata loss in either case takes down all dependent LVs, so the RAID-1
+requirement is non-negotiable in a production environment.
 
 **5. NVMe cache device failure recovery:**
 ```
@@ -312,7 +323,7 @@ RTO assessment:
   LVs accessible: ~3 minutes ✓
   Full performance restored: 35+ minutes (device replace + RAID rebuild) ✗
   Meets 30-minute RTO for accessibility, but NOT for performance recovery.
-  
+
 Recommendation: pre-stage a spare NVMe per node to cut replace time to <10min.
 ```
 

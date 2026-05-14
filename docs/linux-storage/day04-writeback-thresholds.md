@@ -236,12 +236,13 @@ watch -n0.5 "grep -E '^(Dirty|Writeback|NFS_Unstable):' /proc/meminfo"
 ```
 
 ```bash
-# 4. Observe flusher thread wakeups
+# 4. Observe flusher thread wakeups via the writeback tracepoint.
+# (Tracepoint is more stable across kernel versions than kprobing wb_writeback,
+#  and you don't have to chase bdi struct field names.)
 bpftrace -e '
-kprobe:wb_writeback {
-    printf("flusher wakeup: bdi=%s reason=%d\n",
-        ((struct bdi_writeback *)arg0)->bdi->dev_name,
-        ((struct wb_writeback_work *)arg1)->reason);
+tracepoint:writeback:writeback_start {
+    printf("flusher wakeup: bdi=%s reason=%s nr=%lu\n",
+        str(args->name), str(args->reason), args->nr_pages);
 }'
 ```
 
@@ -267,7 +268,7 @@ Write latency (p99):
 **Diagnosis checklist:**
 ```bash
 # Is balance_dirty_pages being called frequently?
-sar -B 1 10 | grep -E "pgpgout|pgpgout"
+sar -B 1 10
 cat /proc/vmstat | grep -E "dirty|writeback|balance"
 
 # Are flusher threads keeping up?

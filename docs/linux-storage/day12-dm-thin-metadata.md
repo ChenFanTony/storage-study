@@ -136,10 +136,14 @@ This is a single point of failure for potentially many virtual volumes.
 
 ```bash
 # How large is a metadata device?
-# Rule of thumb: 48 bytes per block mapping
+# Kernel guidance: 48 bytes per block mapping. Practical sizing formula:
+#   metadata_bytes = 48 * data_dev_size_in_bytes / data_block_size
 # Pool has 1TB data device with 64KB blocks = 1TB/64KB = ~16M blocks
 # Metadata size: 16M × 48 bytes = ~768MB
-# Add headroom: recommend 1–2GB metadata device
+# Add headroom for snapshots: recommend 1–2GB metadata device
+
+# HARD LIMIT: dm-thin will only use up to 16GB of metadata space.
+# Anything beyond that is wasted (kernel emits a warning at creation time).
 
 # LVM auto-calculates:
 lvcreate --type thin-pool -L 1T --poolmetadatasize 2G \
@@ -229,6 +233,11 @@ dm-thin uses a transactional metadata model for crash consistency:
 
 ## 8. Hands-On: Thin Pool Lab
 
+This lab walks through the manual `dmsetup` workflow. Note that activating a
+thin LV is a **two-step** process: you first send a message to the active
+pool to allocate a dev-id, then load the `thin` target table that references
+that dev-id.
+
 ```bash
 # Create thin pool on loopback (safe testing)
 dd if=/dev/zero of=/tmp/pool_data.img bs=1M count=4096    # 4GB data
@@ -237,39 +246,63 @@ dd if=/dev/zero of=/tmp/pool_meta.img bs=1M count=64      # 64MB metadata
 DATA=$(losetup --find --show /tmp/pool_data.img)
 META=$(losetup --find --show /tmp/pool_meta.img)
 
-# Initialize metadata
-thin_pool_format $META  # or use dmsetup
+# Zero the metadata device's superblock area so the kernel knows to format it.
+# (There is no `thin_pool_format` tool — zeroing the first few KB is the
+#  canonical way to ask the thin-pool target to initialize fresh metadata.)
+dd if=/dev/zero of=$META bs=4096 count=1
 
-# Create thin pool
+# Create the thin-pool target.
+# Table: <start> <length> thin-pool <meta_dev> <data_dev> <data_block_sectors> <low_water_mark>
+# data_block_sectors must be between 128 (64KB) and 2097152 (1GB).
 POOL_SIZE=$(blockdev --getsz $DATA)
-META_SIZE=$(blockdev --getsz $META)
+dmsetup create test_pool --table "0 $POOL_SIZE thin-pool $META $DATA 128 0"
 
-echo "0 $POOL_SIZE thin-pool $META $DATA 128 0" \
-    | dmsetup create test_pool
+# Allocate dev-id 1 in the pool. This adds a record to the pool's metadata;
+# only after this can you load a 'thin' table pointing at that dev-id.
+dmsetup message /dev/mapper/test_pool 0 "create_thin 1"
 
-# Create thin LV
-echo "0 $((1024*1024*2)) thin /dev/mapper/test_pool 1" \
-    | dmsetup create thin_lv1   # 1GB thin LV (but only allocates on write)
+# Activate the thin LV. Table: <start> <length> thin <pool> <dev_id>
+# Length here is the LV's virtual size in sectors (2097152 = 1GB).
+dmsetup create thin_lv1 --table "0 2097152 thin /dev/mapper/test_pool 1"
 
-# Check actual allocation
+# Check actual allocation (thin-pool status fields include used_data/total_data)
 dmsetup status test_pool
-# Shows: used_metadata_blocks/total, used_data_blocks/total
 
 # Write some data
 mkfs.ext4 /dev/mapper/thin_lv1
+mkdir -p /mnt/thin_test
 mount /dev/mapper/thin_lv1 /mnt/thin_test
 dd if=/dev/urandom of=/mnt/thin_test/file bs=1M count=100
 
 # Check how many data blocks are now allocated
 dmsetup status test_pool
+```
 
-# Create a snapshot
-echo "0 $((1024*1024*2)) thin /dev/mapper/test_pool 2 1" \
-    | dmsetup create thin_snap1  # device 2, origin device 1
+Taking an internal snapshot (a snapshot of another thin LV in the same pool):
 
-# Inspect metadata (after deactivating)
+```bash
+# Snapshots require the origin to be quiesced briefly:
+sync
+dmsetup suspend /dev/mapper/thin_lv1
+dmsetup message /dev/mapper/test_pool 0 "create_snap 2 1"   # new dev-id 2, of origin dev-id 1
+dmsetup resume /dev/mapper/thin_lv1
+
+# Activate the snapshot device.
+# NOTE: the 'thin' target table for an INTERNAL snapshot is just
+#   thin <pool> <dev_id>
+# The optional 5th argument is the external origin DEVICE PATH and applies
+# only to external snapshots (snapshots of devices outside the pool).
+dmsetup create thin_snap1 --table "0 2097152 thin /dev/mapper/test_pool 2"
+```
+
+Inspect metadata after deactivating:
+
+```bash
 umount /mnt/thin_test
-dmsetup remove thin_snap1 thin_lv1 test_pool
+dmsetup remove thin_snap1
+dmsetup remove thin_lv1
+dmsetup remove test_pool
+
 thin_dump $META | head -50
 thin_check $META && echo "Metadata clean"
 ```
@@ -289,7 +322,7 @@ thin_check $META && echo "Metadata clean"
 
 1. ALL thin LVs in the pool — the metadata device contains the virtual→physical mapping for every thin LV and snapshot in the pool. One metadata device failure takes down everything.
 2. COW (copy-on-write) is triggered when a write targets a block marked `shared=true` (shared between a thin LV and at least one snapshot). The block is copied to a new physical location before the write, preserving the snapshot's view of the original.
-3. Metadata stores only the mapping (virtual block number → physical block number), not the actual data. At ~48 bytes per mapping entry, even a 10TB pool with 64KB blocks needs only ~7.5GB of metadata.
+3. Metadata stores only the mapping (virtual block number → physical block number), not the actual data. At ~48 bytes per mapping entry, even a 10TB pool with 64KB blocks needs only ~7.5GB of metadata. Keep in mind dm-thin caps metadata usage at 16GB regardless of device size.
 4. The COW B-tree means every update writes to new blocks rather than overwriting old ones. The superblock atomically commits the new B-tree root. On crash, loading the last valid superblock gives a consistent (pre-crash) state — no separate journal needed, no corruption possible.
 5. The metadata device and data device are on the same physical spindle — a single disk failure destroys both the data and the ability to address any data that survived. Metadata should be on a separate, preferably mirrored, device. Also: if data fills up the pool, metadata updates fail, which can cause I/O errors on all thin LVs.
 6. (1) Deactivate the pool. (2) Run `thin_check` to assess damage. (3) Try `thin_repair -i <damaged> -o <new_device>` to recover what's possible. (4) Verify with `thin_check` on repaired output. (5) If repair fails, restore from last known-good `thin_dump` XML backup. (6) Accept data loss for any blocks allocated between last backup and crash.

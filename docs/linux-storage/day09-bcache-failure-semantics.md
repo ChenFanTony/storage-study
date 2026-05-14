@@ -224,7 +224,7 @@ mount $BCACHE /mnt/bcache-test
 ```
 
 ```bash
-# Experiment 1: System crash simulation (writeback mode)
+# Experiment 1: Crash-like simulation (writeback mode)
 # Step 1: Write dirty data
 dd if=/dev/urandom of=/mnt/bcache-test/testfile bs=1M count=64
 
@@ -234,10 +234,10 @@ cat /sys/block/bcache0/bcache/dirty_data
 # Step 3: Record MD5 of the file
 md5sum /mnt/bcache-test/testfile > /tmp/expected.md5
 
-# Step 4: Simulate crash (force umount without sync)
-echo 3 > /proc/sys/vm/drop_caches  # flush page cache first to make dirty real
-# In real scenario: echo b > /proc/sysrq-trigger  (DON'T do on production)
-# For safe simulation: umount without sync, then remount
+# Step 4: NOTE: this is a "soft" crash simulation — a lazy umount is not
+# a real crash. For a faithful test you'd want `echo b > /proc/sysrq-trigger`
+# (DON'T do that on a production box). The lazy-umount path here at least
+# exercises bcache's recovery on remount.
 umount -l /mnt/bcache-test
 
 # Step 5: Remount — bcache journal replays
@@ -278,7 +278,7 @@ This is the table you produce from today's study:
 | SSD hardware failure | writethrough | None | Current | Detach, mount HDD directly |
 | Power loss / crash | writeback | Uncommitted page cache writes (same as no-cache) | Stale but btree recoverable | Reboot, journal replay, bcache resumes writeback |
 | Power loss / crash | writethrough | Uncommitted page cache writes only | Current for all fsynced data | Reboot, fs journal replay only |
-| Forced detach (no flush) | writeback | All current dirty data on SSD | Stale | Detach, fsck HDD, restore |
+| Forced detach (no flush) | writeback | All current dirty data | Stale | Detach, fsck HDD, restore |
 | Graceful stop | writeback | None (flush waits for drain) | Current after flush | Normal — no data loss |
 | Backing device failure | either | In-flight I/Os | N/A — device gone | Replace HDD, rebuild from SSD dirty data (limited recovery) |
 

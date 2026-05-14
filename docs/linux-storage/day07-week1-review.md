@@ -43,9 +43,14 @@ If you can't fill in a cell, that's a gap to address.
 | HDD via bcache | mixed | | |
 | NVMe-oF (TCP) | any | | |
 
-**Hint for NVMe-oF:** fabric RTT is ~100µs vs local NVMe's ~50µs.
-To saturate a 10Gbps link with 4K I/O: bandwidth = 10Gbps / 8 / 4K = ~300K IOPS.
-Queue depth needed: IOPS × RTT = 300K × 0.0001s = 30 in-flight minimum.
+**Hint for NVMe-oF sizing (Little's Law: concurrency = throughput × latency):**
+- NVMe-oF/TCP round-trip latency is typically ~100µs end-to-end (vs ~20µs for
+  local NVMe at low queue depth — local NVMe runs from ~10µs idle to a few
+  hundred µs under heavy load).
+- To saturate a 10Gbps link with 4K I/O: throughput cap = 10Gbps / 8 / 4K
+  ≈ 312K IOPS.
+- Required in-flight concurrency: 312K × 100µs ≈ **31 in-flight requests minimum**.
+- Round up for headroom and to absorb latency jitter: target 64–128.
 
 ### Scheduler Selection
 

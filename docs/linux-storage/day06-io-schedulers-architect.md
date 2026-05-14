@@ -168,36 +168,36 @@ done
 
 ## 5. Scheduler + cgroup Interaction
 
-This is the area most architects miss. Scheduler choice affects cgroup
-I/O isolation effectiveness:
+This is the area most architects miss. Scheduler choice affects which
+cgroup v2 controllers actually do useful work:
 
 ```
 bfq + cgroup v2 io.weight:
-  → bfq respects per-cgroup weights
+  → bfq's own per-cgroup proportional sharing applies
   → I/O bandwidth proportional to weight setting
-  → isolation works well
+  → useful primarily on rotating media / SATA SSDs where bfq itself fits
+
+none/mq-deadline + cgroup v2 io.weight:
+  → on kernels >= 5.4 the blk-iocost (cost-model) controller backs io.weight
+    when bfq isn't in use. So io.weight is NOT bfq-only; it works on NVMe
+    with the `none` scheduler too, just through a different mechanism.
+  → blk-iocost requires a one-time cost-model calibration for the device
+    (`echo "<major>:<minor> ... " > /sys/fs/cgroup/io.cost.model`).
 
 none/mq-deadline + cgroup v2 io.latency:
-  → io.latency uses blk-iolatency for enforcement
+  → io.latency is enforced by blk-iolatency
   → doesn't require bfq
   → throttles cgroups that exceed latency target
-  → works on NVMe (where bfq is overkill)
+  → works well on NVMe (where bfq is overkill)
 
 none/mq-deadline + cgroup v2 io.max:
-  → hard bandwidth throttle
+  → hard bandwidth/IOPS throttle via blk-throttle
   → works regardless of scheduler
-  → lowest overhead approach
+  → lowest overhead approach, simplest semantics
 ```
 
 ```bash
-# Check cgroup I/O capabilities for your scheduler
-cat /sys/block/nvme0n1/queue/scheduler   # if "none"
-
-# io.max works regardless of scheduler
-# io.latency works regardless of scheduler (uses blk-iolatency)
-# io.weight requires bfq OR is best-effort only
-
-# Set up a test:
+# io.max example — works regardless of scheduler choice
 mkdir /sys/fs/cgroup/test-cgroup
 echo "nvme0n1 rbps=52428800 wbps=52428800" > /sys/fs/cgroup/test-cgroup/io.max
 # 50MB/s read+write limit, enforced by blk-throttle regardless of scheduler
@@ -211,7 +211,7 @@ echo "nvme0n1 rbps=52428800 wbps=52428800" > /sys/fs/cgroup/test-cgroup/io.max
 |--------|----------|---------|----------------|
 | NVMe local | single-process | single | `none` |
 | NVMe local | multi-process, latency-SLA | single | `none` + `io.latency` |
-| NVMe local | multi-tenant containers | multi | `none` + `io.max` or `io.latency` |
+| NVMe local | multi-tenant containers | multi | `none` + `io.max` or `io.latency` (or `io.weight` via blk-iocost) |
 | NVMe-oF | any | any | `none` (fabric adds latency; don't add scheduler) |
 | bcache (SSD cache) | mixed | any | `none` on SSD; `mq-deadline` on HDD backing |
 | HDD raw | sequential-heavy | single | `mq-deadline` (reduces seeks) |
@@ -255,10 +255,10 @@ overhead on top of bcache's already complex request routing.
 
 1. Averages are dominated by fast common cases, hiding the tail. p99 reveals the worst 1% of requests — what users actually experience as "slowness".
 2. Red-black tree insert/lookup per request, per-hctx lock contention, expire-list scanning. On NVMe doing 1M+ IOPS, these CPU cycles add up to measurable latency.
-3. `none` scheduler + `io.max` (hard bandwidth caps) for guaranteed isolation. Or `none` + `io.latency` for adaptive latency-based throttling. BFQ is another option but adds scheduler overhead to NVMe.
+3. `none` scheduler + `io.max` (hard bandwidth caps) for guaranteed isolation. Or `none` + `io.latency` for adaptive latency-based throttling. `none` + `io.weight` (backed by blk-iocost on 5.4+) gives proportional sharing without bfq's per-request overhead. BFQ is another option but adds scheduler overhead unsuitable for fast NVMe.
 4. bcache device: `none`. SSD: `none`. HDD: `mq-deadline` (or `bfq` if multiple processes compete for HDD bandwidth).
 5. Switch to `mq-deadline` — HDD with `none` has no seek reordering, so requests are dispatched in arrival order regardless of sector locality. `mq-deadline` will sort by sector proximity while still bounding maximum latency.
-6. `io.max`: hard bandwidth/IOPS throttle, enforced unconditionally. `io.weight`: proportional scheduling weight (best with bfq). `io.latency`: adaptive — throttles cgroups if they cause the device's average latency to exceed the target (uses blk-iolatency).
+6. `io.max`: hard bandwidth/IOPS throttle, enforced unconditionally by blk-throttle. `io.weight`: proportional scheduling weight (backed by bfq when it's the scheduler, otherwise by blk-iocost from 5.4+). `io.latency`: adaptive — throttles cgroups if they cause the device's average latency to exceed the target (uses blk-iolatency).
 
 ---
 

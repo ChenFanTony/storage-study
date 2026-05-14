@@ -76,7 +76,9 @@ fio --name=bcache --filename=/dev/bcache0 --rw=randread --bs=4k \
 
 **Architect verdict:** If your SSD cache is NVMe-class (>200K IOPS) and your
 workload is high-concurrency random I/O, bcache will be the bottleneck.
-Use dm-cache or application-level caching instead.
+Use dm-cache or application-level caching instead. These contention numbers
+are rough rules of thumb — your mileage will vary with CPU, NUMA topology,
+and workload mix; measure before committing.
 
 ---
 
@@ -127,8 +129,9 @@ echo writearound > /sys/block/bcache0/bcache/cache_mode
 
 ### When sequential_cutoff isn't enough
 
-The problem: sequential_cutoff uses a per-request heuristic. If the analytics
-job does 1MB reads (below cutoff), they all enter the cache.
+The problem: sequential_cutoff is per-I/O-stream. If the analytics
+job does 1MB reads and each is treated as an independent stream below the
+cutoff, they all enter the cache.
 
 ```bash
 # Check what I/O sizes the analytics job uses:
@@ -178,12 +181,12 @@ If you need tiered caching with ZNS:
 #   - SSD sees higher utilization than necessary
 #   - More GC pressure
 
-# Workaround: periodic cache invalidation
-echo 1 > /sys/block/bcache0/bcache/invalidate  # flush entire cache
-# (heavy operation — use during maintenance windows only)
-
-# Check if your kernel version has improved discard handling:
-grep -i discard /sys/block/bcache0/bcache/cache/*/stats_total/* 2>/dev/null
+# Workaround: periodic cache invalidation (HEAVY operation — maintenance only)
+# Note: writing to the bcache sysfs /clear_stats only resets counters; to
+# actually drop the cached data you typically stop+restart the cache set
+# or use bcache-tools' cache-invalidation procedures.
+# Check whether your kernel has improved discard handling:
+grep -ri discard /sys/block/bcache0/bcache/cache/ 2>/dev/null
 ```
 
 ---
@@ -291,9 +294,9 @@ echo 67108864 > /sys/block/bcache0/bcache/sequential_cutoff  # 64MB
 
 ## 9. Answers
 
-1. Typically ~150–200K IOPS is where btree lock contention becomes visible. Above ~300K IOPS on NVMe, bcache is rarely the right choice.
+1. There's no hard cutoff, but contention typically becomes visible somewhere around ~150–200K IOPS with concurrent writers. Above ~300K IOPS on NVMe, bcache is rarely the right choice. Measure on your specific hardware to confirm.
 2. More in-flight requests = more concurrent btree lock acquisitions = more contention. Increasing queue depth makes contention worse, not better.
-3. No — 512KB reads are below the 4MB cutoff, so they enter the SSD cache and will evict hot OLTP data. Need to raise cutoff to at least 1MB (and ideally match or exceed their read I/O size).
+3. No — 512KB reads are below the 4MB cutoff, so they enter the SSD cache and will evict hot OLTP data. Need to raise cutoff to at least 1MB (and ideally match or exceed their read I/O size — actually, the cutoff has to be *below* the size of the sequential stream as bcache detects it, but as a practical first step raise it well above the per-request size and watch the stats).
 4. ZNS requires sequential writes within each zone. bcache's btree updates and GC compaction scatter writes across the SSD address space, violating zone write constraints.
 5. bcache cannot — it supports only one SSD cache device, no mirroring. Use dm-cache on top of a dm-raid1 mirror of two SSDs, or use a hardware RAID controller for the SSD layer.
 6. Key questions: (1) What is the database's working set size vs SSD cache size? (2) Does the DB use O_DIRECT or buffered I/O? (3) What IOPS does the workload require? (4) What are the durability requirements (can we afford dirty data loss on SSD failure)? (5) Are there large sequential scans mixed with random I/O? These answers determine whether bcache is appropriate or dm-cache/app-level caching is better.

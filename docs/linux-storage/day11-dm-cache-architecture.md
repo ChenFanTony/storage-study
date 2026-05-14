@@ -186,53 +186,90 @@ dmsetup status cached
 
 ## 6. Setting Up dm-cache
 
+### Option A: Via LVM (recommended for production)
+
 ```bash
 # Setup: NVMe SSD cache + HDD origin + small SSD for metadata
-
 SSD=/dev/nvme0n1     # cache device
 HDD=/dev/sda         # origin device
 META=/dev/nvme0n2    # metadata device (small SSD, even 1GB is enough)
 
-# Step 1: Create metadata and cache volumes with LVM (recommended)
+# Step 1: Build LVM PVs and VGs
 pvcreate $SSD $META $HDD
-vgcreate vg_cache $SSD $META
-vgcreate vg_data $HDD
+vgcreate vg_data $SSD $META $HDD   # one VG containing all PVs
 
-lvcreate -L 200G -n cache_data vg_cache $SSD
-lvcreate -L 1G   -n cache_meta vg_cache $META
+# Step 2: Create the three LVs (cache data, cache meta, data origin)
+#         placing each on the right physical volume
+lvcreate -L 200G -n cache_data vg_data $SSD
+lvcreate -L 1G   -n cache_meta vg_data $META
+lvcreate -L 4T   -n data_lv    vg_data $HDD
 
-# Step 2: Create dm-cache using lvmcache
-lvconvert --type cache-pool \
-    --cachepool vg_cache/cache_data \
-    --poolmetadata vg_cache/cache_meta \
+# Step 3: Combine cache_data + cache_meta into a cache-pool LV
+lvconvert --yes --type cache-pool \
+    --poolmetadata vg_data/cache_meta \
     --cachemode writeback \
     --chunksize 64k \
+    vg_data/cache_data
+
+# Step 4: Attach the cache-pool to the origin (data_lv) to create the cache LV
+lvconvert --yes --type cache \
+    --cachepool vg_data/cache_data \
     vg_data/data_lv
 
-# Step 3: Verify
-dmsetup table vg_data-data_lv
+# Verify
+lvs -o+cache_total_blocks,cache_used_blocks,cache_dirty_blocks vg_data
 dmsetup status vg_data-data_lv
 ```
 
+(Older single-step `lvconvert --type cache-pool ... <originlv>` forms have
+existed in some LVM versions but the two-step form above matches the
+documented current LVM workflow and works reliably across distros.)
+
+### Option B: Manual dmsetup (for understanding internals)
+
+The dm-cache target string is:
+```
+cache <metadata dev> <cache dev> <origin dev> <block size>
+      <#feature args> [<feature arg>]*
+      <policy> <#policy args> [<policy arg>]*
+```
+
+Note the target is called `cache` — there is no separate "cache-pool"
+target in dm-cache (that name only exists for dm-thin).
+
 ```bash
-# Manual dm-cache setup (without LVM) for understanding internals
-
-ORIGIN_SIZE=$(blockdev --getsz $HDD)
-CACHE_SIZE=$(blockdev --getsz $SSD)
-CACHE_BLOCK=128   # sectors (64KB cache block size)
-
-# Load dm-cache and policy modules
+# Load modules
 modprobe dm-cache
 modprobe dm-cache-smq
 
-# Create cache pool
-echo "0 $CACHE_SIZE cache-pool $META $SSD $CACHE_BLOCK 0 smq 0" \
-    | dmsetup create cache_pool
+META=/dev/nvme0n2p1       # tiny SSD partition for metadata
+SSD=/dev/nvme0n1          # cache device
+HDD=/dev/sda              # origin device
 
-# Create cached device
-echo "0 $ORIGIN_SIZE cache /dev/mapper/cache_pool $HDD $CACHE_BLOCK 1 writeback smq 0" \
-    | dmsetup create cached
+ORIGIN_SIZE=$(blockdev --getsz $HDD)
+CACHE_BLOCK=128           # sectors (64KB cache block size)
+
+# Initialize a fresh dm-cache metadata device by zeroing its superblock area.
+# (The target detects a zeroed superblock and formats the metadata.)
+dd if=/dev/zero of=$META bs=4096 count=1
+
+# Build the cache target.
+# Feature args: "1 writeback" = one feature arg, which is "writeback"
+# Policy: "smq" with zero policy args.
+dmsetup create cached --table \
+    "0 $ORIGIN_SIZE cache $META $SSD $HDD $CACHE_BLOCK 1 writeback smq 0"
+
+# /dev/mapper/cached now exists; format and mount as usual.
+dmsetup status cached
 ```
+
+Typical `dmsetup status` line:
+```
+0 8388608 cache 8 1234/16384 256 38912/65536 13409 8211 4567 1234 56 56 0 1 \
+  writeback no_discard_passdown 2 migration_threshold 2048 smq 0 rw -
+```
+Fields you care about: `used_meta/total_meta`, `block_size`, `used_cache/total_cache`,
+`promotions`, `demotions`, dirty count, feature args, policy.
 
 ---
 

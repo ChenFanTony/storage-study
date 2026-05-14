@@ -21,12 +21,15 @@ SSD cache device layout:
 │  512KB   │  512KB   │  512KB   │  512KB   │  512KB   │
 └──────────┴──────────┴──────────┴──────────┴──────────┘
 
-Each bucket has metadata in the bucket array (in-memory):
+Each bucket has metadata in the in-memory bucket array. The fields below
+are simplified — the actual struct has more (gc_gen, last_gc_gen, dirty/
+gc sector counters separately) but conceptually:
+
   struct bucket {
-      uint16_t  prio;        // recency (used by LRU eviction)
-      uint8_t   gen;         // generation counter (for pointer validation)
-      uint8_t   last_gc;     // gen at last GC
-      uint16_t  sectors_used; // how many sectors are live in this bucket
+      uint16_t  prio;          // recency (used by LRU eviction)
+      uint8_t   gen;           // generation counter (for pointer validation)
+      uint8_t   last_gc;       // gen at last GC
+      uint16_t  sectors_used;  // how many sectors are live in this bucket
   };
 ```
 
@@ -187,27 +190,38 @@ interval:s:5 {
 
 ## 6. GC Pressure Indicators
 
-```bash
-# 1. Watch free bucket count (low = GC under pressure)
-watch -n1 "cat /sys/fs/bcache/*/cache/*/stats_total/cache_miss_collisions 2>/dev/null; \
-           cat /sys/block/bcache*/bcache/cache/*/freelist_percent 2>/dev/null"
+bcache exposes two useful sysfs files for bucket availability. They tell
+you different things:
 
-# 2. Indirect: cache hit rate degradation under write load
-# (GC evicting useful data to free buckets)
+- `cache_available_percent` — percentage of the cache device **not** holding
+  dirty data and therefore eligible for writeback / reclaim. This is the
+  one to watch for writeback pressure.
+- `freelist_percent` — size of the per-cache free-bucket list. Mostly a
+  testing knob; not always a great real-time signal of GC pressure.
+
+```bash
+# Available paths (per cache set, per cache device):
+CACHEDIR=/sys/fs/bcache/*/cache0   # adjust to your UUID
+
+cat $CACHEDIR/cache_available_percent 2>/dev/null    # main signal
+cat $CACHEDIR/priority_stats         2>/dev/null     # contains "Unused: NN%"
+cat $CACHEDIR/freelist_percent       2>/dev/null     # may not exist on all kernels
+
+# Watch hit rate degradation under write load (GC evicting useful data)
 watch -n2 "cat /sys/block/bcache0/bcache/stats_five_minute/cache_hit_ratio"
 
-# 3. Direct GC activity via bpftrace
+# Direct GC activity via bpftrace
 bpftrace -e '
 kprobe:bch_gc_thread { printf("GC started: %s\n", comm); @gc_count++; }
 kretprobe:bch_gc_thread { printf("GC done\n"); }
 interval:s:10 { print(@gc_count); clear(@gc_count); }'
 
-# 4. Watch SSD write amplification over time
-# Compare sectors written to bcache SSD vs user data written to bcache device
-# (via /proc/diskstats for both devices)
+# Watch SSD write amplification over time:
+# compare sectors written to bcache device (user view) vs sectors written to
+# the underlying SSD (actual device writes). Field 10 of /proc/diskstats is
+# sectors_written.
 BCACHE_DEV=bcache0
 SSD_DEV=nvme0n1
-
 while true; do
     bcache_writes=$(awk "/$BCACHE_DEV / {print \$10}" /proc/diskstats)
     ssd_writes=$(awk "/$SSD_DEV / {print \$10}" /proc/diskstats)
@@ -227,13 +241,13 @@ done
 # Step 1: Fill cache to ~80% with random data
 fio --name=fill --filename=/dev/bcache0 \
     --rw=randwrite --bs=4k \
-    --size=80%   \  # fill 80% of SSD cache
+    --size=80% \      # fill 80% of device size
     --ioengine=libaio --iodepth=64
 
 # Step 2: Run sustained random write workload (causes cache churn)
 fio --name=churn --filename=/dev/bcache0 \
     --rw=randwrite --bs=4k \
-    --size=200%  \  # write 2x cache size → force heavy eviction/GC
+    --size=200% \     # write 2x device size → force heavy eviction/GC
     --ioengine=libaio --iodepth=64 \
     --time_based --runtime=120 &
 
@@ -295,7 +309,7 @@ cat /sys/block/bcache0/bcache/cache/*/cache_replacement_policy
 2. When `fifo_empty(&ca->free[])` — the free bucket list is exhausted. The allocator cannot get a free bucket for new writes, so it wakes GC to reclaim invalidated buckets.
 3. User writes → land in open SSD bucket → later overwritten → old copy becomes dead in bucket → bucket is partially dead → GC must copy live data out (compaction write) → bucket freed → compaction write = write amplification.
 4. GC holds btree node locks while walking the tree to count live sectors. The I/O path holds btree node locks for cache lookups. At high IOPS, many threads contend on the same btree node locks → spinlock contention dominates CPU time.
-5. GC is evicting hot data to free buckets for new writes (cache churn). The working set nominally fits, but write pressure is forcing evictions faster than the working set can stabilize. Check `cache_hit_ratio` trend and `freelist_percent`.
+5. GC is evicting hot data to free buckets for new writes (cache churn). The working set nominally fits, but write pressure is forcing evictions faster than the working set can stabilize. Check `cache_hit_ratio` trend and `cache_available_percent`.
 6. Increase bucket size to 1MB or 2MB at next cache recreation. Larger buckets reduce GC frequency (fewer buckets to manage) and improve sequential write efficiency. Also check `sequential_cutoff` — large sequential writes should bypass cache to avoid thrashing.
 
 ---

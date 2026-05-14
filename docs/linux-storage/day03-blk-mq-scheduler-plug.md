@@ -40,7 +40,9 @@ blk_finish_plug() → blk_flush_plug(plug, false)
 
 **Why this helps:**
 - Consecutive 4K writes to adjacent sectors → merged into single 64K request
-- One HW queue doorbell instead of N separate doorbells ( a MMIO write request to notify NVME/ssd)
+- One batch of dispatches instead of N individual ones (for NVMe, one
+  doorbell write per batch — the MMIO register write that notifies the
+  device that new commands are in the submission queue)
 - Scheduler sees a batch → can sort more effectively
 
 **Why this can hurt:**
@@ -103,7 +105,7 @@ is "committed" and the tag is held until completion.
 
 ## 4. mq-deadline: What It Guarantees
 
-mq-deadline maintains two sorted trees (read and write) plus FIFO expiry lists.
+mq-deadline maintains two sorted red-black trees (read and write) plus FIFO expiry lists.
 
 ```c
 // block/mq-deadline.c
@@ -183,6 +185,15 @@ RWBS field:
   S = sync, M = meta, A = ahead (readahead), E = FUA
 ```
 
+`blkparse` text-mode output columns (this matters for any awk you write):
+```
+<major,minor>  <cpu>  <seqno>  <time>  <pid>  <action>  <RWBS>  <sector> + <nrsec> [<comm>]
+     $1         $2     $3       $4      $5      $6        $7       $8      $9   $10    $11
+   "  8,0"      0      1     0.000000   4262    Q          R       0    +   8   [fio]
+```
+Field 4 is the timestamp. Field 8 is the start sector. The action character
+is field 6.
+
 Latency you can derive from traces:
 - **Scheduler latency:** time from `I` to `D` (how long scheduler held it)
 - **Device latency:** time from `D` to `C` (how long device took)
@@ -213,14 +224,26 @@ grep " M " trace.txt | head -20
 
 # Look for plug/unplug cycles
 grep -E " [PU] " trace.txt | head -30
-
-# Calculate D→C latency (device service time) for first 100 completions
-awk '/D / {d[$6]=$1} / C / {if($6 in d) printf "lat=%.6f\n", $1-d[$6]}' \
-    trace.txt | head -100
 ```
 
+Calculating D→C latency (device service time) from the blkparse text output
+needs care: you must key by something that uniquely identifies the request
+(sequence number `$3` works well, since blkparse assigns it within a single
+trace), and you must compare the timestamps in field `$4`:
+
 ```bash
-# Alternative: bpftrace for real-time latency histogram
+# Per-request D→C latency in seconds, using sequence number to correlate
+awk '
+  $6 == "D" { d[$3] = $4 }
+  $6 == "C" && ($3 in d) { printf "lat_sec=%.9f\n", $4 - d[$3]; delete d[$3] }
+' trace.txt | head -100
+```
+
+In practice the bpftrace approach below is more reliable — it sidesteps
+blkparse's column parsing entirely and gives you a histogram directly:
+
+```bash
+# bpftrace for real-time D→C latency histogram
 bpftrace -e '
 tracepoint:block:block_rq_issue   { @start[args.sector] = nsecs; }
 tracepoint:block:block_rq_complete {
@@ -257,7 +280,7 @@ interval:s:10 { print(@us); clear(@us); clear(@start); exit(); }
 
 # Heavy sequential write to see plug in action:
 dd if=/dev/zero of=/tmp/test bs=1M count=512 &
-blktrace -d /dev/sda -o - | blkparse -i - | grep -E "^.*[PUM] " | head -50
+blktrace -d /dev/sda -o - | blkparse -i - | grep -E " [PUM] " | head -50
 ```
 
 ---
@@ -285,7 +308,7 @@ blktrace -d /dev/sda -o - | blkparse -i - | grep -E "^.*[PUM] " | head -50
 
 ## 11. Answers
 
-1. Plug merge: within the current task's plug list, O(small constant), no lock. Elevator merge: across tasks in the scheduler's sorted tree, requires hctx lock. Plug merge is faster.
+1. Plug merge: within the current task's plug list, O(small constant), no lock. Elevator merge: across tasks in the scheduler's sorted tree, requires the scheduler's lock (e.g., `dd->lock` for mq-deadline). Plug merge is faster.
 2. Merging is good but something else limits throughput: maybe queue depth is too low (not enough in-flight after merge), or the merged requests are still not optimal size.
 3. BFQ maintains per-process queues, tracks budgets, detects interactive I/O — all of this is CPU work and adds latency to the dispatch path.
 4. `none` — O_DIRECT random writes have no spatial locality, reordering doesn't help, and you want minimum scheduler overhead.

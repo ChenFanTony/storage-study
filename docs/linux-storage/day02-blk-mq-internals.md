@@ -200,8 +200,11 @@ This is NOT the same as `nr_requests` in sysfs (that's the scheduler queue limit
 # sysfs: scheduler queue depth (requests waiting in elevator)
 cat /sys/block/nvme0n1/queue/nr_requests
 
-# actual tag set depth is visible indirectly via:
-cat /sys/block/nvme0n1/mq/*/nr_tags  (* is the hardware ctx mapping to CPU)
+# Actual tag set depth, per hardware queue. Each /sys/block/<dev>/mq/N
+# directory corresponds to one hardware queue (indexed 0..nr_hw_queues-1).
+for d in /sys/block/nvme0n1/mq/*/; do
+    echo "$d nr_tags=$(cat $d/nr_tags)"
+done
 
 # io depth in flight at any moment:
 cat /sys/block/nvme0n1/inflight
@@ -224,10 +227,12 @@ For virtio-blk in VMs: often 32–128 depending on hypervisor implementation.
 ## 5. CPU → HW Queue Mapping
 
 ```bash
-# see the mapping: which CPUs map to which HW queues
-cat /sys/block/nvme0n1/mq/0/cpu_list
-cat /sys/block/nvme0n1/mq/1/cpu_list
-# etc.
+# See the mapping: which CPUs map to which HW queues.
+# One mq/N directory per HW queue; cpu_list inside it shows the CPUs
+# that dispatch through that queue.
+for d in /sys/block/nvme0n1/mq/*/; do
+    echo "$d cpu_list=$(cat $d/cpu_list)"
+done
 ```
 
 The mapping is set at driver init time via `blk_mq_map_queues()` or
@@ -332,7 +337,7 @@ Focus on these specific functions — read them in order:
 2. NVMe has its own internal command reordering; scheduler overhead (lock, list operations) adds latency without benefit.
 3. 32 `blk_mq_ctx` (one per CPU). HW queues: depends on device, often 32 for NVMe (one per CPU), but could be fewer.
 4. `nr_requests` is the scheduler's staging queue limit. `queue_depth` is the maximum simultaneously in-flight requests backed by tags. On `none` scheduler they effectively converge.
-5. Cross-NUMA memory access for the tag bitmap, request struct, and completion callback adds latency cycles.
+5. Cross-NUMA memory access for the tag bitmap, request struct, and completion callback adds latency cycles. The completion IRQ may also fire on a CPU on the remote NUMA node, requiring cross-node wakeups for the waiter.
 6. In `blk_mq_get_request()`, called from `blk_mq_submit_bio()` after merge attempts fail.
 
 ---
