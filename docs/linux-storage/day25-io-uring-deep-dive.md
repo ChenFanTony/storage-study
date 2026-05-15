@@ -4,359 +4,448 @@
 - Understand io_uring's SQ/CQ ring mechanics at source level
 - Understand fixed buffer registration: what cost it eliminates and why
 - Understand registered files: what cost that eliminates
-- Write programs using: basic io_uring, fixed buffers, NVMe passthrough
-- Know when io_uring outperforms O_DIRECT and when it doesn't
+- Write programs using basic io_uring, fixed buffers, and NVMe passthrough
+- Know when io_uring outperforms O_DIRECT + libaio (and when it doesn't)
 
 ---
 
 ## 1. SQ/CQ Ring Mechanics
 
-io_uring uses two ring buffers shared between kernel and userspace via mmap.
-No syscall needed per I/O — the kernel and userspace communicate through
-shared memory.
+io_uring uses two ring buffers shared between kernel and userspace via
+mmap. The kernel and userspace communicate through shared memory —
+no syscall per I/O.
 
 ```c
 // io_uring/io_uring.c
 
 // Setup: io_uring_setup() creates the rings
-struct io_rings {
-    struct io_uring_sq sq;    // submission queue metadata
-    struct io_uring_cq cq;    // completion queue metadata
-    // ...
-};
+// Returns a file descriptor; userspace mmaps three regions:
+//   IORING_OFF_SQ_RING — submission queue metadata + indices
+//   IORING_OFF_CQ_RING — completion queue metadata + entries
+//   IORING_OFF_SQES    — submission queue entries array
 
-// Submission Queue Entry (SQE) — one per I/O operation
+struct io_rings {
+    struct io_uring        sq, cq;       // metadata + head/tail pointers
+    u32                    sq_ring_mask, cq_ring_mask;
+    u32                    sq_ring_entries, cq_ring_entries;
+    // ...
+    struct io_uring_cqe    cqes[];       // CQE array (flexible)
+};
+```
+
+```c
+// include/uapi/linux/io_uring.h
+
+// Submission Queue Entry — one per I/O operation
 struct io_uring_sqe {
-    __u8    opcode;         // IORING_OP_READ, IORING_OP_WRITE, ...
-    __u8    flags;          // IOSQE_FIXED_FILE, IOSQE_BUFFER_SELECT, ...
+    __u8    opcode;         // IORING_OP_READ, IORING_OP_WRITE, IORING_OP_URING_CMD, ...
+    __u8    flags;          // IOSQE_FIXED_FILE, IOSQE_IO_LINK, IOSQE_ASYNC, ...
     __u16   ioprio;
     __s32   fd;             // file descriptor (or registered file index)
     __u64   off;            // file offset
     __u64   addr;           // buffer address (or fixed buffer index)
     __u32   len;            // transfer length
-    __u32   buf_index;      // index into registered buffer table
-    __u64   user_data;      // opaque user data, returned in CQE
-    // ...
+    union { __u16 buf_index; ... };
+    __u64   user_data;      // opaque user data, returned in CQE (lets app
+                            // correlate completions to requests)
+    // ... 16 more bytes
 };
 
-// Completion Queue Entry (CQE) — one per completed I/O
+// Completion Queue Entry — one per completed I/O
 struct io_uring_cqe {
     __u64   user_data;      // matches SQE user_data (identifies the I/O)
     __s32   res;            // result: bytes transferred or -errno
-    __u32   flags;
+    __u32   flags;          // IORING_CQE_F_BUFFER, IORING_CQE_F_MORE, ...
 };
 ```
 
-**The zero-syscall path:**
+### The zero-syscall path
+
 ```
 Submit I/O:
-  1. Write SQE to sq.sqes[sq.tail & sq.ring_mask]
-  2. Increment sq.tail (visible to kernel via shared memory)
-  3. Call io_uring_enter(ring_fd, to_submit, ...) [one syscall for many I/Os]
-     OR: if SQPOLL mode: kernel thread polls SQ — ZERO syscalls for submission
+  1. Write SQE to ring->sqes[sq.tail & sq.ring_mask]
+  2. Increment sq.tail (a store to shared memory — visible to kernel)
+  3. Call io_uring_enter(ring_fd, to_submit, ...) — ONE syscall for N I/Os
+     OR if SQPOLL mode: kernel thread polls SQ — ZERO syscalls
 
 Receive completion:
-  1. Poll cq.head != cq.tail (check shared memory — no syscall)
-  2. Read CQE from cq.cqes[cq.head & cq.ring_mask]
-  3. Increment cq.head (visible to kernel — no syscall)
+  1. Poll cq.head != cq.tail (read shared memory — no syscall)
+  2. Read CQE from ring->cqes[cq.head & cq.ring_mask]
+  3. Increment cq.head (a store to shared memory — visible to kernel)
 ```
+
+At sustained high IOPS, this design is dramatically more efficient than
+libaio's `io_submit() / io_getevents()` pair, which always involves a
+syscall.
 
 ---
 
-## 2. Fixed Buffer Registration: The Key Optimization
+## 2. Fixed Buffer Registration
 
-Every normal I/O (read/write) requires the kernel to:
-1. Map the user buffer into kernel address space (pin pages)
-2. Set up DMA scatter-gather list
-3. Perform DMA
-4. Unmap buffer (unpin pages)
+Every normal I/O requires the kernel to:
+1. `get_user_pages()` — pin user buffer pages (so they don't get swapped
+   or moved while DMA is in flight)
+2. Set up the bio's biovec scatter-gather list
+3. Submit the bio; complete the I/O
+4. `put_page()` — unpin the pages
 
-Steps 1 and 4 are expensive at high IOPS — `get_user_pages` and `put_page`
-under lock pressure. At 500K IOPS: millions of pin/unpin operations per second.
+Steps 1 and 4 involve atomic refcount operations, page table walking,
+and mmap_lock contention under pressure. At 500K+ IOPS, this is
+measurable CPU overhead.
 
-**Fixed buffers pre-register buffers once:**
+**Fixed buffers pre-register buffers once, eliminating per-I/O pinning:**
 
 ```c
-// io_uring/rsrc.c
+// io_uring/rsrc.c — fixed buffer registration
 
-// Register buffers once at setup time:
+// Register buffers at setup time:
 io_uring_register(ring_fd, IORING_REGISTER_BUFFERS, iovecs, nr_iovecs)
-    // Kernel: pin all pages in the iovecs NOW (once)
-    //         build DMA maps for all registered buffers (once)
-    //         store in ring->ctx->user_bufs[]
+    →  __io_sqe_buffers_register():
+        for each iovec:
+            io_pin_pages(iov, &pages, &nr_pages)
+            // Build io_mapped_ubuf struct holding the pinned pages
 
-// Use pre-registered buffer in SQE:
-sqe->opcode  = IORING_OP_READ;
-sqe->flags   = IOSQE_BUFFER_FIXED;  // use fixed buffer
-sqe->buf_index = 3;                  // index into registered buffer table
-// NO addr field needed — kernel already has the DMA map
+        // Store array in ctx->buf_table — accessed by index later
 
-// Result: zero per-I/O buffer mapping cost
+// Use fixed buffer in SQE:
+sqe->opcode    = IORING_OP_READ_FIXED;   // not IORING_OP_READ
+sqe->buf_index = 3;                       // index into ctx->buf_table
+sqe->addr      = (uint64_t)buf;           // address within registered buffer
+sqe->len       = 4096;
+
+// On submission, io_uring uses ctx->buf_table[3] directly
+// → no per-I/O get_user_pages / put_page
 ```
 
 ```c
-// Example: fixed buffer read with liburing
+// Example with liburing
 #include <liburing.h>
 
 struct io_uring ring;
 io_uring_queue_init(32, &ring, 0);
 
-// Allocate and register buffers (once at startup)
+// Allocate aligned buffers
 char *bufs[8];
 struct iovec iovecs[8];
 for (int i = 0; i < 8; i++) {
-    posix_memalign((void**)&bufs[i], 4096, 65536);  // 64KB buffers
+    posix_memalign((void**)&bufs[i], 4096, 65536);  // 64 KB
     iovecs[i].iov_base = bufs[i];
     iovecs[i].iov_len  = 65536;
 }
+
+// Register once (kernel pins all 8 buffers now)
 io_uring_register_buffers(&ring, iovecs, 8);
 
-// Submit reads using fixed buffers (no per-I/O mapping)
+// Submit reads using fixed buffers (no per-I/O page pinning)
 struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-io_uring_prep_read_fixed(sqe, fd, bufs[0], 65536, offset, 0); // buf_index=0
+io_uring_prep_read_fixed(sqe, fd, bufs[0], 65536, offset, /*buf_index*/ 0);
 sqe->user_data = 1;
 io_uring_submit(&ring);
 
-// Wait for completion
+// Reap completion
 struct io_uring_cqe *cqe;
 io_uring_wait_cqe(&ring, &cqe);
-printf("Read %d bytes\n", cqe->res);
+// cqe->res = bytes read (or negative errno)
 io_uring_cqe_seen(&ring, cqe);
 ```
 
 ---
 
-## 3. Registered Files: Eliminating fd Table Lookups
+## 3. Registered Files
 
-Every I/O syscall performs `fdget()` — looks up the file from the fd table,
-increments reference count. At 500K IOPS: 500K fdget/fdput pairs per second.
+Every normal I/O syscall does `fdget()` — looks up the file from the
+process fd table, increments the file's reference count. At 500K IOPS:
+500K fdget/fdput pairs per second, each involving an atomic operation.
 
-**Registered files pre-resolve file descriptors:**
+**Registered files pre-resolve fds once, eliminating per-I/O lookup:**
 
 ```c
-// Register files once:
+// io_uring/rsrc.c
+
+// Register at setup time:
 io_uring_register(ring_fd, IORING_REGISTER_FILES, fds, nr_fds)
-    // Kernel: resolve each fd → struct file* NOW (once)
-    //         store file* array in ring context
-    //         increment file refcount once
+    →  Resolves each fd → struct file* once
+    →  Stores array of struct file* in ctx->file_table
+    →  Increments each file's refcount once (not per I/O)
 
-// Use registered file in SQE:
+// Use registered file:
 sqe->flags = IOSQE_FIXED_FILE;
-sqe->fd    = 2;   // index into registered file table (not actual fd)
+sqe->fd    = 2;   // index into ctx->file_table (not the actual fd)
 
-// Result: zero per-I/O fd table lookup
+// io_uring uses ctx->file_table[2] directly — no fdget per I/O
 ```
+
+**Direct descriptors** (a newer feature) extend this: an open operation
+in io_uring can produce a "direct descriptor" — an index into the
+registered table — without ever creating a normal kernel fd. Useful for
+workloads with high fd-creation rates (network servers, file proxies).
 
 ---
 
-## 4. io_uring Kernel Path for Read/Write
+## 4. SQPOLL: Eliminating Submission Syscalls Entirely
+
+```c
+// io_uring/sqpoll.c
+
+// IORING_SETUP_SQPOLL creates a kernel thread that polls the SQ:
+struct io_sq_data {
+    struct task_struct  *thread;     // the kernel poller thread
+    // ...
+};
+
+io_sq_thread():  // the kernel thread's main loop
+    while (!kthread_should_park()) {
+        // Check if userspace has added new SQEs
+        if (sq_head != sq_tail) {
+            io_submit_sqes(ctx, to_submit);
+        } else if (idle_too_long) {
+            // Park the thread; wake on next userspace activity
+            schedule();
+        }
+    }
+```
+
+```c
+// Setup: ring with SQPOLL
+struct io_uring_params p = {
+    .flags = IORING_SETUP_SQPOLL,
+    .sq_thread_idle = 1000,   // park after 1 second idle
+};
+io_uring_queue_init_params(32, &ring, &p);
+
+// Now submitting requires NO syscall:
+//   userspace writes SQE → bumps sq.tail
+//   kernel thread sees the new tail → submits
+//   userspace polls CQ for completion
+```
+
+**Cost of SQPOLL:**
+- One dedicated CPU thread burning cycles polling
+- Park after `sq_thread_idle` ms of inactivity, but bursty workloads
+  keep it busy
+- Pin to a specific CPU with `IORING_SETUP_SQ_AFF` + `sq_thread_cpu`
+- Worthwhile only for sustained very high IOPS (>500K) where the
+  syscall overhead saved exceeds the cost of a dedicated CPU
+
+---
+
+## 5. The Kernel Path for io_uring Read/Write
 
 ```c
 // io_uring/rw.c
 
+// On SQE submission, for IORING_OP_READ:
 io_read(req, issue_flags):
     // 1. Get iovec from SQE (or fixed buffer)
-    // 2. Call iomap_dio_rw() or kiocb-based read
-    //    (same as O_DIRECT for files opened with O_DIRECT)
-    //    OR: go through page cache (for buffered files)
-    // 3. Set up async completion callback
-    // 4. Return to caller (non-blocking — I/O happens asynchronously)
+    // 2. Set up kiocb (kernel I/O control block)
+    // 3. Call file->f_op->read_iter() — same as regular read syscall
+    //    For O_DIRECT files: iomap_dio_rw() — same as O_DIRECT read
+    //    For buffered:        generic_file_read_iter() — page cache path
+    // 4. If async (typical for O_DIRECT): return -EIOCBQUEUED
+    //    completion callback will post the CQE later
+    // 5. If sync: complete immediately, post CQE
 
-// On I/O completion (interrupt/callback):
-io_complete_rw():
-    // Post CQE to completion ring
-    io_cqring_add_event(req, res, 0)
-    // User sees completion by polling CQ
+// io_uring is largely a thin layer over the existing file I/O paths.
+// Its value is in submission/completion efficiency, not different I/O paths.
 ```
 
 ---
 
-## 5. NVMe Passthrough via io_uring (`uring_cmd`)
+## 6. NVMe Passthrough via `uring_cmd`
 
-`uring_cmd` (kernel 5.19+) allows sending raw NVMe commands via io_uring,
-combining async I/O with NVMe passthrough — the highest-performance
-kernel-accessible I/O path.
+`uring_cmd` (kernel 5.19+) lets io_uring submit raw device commands. For
+NVMe, this combines async I/O with NVMe passthrough — the highest-
+performance kernel-accessible I/O path.
 
 ```c
-// io_uring/uring_cmd.c + drivers/nvme/host/ioctl.c
+// io_uring/uring_cmd.c
 
-// SQE for NVMe passthrough:
-sqe->opcode = IORING_OP_URING_CMD;
-sqe->fd     = nvme_fd;      // open("/dev/ng0n1", O_RDWR)  ← note: ng0n1, not nvme0n1
-sqe->cmd_op = NVME_URING_CMD_IO;
-// The actual NVMe command is embedded in sqe->cmd (80 bytes)
-
-struct nvme_uring_cmd *cmd = (void *)sqe->cmd;
-cmd->opcode    = nvme_cmd_read;   // 0x02
-cmd->nsid      = 1;
-cmd->cdw10     = start_lba & 0xffffffff;
-cmd->cdw11     = start_lba >> 32;
-cmd->cdw12     = (nlb - 1);       // number of LBAs - 1
-cmd->addr      = (uint64_t)buf;   // data buffer (or fixed buffer index)
-cmd->data_len  = nlb * 512;
+// IORING_OP_URING_CMD wraps device-specific commands:
+io_uring_cmd():
+    // Dispatches to file->f_op->uring_cmd()
+    // For NVMe character device: nvme_uring_cmd() in drivers/nvme/host/ioctl.c
 ```
 
 ```c
-// Example: NVMe passthrough read with io_uring
-#include <liburing.h>
-#include <linux/nvme_ioctl.h>
+// SQE format for NVMe passthrough:
+// Note: uring_cmd needs more space than a regular SQE — must set up ring
+// with IORING_SETUP_SQE128 (128-byte SQEs, vs default 64).
+// And IORING_SETUP_CQE32 if the command returns a 32-byte CQE.
 
-int ng_fd = open("/dev/ng0n1", O_RDWR);  // generic NVMe char device
-struct io_uring ring;
-io_uring_queue_init(32, &ring, 0);
+struct io_uring_params p = {
+    .flags = IORING_SETUP_SQE128 | IORING_SETUP_CQE32,
+};
+io_uring_queue_init_params(32, &ring, &p);
 
+// Open the NVMe character device (NOT /dev/nvme0n1):
+int ng_fd = open("/dev/ng0n1", O_RDWR);   // generic NVMe — passthrough target
+
+// Build SQE
 struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
 sqe->opcode = IORING_OP_URING_CMD;
 sqe->fd     = ng_fd;
 sqe->cmd_op = NVME_URING_CMD_IO;
 
+// The NVMe command is embedded in sqe->cmd (up to 80 bytes with SQE128):
 struct nvme_uring_cmd *cmd = (void *)sqe->cmd;
 memset(cmd, 0, sizeof(*cmd));
-cmd->opcode   = nvme_cmd_read;
+cmd->opcode   = nvme_cmd_read;   // 0x02
 cmd->nsid     = 1;
-cmd->cdw10    = 0;          // LBA 0
-cmd->cdw12    = 7;          // 8 LBAs = 4KB
-cmd->addr     = (uint64_t)buf;
-cmd->data_len = 4096;
+cmd->cdw10    = lba & 0xffffffff;
+cmd->cdw11    = lba >> 32;
+cmd->cdw12    = nlb - 1;          // number of LBAs - 1
+cmd->addr     = (uint64_t)buf;    // data buffer (or fixed-buffer ref)
+cmd->data_len = nlb * 512;
 
-sqe->user_data = 42;
 io_uring_submit(&ring);
-
-struct io_uring_cqe *cqe;
-io_uring_wait_cqe(&ring, &cqe);
-// cqe->res == 0 on success
+// ...
 ```
 
 **Why this matters:**
 ```
-Normal block I/O path:
-  Application → syscall → VFS → filesystem → blk-mq → NVMe driver → device
+Normal block I/O:
+  Application → syscall → VFS → blk-mq → NVMe driver → device
 
 io_uring + NVMe passthrough:
   Application → SQ ring → io_uring → NVMe driver → device
-                                   ↑ filesystem and blk-mq scheduler bypassed
+                                   ↑ VFS and blk-mq bypassed
 
-Combined with fixed buffers: also eliminates per-I/O buffer mapping
-→ Minimum possible kernel overhead for NVMe I/O without full SPDK userspace driver
+Combined with fixed buffers (--fixedbufs in fio): also eliminates per-I/O
+buffer mapping. Result: minimum possible kernel overhead for NVMe I/O
+without going to a full SPDK userspace driver.
 ```
+
+**What you give up with `uring_cmd`:**
+- No I/O scheduler (BFQ fairness, mq-deadline ordering — all bypassed)
+- No cgroup I/O enforcement (`io.max`, `io.weight`, `io.latency` are
+  enforced in blk-mq, which is bypassed)
+- No filesystem layer — you're talking directly to a namespace
+- blktrace block-layer events don't see these I/Os
+- bypasses dm-crypt, md, dm-cache — anything below the filesystem
+
+For high-throughput single-tenant workloads on dedicated NVMe, this is
+the cost-free choice. For shared, multi-tenant, or anything needing
+the above features: stick with the normal block path.
 
 ---
 
-## 6. Performance: When io_uring Wins vs O_DIRECT
+## 7. Performance Comparison
 
 ```bash
-# Benchmark 1: O_DIRECT with libaio (traditional async I/O)
-fio --name=libaio-direct \
-    --filename=/dev/nvme0n1 \
-    --rw=randread --bs=4k \
-    --ioengine=libaio \
-    --iodepth=32 \
-    --direct=1 \
-    --time_based --runtime=30
+# Setup
+DEV=/dev/nvme0n1
+RUNTIME=30
 
-# Benchmark 2: io_uring basic (same as O_DIRECT, async)
-fio --name=iou-basic \
-    --filename=/dev/nvme0n1 \
-    --rw=randread --bs=4k \
-    --ioengine=io_uring \
-    --iodepth=32 \
-    --direct=1 \
-    --time_based --runtime=30
+# 1. Synchronous (baseline)
+fio --name=sync --filename=$DEV --rw=randread --bs=4k \
+    --ioengine=psync --iodepth=1 --direct=1 \
+    --time_based --runtime=$RUNTIME
 
-# Benchmark 3: io_uring with fixed buffers
-fio --name=iou-fixedbuf \
-    --filename=/dev/nvme0n1 \
-    --rw=randread --bs=4k \
-    --ioengine=io_uring \
-    --iodepth=32 \
-    --direct=1 \
-    --registerfiles=1 \
-    --fixedbufs=1 \
-    --time_based --runtime=30
+# 2. libaio + O_DIRECT (traditional async)
+fio --name=libaio --filename=$DEV --rw=randread --bs=4k \
+    --ioengine=libaio --iodepth=32 --direct=1 \
+    --time_based --runtime=$RUNTIME
 
-# Benchmark 4: io_uring with SQPOLL (zero-syscall submission)
-fio --name=iou-sqpoll \
-    --filename=/dev/nvme0n1 \
-    --rw=randread --bs=4k \
-    --ioengine=io_uring \
-    --iodepth=32 \
-    --direct=1 \
-    --sqthread_poll=1 \
-    --registerfiles=1 \
-    --fixedbufs=1 \
-    --time_based --runtime=30
+# 3. io_uring basic
+fio --name=iou-basic --filename=$DEV --rw=randread --bs=4k \
+    --ioengine=io_uring --iodepth=32 --direct=1 \
+    --time_based --runtime=$RUNTIME
 
-# Expected results (fast NVMe, 32-core server):
-# libaio:        ~800K IOPS
-# io_uring basic: ~850K IOPS (slightly better CQ batching)
-# io_uring fixed: ~950K IOPS (eliminates buffer mapping overhead)
-# io_uring SQPOLL: ~1M+ IOPS (zero syscall overhead, dedicated kernel thread)
+# 4. io_uring with fixed buffers + registered files
+fio --name=iou-fixed --filename=$DEV --rw=randread --bs=4k \
+    --ioengine=io_uring --iodepth=32 --direct=1 \
+    --fixedbufs=1 --registerfiles=1 \
+    --time_based --runtime=$RUNTIME
+
+# 5. io_uring with SQPOLL (zero-syscall submission)
+fio --name=iou-sqpoll --filename=$DEV --rw=randread --bs=4k \
+    --ioengine=io_uring --iodepth=32 --direct=1 \
+    --fixedbufs=1 --registerfiles=1 --sqthread_poll=1 \
+    --time_based --runtime=$RUNTIME
+
+# 6. NVMe passthrough via uring_cmd (requires /dev/ng* and a recent kernel)
+fio --name=iou-cmd --filename=/dev/ng0n1 --rw=randread --bs=4k \
+    --ioengine=io_uring_cmd --cmd_type=nvme \
+    --iodepth=32 --time_based --runtime=$RUNTIME
+
+# Typical results on a fast NVMe + recent server (illustrative):
+#   psync:                ~150K IOPS
+#   libaio:               ~800K IOPS
+#   io_uring basic:       ~850K IOPS
+#   io_uring fixed:       ~950K IOPS
+#   io_uring SQPOLL:      ~1M+ IOPS
+#   io_uring uring_cmd:   ~1.1M+ IOPS (when block layer overhead is significant)
 ```
 
 ---
 
-## 7. When io_uring Does NOT Help
+## 8. When io_uring Does NOT Help
 
 ```
-io_uring adds complexity. Use it only when:
-  - You're CPU-bound on syscall/buffer-mapping overhead
-  - IOPS > 200K (below this, overhead difference is negligible)
-  - You need async I/O with minimal latency (no thread pool needed)
+io_uring adds complexity. Use it only when one of these applies:
+  - You are CPU-bound on syscall overhead or buffer mapping
+  - Sustained IOPS > 200K (below that, the differences are noise)
+  - You need async I/O with minimal latency variance (no thread pool needed)
 
 io_uring does NOT help when:
-  - Storage is the bottleneck (slow HDD, bcache-with-GC-pressure)
+  - Storage is the bottleneck (slow HDD, GC-stalled SSD)
   - IOPS < 100K (syscall overhead is negligible vs I/O latency)
-  - Application is already I/O-wait bound (adding async complexity won't help)
-  - Simple sequential workload (buffered I/O or O_DIRECT + read() is fine)
+  - Application already I/O-wait bound (more async doesn't help)
+  - Simple sequential workload — buffered I/O or O_DIRECT + read() works fine
 
-io_uring with SQPOLL:
-  - Dedicates a kernel CPU thread to polling SQ (burns 1 CPU even when idle)
-  - Only worthwhile at sustained very high IOPS (>500K)
-  - Must register files and buffers, or SQPOLL provides no benefit
+SQPOLL specifically:
+  Worthwhile only for sustained >500K IOPS workloads
+  Burns one CPU continuously
+  Don't enable for occasional bursts — it'll waste a core during idle periods
 ```
 
 ---
 
-## 8. Source Code Map
+## 9. Source Reading Checklist
 
 ```
 io_uring/io_uring.c     — ring setup, syscall entry, main dispatch
-io_uring/rw.c           — read/write operations
+io_uring/rw.c           — read/write operations (io_read, io_write)
 io_uring/rsrc.c         — fixed buffer and file registration
-io_uring/uring_cmd.c    — NVMe passthrough (uring_cmd)
+io_uring/uring_cmd.c    — NVMe passthrough infrastructure
 io_uring/sqpoll.c       — SQPOLL kernel thread
+include/linux/io_uring.h         — kernel-side structs
+include/uapi/linux/io_uring.h    — UAPI (SQE, CQE, flags)
 
-Key functions to read:
-  io_uring_setup()          — creates rings, validates params
-  io_submit_sqes()          — processes SQEs from ring
-  io_read() / io_write()    — buffered and direct I/O ops
-  io_uring_cmd_import_fixed()  — fixed buffer for uring_cmd
-  io_sq_thread()            — SQPOLL kernel thread main loop
+drivers/nvme/host/ioctl.c        — NVMe's uring_cmd implementation
 ```
+
+Reading order: `io_uring.c` setup + entry (`io_uring_setup`, `io_uring_enter`),
+then `rw.c` for the I/O paths, then `rsrc.c` for the buffer/file registration
+paths. `sqpoll.c` and `uring_cmd.c` are smaller and read quickly once the
+core is clear.
 
 ---
 
-## 9. Self-Check Questions
+## 10. Self-Check Questions
 
 1. What does fixed buffer registration eliminate vs normal O_DIRECT, and at what IOPS does the saving become significant?
-2. What is SQPOLL mode and what is its cost in terms of system resources?
+2. What is SQPOLL mode and what is its cost in system resources?
 3. NVMe passthrough via io_uring uses `/dev/ng0n1` rather than `/dev/nvme0n1`. What is the difference?
-4. At 100K IOPS, is io_uring with fixed buffers significantly faster than O_DIRECT with libaio? Justify.
-5. An application does 500K IOPS of 4K random reads on NVMe. It currently uses O_DIRECT + libaio and is CPU-bound. Which io_uring features would you enable first?
-6. io_uring IORING_OP_URING_CMD bypasses the filesystem and blk-mq. What does this mean for I/O scheduler policies and cgroup I/O limits?
+4. At 100K IOPS, is io_uring with fixed buffers significantly faster than O_DIRECT + libaio? Justify.
+5. An application does 500K IOPS of 4 KB random reads on NVMe. It currently uses O_DIRECT + libaio and is CPU-bound. Which io_uring features would you enable, in what order?
+6. `IORING_OP_URING_CMD` bypasses the filesystem and blk-mq. What does this mean for I/O scheduler policies and cgroup I/O limits?
+7. Why does NVMe passthrough via io_uring require `IORING_SETUP_SQE128`?
 
-## 10. Answers
+## 11. Answers
 
-1. Fixed buffers eliminate `get_user_pages()` (pin) and `put_page()` (unpin) per I/O. These pin/unpin operations involve page table walking and atomic operations. At 100K IOPS: 100K pin+unpin pairs/sec — measurable but not dominant. At 500K IOPS: 500K pairs/sec — becomes significant CPU overhead. Rule of thumb: above 200-300K IOPS on fast NVMe, fixed buffers provide measurable throughput improvement.
-2. SQPOLL creates a dedicated kernel thread that continuously polls the SQ ring for new submissions, eliminating the `io_uring_enter()` syscall for submission. Cost: one dedicated CPU core (or a fraction of one if idle timeout is configured). The SQPOLL thread is always running — burns CPU even when no I/O is submitted. Use only for sustained very high IOPS workloads that can justify the dedicated CPU.
-3. `/dev/nvme0n1` is a block device managed by blk-mq — I/O goes through the full block layer. `/dev/ng0n1` (`ng` = NVMe generic) is a character device that allows direct ioctl and uring_cmd access to the NVMe controller, bypassing blk-mq entirely. `uring_cmd` requires the char device; regular block I/O uses the block device.
-4. No — at 100K IOPS, buffer mapping overhead (~100K × ~1µs per pin/unpin ≈ 100ms/sec total CPU time) is small relative to I/O time and other overheads. The difference between libaio and io_uring fixed buffers at 100K IOPS is typically <5% and within measurement noise. The benefit becomes significant above 200-300K IOPS.
-5. Enable in priority order: (1) `IORING_REGISTER_BUFFERS` (fixed buffers) — eliminates the per-I/O page pinning that's most likely causing CPU saturation. (2) `IORING_REGISTER_FILES` (registered files) — eliminates fd table lookup. (3) If still CPU-bound after (1) and (2): enable SQPOLL (`IORING_SETUP_SQPOLL`) — eliminates submission syscall, at cost of one dedicated CPU thread.
-6. `uring_cmd` bypasses blk-mq entirely — the request goes from io_uring directly to the NVMe driver's ioctl handler. Consequences: (a) I/O scheduler is completely bypassed — no BFQ fairness, no mq-deadline ordering. (b) cgroup `io.max`, `io.latency`, and `io.weight` are NOT enforced (blk-cgroup enforcement happens in blk-mq, which is bypassed). (c) blktrace block layer events won't capture these I/Os. Architect implication: NVMe passthrough gives performance but sacrifices all kernel-level I/O management and isolation guarantees.
+1. Fixed buffers eliminate `get_user_pages()` (pin user pages for DMA) and `put_page()` (unpin on completion) per I/O. These involve atomic refcount operations and page table walking. At 100K IOPS the overhead is modest (~5-10% of CPU). At 500K IOPS it's significant (15-25%). Rule of thumb: above ~200K IOPS on fast NVMe, fixed buffers provide measurable throughput improvement; below that, the difference is within noise.
+2. SQPOLL creates a dedicated kernel thread that continuously polls the SQ ring for new submissions, eliminating the `io_uring_enter()` syscall for submission. Cost: one CPU core fully (or partially, if `sq_thread_idle` parks it during quiet periods). The thread can be pinned to a specific CPU via `IORING_SETUP_SQ_AFF` + `sq_thread_cpu`. Only worthwhile for sustained very-high-IOPS workloads where the syscall savings exceed the dedicated-core cost.
+3. `/dev/nvme0n1` is a block device managed by blk-mq — I/O goes through the full block layer (filesystem, dm layers, I/O scheduler, etc.). `/dev/ng0n1` (`ng` = NVMe generic) is a character device that allows direct ioctl and `uring_cmd` access to the NVMe controller, bypassing blk-mq entirely. `uring_cmd` requires the char device; regular block I/O uses the block device.
+4. No — at 100K IOPS, the buffer mapping and syscall overheads are small relative to I/O time. The difference between libaio and io_uring fixed buffers at 100K IOPS is typically <5% and often within measurement noise. The benefit becomes significant above 200-300K IOPS, where per-I/O kernel overhead starts to dominate.
+5. In priority order: (1) `IORING_REGISTER_BUFFERS` — fixed buffers eliminate the per-I/O page pinning that's most likely causing CPU saturation. (2) `IORING_REGISTER_FILES` — registered files eliminate per-I/O fd table lookup. (3) If still CPU-bound: enable SQPOLL (`IORING_SETUP_SQPOLL`) to eliminate submission syscalls. (4) If still bottlenecked and the workload doesn't need filesystem features: switch to `IORING_OP_URING_CMD` against `/dev/ng*` for full block-layer bypass.
+6. `uring_cmd` bypasses blk-mq entirely — requests go directly from io_uring to the NVMe driver's ioctl handler. Consequences: (a) I/O scheduler completely bypassed — no BFQ fairness, no mq-deadline ordering. (b) cgroup `io.max`, `io.latency`, and `io.weight` are NOT enforced (those work in blk-mq). (c) blktrace block-layer events don't capture these I/Os. (d) Any device-mapper layers below the filesystem (dm-crypt, dm-cache, md) are bypassed too. Architect implication: passthrough gives performance but sacrifices kernel I/O management and isolation.
+7. The standard `io_uring_sqe` is 64 bytes; only ~16 bytes are available for command-specific payload. NVMe passthrough requires sending a `struct nvme_uring_cmd` (72 bytes) embedded in the SQE. `IORING_SETUP_SQE128` doubles the SQE size to 128 bytes, providing room for the embedded NVMe command structure plus addressing fields. Without `SQE128`, there isn't enough space to fit the full passthrough command in the SQE.
 
 ---
 
 ## Tomorrow: Day 26 — ZNS: Zone Types, Write Pointer & Zone Append
 
 We understand Zoned Namespace NVMe devices, the zone model, and the
-implications for storage software that was designed for random-write devices.
+implications for storage software that was designed for random-write
+devices.

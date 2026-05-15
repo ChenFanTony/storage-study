@@ -11,8 +11,8 @@
 
 ## 1. NVMe Queue Pair Model
 
-NVMe defines a fundamentally different interface from SATA/SCSI:
-no single command queue shared by host and device. Instead:
+NVMe defines a fundamentally different interface from SATA/SCSI: no single
+command queue shared by host and device. Instead:
 
 ```
 NVMe Queue Pair:
@@ -24,7 +24,7 @@ NVMe Queue Pair:
   Protocol:
     1. Host places command in SQ[tail]
     2. Host writes SQ tail doorbell register (tells device "new command")
-    3. Device reads command, executes it
+    3. Device reads command via DMA, executes it
     4. Device places completion in CQ[head]
     5. Device asserts interrupt (or host polls CQ)
     6. Host reads completion, processes result
@@ -34,18 +34,27 @@ NVMe Queue Pair:
 ```
 NVMe queue counts:
   Admin Queue (AQ): 1 queue pair, management commands only
-                    (identify, set features, format, etc.)
+                    (identify, set features, format, create/delete queues)
   I/O Queues:       1 to 65535 queue pairs
-                    Typical NVMe SSD: 1 per CPU core (32-64)
-                    Each queue: up to 65535 entries (depth)
+                    Typical NVMe SSD: 1 I/O queue pair per CPU core (32-128)
+                    Each queue: 64 to 65535 entries (queue depth)
 ```
 
 **Mapping to blk-mq (from Day 2):**
 ```
-blk_mq_hw_ctx   ←→  NVMe I/O queue pair
-blk_mq_ctx      ←→  per-CPU software staging queue
-tag             ←→  command ID in SQ entry (CID field)
-queue_depth     ←→  SQ/CQ ring buffer size
+NVMe concept       ←→  blk-mq concept
+─────────────────────────────────────
+I/O queue pair         blk_mq_hw_ctx
+                       (one hardware context per NVMe queue pair)
+
+Software staging   ←→  blk_mq_ctx
+                       (per-CPU; merges, then dispatches to hctx)
+
+Command ID (CID)   ←→  blk-mq tag
+                       (uniquely identifies in-flight command)
+
+Queue depth        ←→  SQ/CQ ring size
+                       (max in-flight commands per queue)
 ```
 
 ---
@@ -56,26 +65,35 @@ queue_depth     ←→  SQ/CQ ring buffer size
 // drivers/nvme/host/pci.c
 
 struct nvme_dev {
-    struct nvme_queue   *queues;    // array of queue pairs (admin + I/O)
+    struct nvme_queue   *queues;    // array of queue pairs: index 0=admin, 1+=I/O
     u32 __iomem         *dbs;       // doorbell registers (MMIO)
-    struct nvme_ctrl    ctrl;       // common controller state
+    struct nvme_ctrl    ctrl;       // shared controller state (across transports)
+    unsigned int        online_queues;  // currently online queue count
+    int                 io_queues[HCTX_MAX_TYPES];  // default/read/poll queue counts
     // ...
 };
 
 struct nvme_queue {
     struct nvme_dev     *dev;
-    struct nvme_command *sq_cmds;   // SQ ring buffer (host memory)
+    spinlock_t          sq_lock;
+    struct nvme_command *sq_cmds;        // SQ ring buffer (host memory)
     volatile struct nvme_completion *cqes; // CQ ring buffer (host memory)
-    dma_addr_t          sq_dma_addr;   // DMA address of SQ
-    dma_addr_t          cq_dma_addr;   // DMA address of CQ
-    u32 __iomem         *q_db;         // doorbell register for this queue
-    u16                 q_depth;       // SQ/CQ size
-    u16                 sq_tail;       // host's SQ write pointer
-    u16                 cq_head;       // host's CQ read pointer
-    u16                 qid;           // queue ID (0 = admin)
+    dma_addr_t          sq_dma_addr;     // DMA address of SQ
+    dma_addr_t          cq_dma_addr;     // DMA address of CQ
+    u32 __iomem         *q_db;           // SQ doorbell register
+    u16                 q_depth;         // SQ/CQ size
+    u16                 sq_tail;         // host's SQ write pointer
+    u16                 cq_head;         // host's CQ read pointer
+    u16                 qid;             // queue ID (0 = admin)
+    u8                  cq_phase;        // phase bit (toggles each ring wrap)
     // ...
 };
 ```
+
+The **phase bit** is how the host knows whether a CQE is new or stale.
+Each ring traversal toggles the expected phase; a CQE matches "new" only
+when its phase bit matches the current expected value. This avoids the
+need for the device to explicitly invalidate CQ entries between traversals.
 
 ---
 
@@ -88,35 +106,53 @@ struct nvme_queue {
 static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
                                    const struct blk_mq_queue_data *bd)
 {
+    struct nvme_ns *ns = hctx->queue->queuedata;
     struct nvme_queue *nvmeq = hctx->driver_data;
     struct request *req = bd->rq;
+    struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 
     // 1. Build NVMe command from blk-mq request
     nvme_setup_cmd(ns, req);
     // → fills struct nvme_command:
-    //   opcode (read=0x02, write=0x01)
+    //   opcode (read=0x02, write=0x01, flush=0x00, ...)
     //   namespace ID
-    //   starting LBA
-    //   length (in 512-byte units)
-    //   PRP list (Physical Region Pages — DMA scatter-gather)
+    //   starting LBA (cdw10, cdw11)
+    //   length in LBA units (cdw12)
+    //   PRP list / SGL list (for DMA scatter-gather of data buffer)
 
-    // 2. Place command in SQ ring buffer
+    // 2. Map the data buffer for DMA
+    nvme_map_data(dev, req, &iod->cmd);
+    // → builds PRP (Physical Region Page) list pointing to user pages
+
+    // 3. Place command in SQ ring buffer
+    spin_lock(&nvmeq->sq_lock);
     nvme_sq_copy_cmd(nvmeq, &iod->cmd);
     // → memcpy to nvmeq->sq_cmds[nvmeq->sq_tail]
     // → nvmeq->sq_tail = (nvmeq->sq_tail + 1) % nvmeq->q_depth
 
-    // 3. Ring the doorbell (tell device new commands are available)
-    if (bd->last)
-        nvme_write_sq_db(nvmeq, true);
+    // 4. Ring the doorbell (tell device new commands are available)
+    if (bd->last || !nvmeq->sq_tail_pending)
+        nvme_write_sq_db(nvmeq, bd->last);
     // → writel(nvmeq->sq_tail, nvmeq->q_db)
-    // → single MMIO write — device sees the new tail pointer
+    spin_unlock(&nvmeq->sq_lock);
+
+    return BLK_STS_OK;
 }
 ```
 
 **The doorbell write is the critical moment:**
 - Before doorbell: command is in host memory, device doesn't know
-- After doorbell: device fetches and executes command
-- Batching doorbells (writing once after multiple commands) improves throughput
+- After doorbell: device DMA-reads the command and executes it
+- A doorbell write is an MMIO write — costs ~500 ns to 1 µs
+- **Batching doorbells** (writing once after submitting multiple commands)
+  is a meaningful optimization at high IOPS
+
+```c
+// The CID (command ID) in the NVMe command is set to the blk-mq tag:
+nvme_setup_cmd():
+    cmnd->common.command_id = nvme_cid(req);
+// Later, on completion, the CID identifies the request to complete
+```
 
 ---
 
@@ -125,83 +161,84 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 ```c
 // drivers/nvme/host/pci.c
 
-// IRQ handler (or polling loop):
+// IRQ handler (interrupt-driven completion):
 static irqreturn_t nvme_irq(int irq, void *data)
 {
     struct nvme_queue *nvmeq = data;
-    nvme_process_cq(nvmeq);
-    return IRQ_HANDLED;
+    DEFINE_IO_COMP_BATCH(iob);
+
+    if (nvme_poll_cq(nvmeq, &iob)) {
+        if (!rq_list_empty(&iob.req_list))
+            nvme_pci_complete_batch(&iob);
+        return IRQ_HANDLED;
+    }
+    return IRQ_NONE;
 }
 
-static void nvme_process_cq(struct nvme_queue *nvmeq)
+static inline int nvme_poll_cq(struct nvme_queue *nvmeq,
+                                struct io_comp_batch *iob)
 {
+    int found = 0;
+
     while (nvme_cqe_pending(nvmeq)) {
         // Read completion entry
         struct nvme_completion *cqe = &nvmeq->cqes[nvmeq->cq_head];
 
-        // Extract command ID → find in-flight request
-        req = nvme_find_rq(nvmeq, cqe->command_id);
+        // Advance CQ head; flip phase bit on wrap
+        nvme_update_cq_head(nvmeq);
 
-        // Complete the blk-mq request
-        nvme_end_request(req, cqe->status);
-        // → blk_mq_end_request(req, ...) → frees tag → wakes waiters
-
-        // Advance CQ head
-        nvmeq->cq_head = (nvmeq->cq_head + 1) % nvmeq->q_depth;
+        // Find request by CID (= blk-mq tag)
+        nvme_handle_cqe(nvmeq, iob, idx);
+        found++;
     }
 
-    // Tell device we consumed completions
-    writel(nvmeq->cq_head, nvmeq->q_db + nvmeq->dev->db_stride);
+    if (found)
+        nvme_ring_cq_doorbell(nvmeq);  // tell device we consumed these
+
+    return found;
 }
 ```
+
+**The completion path under load:**
+- One IRQ may complete many commands (batch processing)
+- `nvme_pci_complete_batch()` calls `blk_mq_end_request()` for each
+- One CQ doorbell write at the end (not one per completion) — important
+  for high-IOPS efficiency
 
 ---
 
 ## 5. Multi-Namespace Management
 
-NVMe namespaces are the equivalent of LUNs — independent addressable
-storage units within a single controller.
+NVMe namespaces are independent addressable storage units within a single
+controller — analogous to LUNs in SCSI.
 
 ```bash
 # List all namespaces on a controller
 nvme list-ns /dev/nvme0
-# Output: [  0]:0x1  [  1]:0x2  ...  (namespace IDs)
+# [   0]:0x1
+# [   1]:0x2
+# ...
 
 # Detailed namespace info
 nvme id-ns /dev/nvme0 -n 1
-# Shows: namespace size, capacity, formatted LBA size, features
+# Shows: namespace size (nsze), capacity (ncap),
+#        formatted LBA size, features, NGUID/EUI64
 
 # Controller identity (shows namespace limits)
-nvme id-ctrl /dev/nvme0 | grep -E "nn|mnan|oncs"
-# nn = total namespace count
+nvme id-ctrl /dev/nvme0 | grep -E "^nn|^mnan|^oncs|^vwc"
+# nn   = total namespace count supported
 # mnan = max namespace attachment count
-# oncs = optional NVM command set (shows supported features)
+# oncs = optional NVM command set bitmap
+# vwc  = volatile write cache present (0 or 1)
 
 # SMART log per-namespace (if supported)
 nvme smart-log /dev/nvme0n1
-nvme smart-log /dev/nvme0n2
-```
 
-**Multi-namespace architecture uses:**
-```
-Single physical SSD → multiple namespaces:
-  nvme0n1: 1TB  → OS filesystem
-  nvme0n2: 500GB → database data
-  nvme0n3: 100GB → database WAL/log
-
-Benefits:
-  - Separate QoS per namespace (if controller supports)
-  - Independent formatting (different LBA sizes)
-  - ANA (Asymmetric Namespace Access) for NVMe-oF multipathing
-  - Namespace-level encryption keys (if controller supports)
-```
-
-```bash
-# Create namespace (requires admin privilege, controller must support it)
+# Create a namespace (requires admin, controller must support namespace management)
 nvme create-ns /dev/nvme0 \
-    --nsze=209715200 \    # size in LBA units (100GB at 512B LBA)
+    --nsze=209715200 \    # size in LBA units (100 GB at 512B LBA)
     --ncap=209715200 \
-    --flbas=0             # formatted LBA size index
+    --flbas=0             # formatted LBA size index (0 = first LBA format)
 
 # Attach namespace to controller
 nvme attach-ns /dev/nvme0 --namespace-id=2 --controllers=0x1
@@ -211,66 +248,93 @@ nvme detach-ns /dev/nvme0 --namespace-id=2 --controllers=0x1
 nvme delete-ns /dev/nvme0 --namespace-id=2
 ```
 
+**Architectural uses for multiple namespaces:**
+
+```
+Single physical SSD partitioned into namespaces:
+  nvme0n1: 1 TB → OS filesystem
+  nvme0n2: 500 GB → database data
+  nvme0n3: 100 GB → database WAL/log
+
+Benefits over partitions:
+  - Per-namespace QoS (some controllers support)
+  - Per-namespace formatted LBA size (e.g., 4 KB for one, 512 B for another)
+  - ANA (Asymmetric Namespace Access) — foundation of NVMe-oF multipathing
+  - Per-namespace encryption keys (some controllers)
+  - Independent namespace utilization tracking
+```
+
 ---
 
 ## 6. NVMe Passthrough: Bypassing the Block Layer
 
-NVMe passthrough allows sending raw NVMe commands directly to the device,
-bypassing blk-mq, I/O schedulers, and the filesystem.
+NVMe passthrough lets userspace send raw NVMe commands directly to the
+device, bypassing blk-mq, I/O schedulers, and the filesystem.
 
 ```c
 // drivers/nvme/host/ioctl.c
 
-// ioctl path: NVME_IOCTL_IO_CMD
+// ioctl path: NVME_IOCTL_IO_CMD (for I/O commands)
+//             NVME_IOCTL_ADMIN_CMD (for admin commands)
 nvme_user_cmd(ctrl, ns, ucmd):
     // 1. Copy command from userspace
     memdup_user(ucmd->addr, sizeof(c))
 
-    // 2. Submit directly to admin/IO queue
-    nvme_submit_user_cmd(ctrl->admin_q or ns->queue, &c, ...)
+    // 2. Submit directly to the appropriate queue (admin or I/O)
+    nvme_submit_user_cmd(ctrl->admin_q or ns->queue, &c,
+                         data_ptr, data_len, ...)
 
     // 3. Wait for completion
-    // 4. Copy result back to userspace
+    // 4. Copy result back to userspace (result code + optional data)
 ```
 
 ```bash
-# Send raw NVMe IDENTIFY command
+# Send raw NVMe IDENTIFY (admin) command
 nvme admin-passthru /dev/nvme0 \
     --opcode=0x06 \          # identify opcode
     --cdw10=1 \              # CNS=1 (identify controller)
     --data-len=4096 \
     --read
 
-# Send raw READ command (I/O passthrough)
+# Send raw READ (I/O) command
 nvme io-passthru /dev/nvme0n1 \
     --opcode=0x02 \          # read opcode
-    --cdw10=0 \              # starting LBA low
-    --cdw12=7 \              # number of LBAs - 1 (8 LBAs = 4KB)
+    --cdw10=0 \              # starting LBA low 32 bits
+    --cdw11=0 \              # starting LBA high 32 bits
+    --cdw12=7 \              # number of LBAs - 1 (8 LBAs = 4 KB at 512 B LBA)
     --data-len=4096 \
     --read \
     --raw-binary > /tmp/sector0.bin
 ```
 
-**Why passthrough matters for architects:**
+### Why passthrough matters for architects
 
-1. **SPDK-style bypass**: Applications (SPDK, DPDK-based storage) use
-   passthrough to eliminate kernel overhead entirely for ultra-low latency
+1. **SPDK-style bypass**: SPDK-based storage stacks use passthrough to
+   eliminate kernel I/O stack overhead entirely. They claim NVMe devices
+   from the kernel and drive them from userspace.
 
 2. **Vendor-specific commands**: NVMe vendor extensions (sanitize,
-   firmware update, telemetry) require passthrough
+   firmware update, telemetry, custom log pages) require passthrough.
 
 3. **io_uring + NVMe passthrough** (Day 25): combines async I/O with
-   kernel-bypass for maximum performance without full SPDK complexity
+   kernel-bypass for maximum performance without full SPDK complexity.
+   The `IORING_OP_URING_CMD` opcode lets io_uring submit raw NVMe
+   commands.
 
 ```bash
-# Check if namespace supports passthrough for specific features
-nvme id-ctrl /dev/nvme0 | grep -i "vs"   # vendor specific capabilities
+# Useful NVMe commands accessible via passthrough or wrapper tools
 
-# NVMe Write Zeroes (faster than writing zeros manually)
+# Write Zeroes — faster than writing zeros manually (no DMA of data)
 nvme write-zeroes /dev/nvme0n1 --start-block=0 --block-count=1023
 
-# NVMe Dataset Management (TRIM/discard at NVMe level)
+# Dataset Management — TRIM/discard at the NVMe level
 nvme dsm /dev/nvme0n1 --namespace-id=1 --ad --slbs=0 --nlbs=8191
+
+# Flush — equivalent to fdatasync at NVMe protocol level
+nvme flush /dev/nvme0n1 --namespace-id=1
+
+# Sanitize — secure erase (caution: irreversible)
+nvme sanitize /dev/nvme0 --sanact=2   # block erase
 ```
 
 ---
@@ -279,29 +343,37 @@ nvme dsm /dev/nvme0n1 --namespace-id=1 --ad --slbs=0 --nlbs=8191
 
 ```bash
 # 1. Volatile Write Cache (VWC)
-nvme id-ctrl /dev/nvme0 | grep vwc
-# vwc=1: device has volatile write cache
-# Must flush with FUA bit or FLUSH command for durability guarantee
+nvme id-ctrl /dev/nvme0 | grep "^vwc"
+# vwc:0x1 (bit 0 set) = device has a volatile write cache
+# Acked writes may be in DRAM, not NAND
+# Must flush via FUA bit on the bio or explicit FLUSH command
 
-# Force flush (equivalent to fdatasync at NVMe level)
-nvme flush /dev/nvme0n1 --namespace-id=1
-
-# 2. Namespace Write Protection
-nvme id-ns /dev/nvme0 -n 1 | grep wp
-# wp: write protection state
-
-# 3. NVMe Error Log
+# 2. Error log — last N command errors
 nvme error-log /dev/nvme0
-# Shows: error count, LBA, opcode, status for each error
+# Shows: error count, LBA, opcode, status field, namespace
+# Crucial for diagnosing drive misbehavior
 
-# 4. Firmware management
-nvme fw-log /dev/nvme0       # firmware slot info
-nvme fw-download /dev/nvme0 --fw=firmware.bin
-nvme fw-activate /dev/nvme0 --slot=1 --action=1
+# 3. SMART / Health log
+nvme smart-log /dev/nvme0 | grep -E "percentage_used|temperature|unsafe_shutdowns|media_errors"
+# percentage_used: wear indicator (0-100, where 100 = end of rated life)
+# unsafe_shutdowns: count of power-loss events
+# media_errors: uncorrected NAND errors
 
-# 5. Power states
-nvme id-ctrl /dev/nvme0 | grep -A5 "ps "   # power state descriptors
+# 4. Power states
+nvme id-ctrl /dev/nvme0 | grep -A2 "^ps "
+# Multiple power states with different latency/power tradeoffs
 nvme get-feature /dev/nvme0 --feature-id=0x02  # current power state
+
+# 5. Firmware management
+nvme fw-log /dev/nvme0           # firmware slot info
+nvme fw-download /dev/nvme0 --fw=firmware.bin
+nvme fw-activate /dev/nvme0 --slot=1 --action=1   # activate from slot 1
+
+# 6. Format namespace (CAUTION: destructive)
+# Change LBA size, secure erase, crypto erase
+nvme format /dev/nvme0n1 --lbaf=1 --ses=0
+# --lbaf: LBA format index (0..15, defined per-namespace)
+# --ses:  Secure Erase Settings (0=none, 1=user data erase, 2=crypto erase)
 ```
 
 ---
@@ -309,65 +381,90 @@ nvme get-feature /dev/nvme0 --feature-id=0x02  # current power state
 ## 8. Hands-On: NVMe Inspection
 
 ```bash
-# Full NVMe system inventory
+# System inventory
 nvme list
 # Shows: device, model, serial, firmware, size, format
 
 # Deep dive on one controller
 nvme id-ctrl /dev/nvme0 | head -60
-# Key fields:
-# mn: model name
-# fr: firmware revision
-# tnvmcap: total NVM capacity
-# unvmcap: unallocated NVM capacity (available for new namespaces)
-# sqes/cqes: SQ/CQ entry sizes
-# nn: number of namespaces
 
-# Check queue depth and count
+# blk-mq queue count for this NVMe (should match online I/O queues)
 cat /sys/block/nvme0n1/queue/nr_hw_queues
-ls /sys/block/nvme0n1/mq/ | wc -l
-cat /sys/block/nvme0n1/queue/nr_requests
+ls /sys/block/nvme0n1/mq/ | sort -n | wc -l
 
-# Monitor NVMe error rate
-watch -n5 "nvme error-log /dev/nvme0 --log-entries=5"
+# IRQ affinity (which CPUs handle completions for which queues)
+cat /proc/interrupts | grep nvme0q
+# Each line: irq number, per-CPU counts, "PCI-MSI ... nvme0qN"
 
-# Check media wear and temperature
-nvme smart-log /dev/nvme0 | grep -E "percentage_used|temperature|unsafe_shutdowns"
+# Check IRQ affinity for queue 1 (first I/O queue)
+QUEUE1_IRQ=$(grep nvme0q1 /proc/interrupts | awk -F: '{print $1}' | tr -d ' ')
+cat /proc/irq/${QUEUE1_IRQ}/smp_affinity_list
 
-# Trace NVMe command submission at blk-mq level
+# Monitor live submission/completion rates per opcode
 bpftrace -e '
-tracepoint:nvme:nvme_sq {
-    @cmds[args->opcode] = count();
-}
-interval:s:5 {
-    print(@cmds); clear(@cmds);
+tracepoint:nvme:nvme_setup_cmd { @ops[args->opcode] = count(); }
+interval:s:5 { print(@ops); clear(@ops); }
+'
+# Common opcodes:
+#  0x00 = Flush
+#  0x01 = Write
+#  0x02 = Read
+#  0x08 = Write Zeroes
+#  0x09 = Dataset Management
+
+# Latency distribution per opcode
+bpftrace -e '
+tracepoint:nvme:nvme_setup_cmd  { @start[args->cid] = nsecs; @op[args->cid] = args->opcode; }
+tracepoint:nvme:nvme_complete_rq /@start[args->cid]/ {
+    @lat_us[@op[args->cid]] = hist((nsecs - @start[args->cid]) / 1000);
+    delete(@start[args->cid]); delete(@op[args->cid]);
 }'
-# opcode 0x01=write, 0x02=read, 0x00=flush
 ```
 
 ---
 
-## 9. Self-Check Questions
+## 9. Source Reading Checklist
 
-1. What is the NVMe doorbell register and why is batching doorbell writes beneficial?
-2. How does the NVMe command ID (`CID`) map to the blk-mq tag from Day 2?
-3. What is an NVMe namespace and how does it differ from a partition?
-4. Why would an application use NVMe I/O passthrough instead of normal block I/O?
-5. A device has `vwc=1`. What does this mean for data durability and what must the application do?
-6. On a 32-core server, a typical NVMe SSD creates 32 I/O queue pairs. What blk-mq structure corresponds to each queue pair?
+```
+drivers/nvme/host/pci.c       — PCIe transport: queue setup, submission, IRQ
+drivers/nvme/host/core.c      — common controller logic, namespace mgmt
+drivers/nvme/host/ioctl.c     — passthrough via ioctl + uring_cmd
+drivers/nvme/host/nvme.h      — host-side structs (nvme_ctrl, nvme_ns, nvme_queue)
+include/linux/nvme.h          — NVMe spec definitions (commands, completions)
+drivers/nvme/host/multipath.c — ANA multipathing (Day 23 topic)
+```
 
-## 10. Answers
+Reading order: `nvme.h` (the protocol structures), then `pci.c` queue
+setup + `nvme_queue_rq`, then `pci.c` completion path
+(`nvme_irq` + `nvme_poll_cq`). The whole submission/completion lifecycle
+is in those two files.
 
-1. The doorbell register is an MMIO register that the host writes to signal the device of new SQ entries (or consumed CQ entries). Writing a doorbell is a PCI MMIO write — relatively expensive (~1µs). Batching: submit multiple commands to the SQ ring buffer, then write the doorbell once — one MMIO write for N commands instead of N MMIO writes.
-2. The CID (Command ID) in the NVMe SQ entry is set to the blk-mq tag value. On completion, the device returns the CID in the CQ entry. The driver uses the CID to find the corresponding in-flight request via `nvme_find_rq()` — exactly the tag→request lookup from Day 2.
-3. A namespace is an independently addressable LBA space within an NVMe controller. Unlike a partition (a logical subdivision of a single block device), a namespace is managed at the controller level, can have different LBA sizes, can be attached/detached, and can have independent QoS and encryption. Multiple namespaces share the controller's physical NAND pool.
-4. (a) Vendor-specific commands not exposed through the block layer. (b) Ultra-low latency by eliminating kernel I/O stack overhead (SPDK-style). (c) Custom scatter-gather patterns not supported by standard bio. (d) Accessing raw NVMe features (sanitize, telemetry, firmware update).
-5. `vwc=1` means the device has a volatile write cache — writes acknowledged by the device may still be in DRAM, not persisted to NAND. A power loss before the cache is flushed loses those writes. Application must use `O_SYNC`/`fsync` (which triggers a FLUSH command or FUA bit) for durability. Without explicit flush, acknowledged writes are not guaranteed durable.
-6. `struct blk_mq_hw_ctx` — one per NVMe I/O queue pair. The NVMe driver sets `nr_hw_queues=32` in `blk_mq_tag_set`, and each `blk_mq_hw_ctx` stores a pointer to the corresponding `struct nvme_queue` in `hctx->driver_data`.
+---
+
+## 10. Self-Check Questions
+
+1. What is the NVMe doorbell register and why is batching doorbell writes beneficial at high IOPS?
+2. How does the NVMe command ID (CID) map to the blk-mq tag from Day 2, and where in `pci.c` is this mapping established?
+3. What is an NVMe namespace and how does it differ architecturally from a partition?
+4. Why would an application use NVMe I/O passthrough instead of normal block I/O? Name three distinct reasons.
+5. A device's `id-ctrl` output shows `vwc:0x1`. What does this mean for data durability and what must software do?
+6. On a 32-core server, an NVMe SSD creates 32 I/O queue pairs. What blk-mq structure corresponds to each queue pair, and where is it stored?
+7. What is the CQ phase bit and why does it eliminate the need for explicit CQE invalidation?
+
+## 11. Answers
+
+1. The doorbell is an MMIO register that the host writes to signal the device of new SQ entries (or consumed CQ entries). An MMIO write costs ~500 ns to 1 µs. Batching: submit multiple commands to the SQ ring buffer, then write the doorbell once — one MMIO write for N commands instead of N. At 1M IOPS without batching, doorbells alone could consume a CPU. blk-mq's `dispatch()` exposes the `bd->last` flag so the NVMe driver can defer the doorbell write until the last command in a batch.
+2. The CID field in the NVMe command (`cmnd->common.command_id`) is set to the blk-mq tag value via `nvme_cid(req)` in `nvme_setup_cmd()`. On completion, the device returns the CID in the CQE; the driver uses it via `nvme_find_rq()` to locate the corresponding `struct request` and complete it. This is the same tag→request lookup pattern from Day 2's blk-mq design.
+3. A namespace is an independently addressable LBA space within an NVMe controller. Unlike a partition (a logical subdivision of a single block device, managed by the host), a namespace is managed at the NVMe controller level: it can have a different formatted LBA size from other namespaces, can be attached/detached at runtime, has independent QoS (on capable controllers), and has its own identity (NGUID/EUI64). Multiple namespaces share the controller's physical NAND pool.
+4. (a) Access to vendor-specific commands not exposed through the block layer (firmware update, telemetry, sanitize). (b) Ultra-low latency by eliminating kernel I/O stack overhead — SPDK-style storage engines drive NVMe directly. (c) Custom command patterns not supported by standard bio (e.g., NVMe-MI, ZNS-specific commands, computational storage commands). (d, bonus) io_uring + uring_cmd combines async I/O with passthrough — a kernel-mediated middle ground.
+5. `vwc:0x1` means the device has a volatile write cache — writes acknowledged by the device may still be in DRAM, not yet persisted to NAND. A power loss before the cache is flushed loses those writes. Software must either issue a FLUSH command (NVMe opcode 0x00) or set the FUA bit on critical writes. Filesystems do this automatically as part of `fsync()` / `fdatasync()` — those calls translate to FLUSH commands on the wire (or FUA writes for the data path).
+6. Each NVMe I/O queue pair corresponds to one `struct blk_mq_hw_ctx`. The NVMe driver sets `tag_set->nr_hw_queues = nvme_dev->online_queues - 1` (subtract the admin queue) when registering with blk-mq. Each `hctx` stores a pointer to its `struct nvme_queue` in `hctx->driver_data`, set by the driver's `init_hctx()` callback. The Day 2 software queues (`blk_mq_ctx`, one per CPU) feed into these hardware queues.
+7. The CQ phase bit is a 1-bit field in each CQE that the device toggles each time it wraps around the CQ ring. The host tracks the expected phase value (`cq_phase` in `struct nvme_queue`) and reads a CQE as "new" only when its phase matches. After the host reads a CQE and advances `cq_head`, the slot still contains the old data — but with the wrong phase bit, so it's not mistaken for a new completion. This eliminates the need for the device to explicitly clear or invalidate CQ entries — saves DMA writes and simplifies the protocol.
 
 ---
 
 ## Tomorrow: Day 23 — NVMe-oF: Architecture & Transport Comparison
 
-We set up NVMe-oF/TCP loopback, measure latency vs local NVMe,
-and understand the discovery, queue allocation, and ANA multipathing model.
+We set up NVMe-oF/TCP loopback, measure latency vs local NVMe, and
+understand the discovery protocol, queue allocation, and ANA multipathing
+model that extends NVMe over a network fabric.

@@ -1,277 +1,348 @@
-# Day 21: Week 3 Review — Filesystem Architecture Decisions
+# Day 21: Week 3 Review — Filesystem & Block Stack Architecture Reference
 
 ## Objective
-Produce a written filesystem decision guide and work through a full-stack
-design scenario that integrates dm-crypt, RAID, and filesystem choice.
-This is your Week 3 output.
+Synthesize Days 15–20 into a defensible reference for designing the
+filesystem and block-stack layer of a production system. As with Week 1
+and 2 reviews: you produce a written output today, not just read.
 
 ---
 
-## 1. Week 3 Competency Check
+## 1. What You Should Now Be Able to Defend
 
-Verify you can answer without notes. Mark gaps for re-study.
+| Topic | Can defend? |
+|-------|-------------|
+| Whether to use dm-crypt and which options for a given workload | |
+| dm-crypt sector size and workqueue flags — what each does | |
+| RAID-5 partial-stripe write penalty in concrete numbers | |
+| The three md write-hole solutions and when to pick each | |
+| Why XFS scales on parallel metadata better than ext4 | |
+| The CIL and what it provides architecturally | |
+| When ext4 genuinely wins over XFS | |
+| What `xfs_repair` and `e2fsck` actually do (and don't) | |
+| The recovery sequence: state preservation → diagnosis → repair | |
+| Which filesystem features need to be set at mkfs (cannot be changed later) | |
 
-| Question | Confident? |
+---
+
+## 2. The Decisions Matrix You Take Forward
+
+### Encryption layer (dm-crypt)
+
+| Workload | Cipher | Sector size | Workqueue | Notes |
+|----------|--------|-------------|-----------|-------|
+| New NVMe-backed server | aes-xts-plain64 | 4096 | bypass both | Modern default; big perf gains |
+| SATA SSD | aes-xts-plain64 | 4096 | usually bypass | Crypto less of a bottleneck |
+| HDD | aes-xts-plain64 | 512 or 4096 | leave default | Disk dominates |
+| Need integrity, not just confidentiality | capi:gcm(aes)-random + dm-integrity | — | — | Costs space and CPU |
+| Legacy systems | aes-cbc-essiv:sha256 | 512 | leave default | Don't break working systems |
+
+### Redundancy layer (md)
+
+| Workload | Level | Write-hole solution | Notes |
+|----------|-------|--------------------|----|
+| OLTP DB, random writes | RAID-10 | bitmap (parity hole doesn't apply) | 2× space cost; predictable perf |
+| Bulk seq storage | RAID-6 | bitmap | Tolerate dual disk failure |
+| Mixed read-heavy | RAID-5 | bitmap | Acceptable if reads dominate |
+| Heavy write, can afford journal SSD | RAID-5/6 + raid5-cache write-back | journal | Absorbs partial-stripe writes; SPOF unless journal mirrored |
+| No journal disk available | RAID-5/6 | PPL | 30-40% write penalty; not a true journal |
+| Don't compose | RAID-5/6 + critical workload | — | Use RAID-10 instead |
+
+### Filesystem layer
+
+| Decision driver | Pick |
+|----------------|------|
+| Default unless reason otherwise | XFS |
+| Need shrinkability | ext4 |
+| Very small partition (<10GB) on tight memory | ext4 |
+| Many small files (mail, container, build) | XFS |
+| Need reflink (VM images, snapshots) | XFS |
+| Massive scale (100TB+) | XFS |
+| `data=journal` durability requirement | ext4 |
+| Team familiarity dominates | use what they know |
+
+---
+
+## 3. Decisions You Cannot Reverse
+
+This list is the most-asked-about gotcha. Each of these is set at
+creation time and cannot be changed without backup-restore:
+
+| Decision | Where set |
 |----------|-----------|
-| What the RAID-5 write hole is and when it causes data corruption | |
-| Write-intent bitmap: how it reduces resync time from hours to minutes | |
-| XFS AG model: why it enables parallel metadata operations | |
-| XFS logical logging vs JBD2 block logging: key difference | |
-| XFS CIL: what it does and what durability tradeoff it makes | |
-| When XFS log exhaustion occurs and how to prevent it | |
-| ext4 data=ordered: exactly what is ordered and what gap remains | |
-| ext4 data=writeback: why it can expose garbage data | |
-| Btrfs CoW B-tree: how instant snapshots are possible | |
-| Btrfs send/receive incremental: why transfer is small | |
-| dm-crypt IV modes: security difference between plain and xts | |
-| dm-crypt stack ordering with dm-cache: which protects cache at rest | |
+| XFS AG count | mkfs.xfs (can only grow) |
+| XFS v4 vs v5 (CRC) | mkfs.xfs |
+| XFS reflink support | mkfs.xfs -m reflink=1 |
+| XFS block size | mkfs.xfs |
+| XFS log location (internal vs external) | mkfs.xfs |
+| ext4 inode count (bytes-per-inode) | mkfs.ext4 -i |
+| ext4 vs ext3 features | mkfs.ext4 |
+| dm-crypt cipher mode | cryptsetup luksFormat |
+| dm-crypt sector size | cryptsetup luksFormat --sector-size |
+| md RAID level | mdadm --create |
+| md chunk size | mdadm --create (some grow-time changes possible but risky) |
+
+These are the design-review questions that show up later as
+"we'd love to change it but we can't without downtime and data restore."
 
 ---
 
-## 2. Filesystem Decision Guide (Produce This Today)
+## 4. Scenario: Design Review
 
-Write your reference. Fill in these tables before checking answers.
+**You are designing storage for a SaaS analytics platform.**
+- Hardware per node: 2× NVMe (1TB each), 4× HDD (16TB each), 256GB RAM, 32 cores
+- Workload: ingest 200GB/day raw events (mostly sequential append), then
+  scan over the last 30 days to compute aggregates
+- Customers: 100 tenants, each with their own dataset; want isolation
+- Durability: cannot lose acknowledged ingest; backups are nightly
+- Performance: ingest must keep up at sustained 50MB/s aggregate
 
-### Primary Filesystem Selection
+Walk through these decisions and justify each:
 
-| Workload | Filesystem | Key Reason |
-|----------|-----------|-----------|
-| High-concurrency file creation (containers, builds) | | |
-| Large sequential files (video, backups, databases) | | |
-| Simple general purpose, ops team knows it well | | |
-| Backup destination with incremental snapshots | | |
-| Archival with bit-rot detection requirement | | |
-| Database with O_DIRECT | | |
+1. **Layer stack:** What goes on the NVMe vs HDD? Where does dm-crypt sit?
+   Do you use md RAID, dm-cache, or both?
+2. **Filesystem choice:** XFS or ext4? AG count? Reflink?
+3. **Encryption:** dm-crypt at which layer? Cipher? Sector size?
+4. **Tenancy:** how do you give 100 tenants isolation? Per-tenant filesystem?
+   Per-tenant directory with quotas? Separate dm-thin volumes?
+5. **Durability/recovery:** what's your RPO/RTO for a single-disk failure?
+   For a node failure?
 
-### ext4 Journal Mode Selection
-
-| Application | Mode | Reason |
-|-------------|------|--------|
-| PostgreSQL with fsync | | |
-| NFS server export | | |
-| High-throughput log ingestion | | |
-| Critical system config files | | |
-
-### XFS Sizing Rules
-
-Fill in your values:
-- AG count for a 16-core server: ?
-- Log size for busy metadata workload: ?
-- When to use external log device: ?
-- When to use reflink: ?
+Reference answer at end of document.
 
 ---
 
-## 3. Scenario: Full-Stack Design Review
+## 5. The Operational Runbook (Produce This Today)
 
-**Customer brief:**
-A media company stores and serves video assets:
-- 2PB total storage, growing 20TB/month
-- 50,000 files averaging 40GB each (long-form video)
-- Access pattern: write once (ingest), read many times (streaming)
-- Compliance: files must be encrypted at rest (AES-256)
-- Resilience: tolerate 2 simultaneous disk failures
-- Team has strong Linux/XFS experience, no Btrfs experience
-- Hardware: 4 nodes, each with 24× 20TB HDD + 2× 2TB NVMe
+Write a one-screen reference document. Cover, at minimum:
 
-**Design questions:**
+```markdown
+# Filesystem & Block Stack Runbook
+Version: 2026-MM-DD
 
-1. **RAID level:** Given 24 HDDs per node and the 2-failure tolerance requirement,
-   which RAID level would you choose? Calculate usable capacity per node.
-   At what array size does RAID-6 become mandatory over RAID-5?
+## Mount-time errors
+- "log replay required" on ext4: [steps]
+- "log replay required" on XFS: [steps]
+- "structure needs cleaning" on ext4: [steps]
+- XFS metadata corruption shutdown: [steps]
 
-2. **Filesystem choice:** XFS or Btrfs? The customer mentioned that detecting
-   storage corruption over years is important. Does this change your answer?
+## Before running any repair tool
+1. [the preservation steps]
+2. [the diagnosis steps]
 
-3. **Encryption:** The stack is: `filesystem → dm-crypt → RAID → HDD`.
-   Is this ordering correct for encrypt-at-rest? What IV mode and key size?
-   What is the performance impact of dm-crypt on large sequential reads?
+## RAID resync in progress
+- How to throttle: [commands]
+- How to monitor: [commands]
+- When to abort: [criteria]
 
-4. **XFS tuning for this workload:**
-   - Large files (40GB), write-once, read-many
-   - 2PB filesystem, 24-core nodes
-   - What AG count and log size would you set?
-   - What mount options?
-   - `data=ordered` or `data=writeback`?
+## dm-crypt didn't open
+- LUKS header damage: [recovery steps]
+- Forgotten passphrase, have key in TPM: [steps]
+- Forgotten passphrase, no backup: [you're done]
 
-5. **NVMe role:** 2× 2TB NVMe per node, given the access pattern. Propose
-   a specific use for each NVMe. Justify at the architecture level.
+## Filesystem ran out of inodes (ext4)
+- Diagnostic: df -i
+- Short-term: [steps]
+- Long-term: [reformat with -i value]
 
-6. **Incremental backup strategy:** The customer wants daily backups with
-   minimal storage cost. They currently do full rsync daily (expensive).
-   You cannot change the primary filesystem (XFS). What backup mechanism
-   would you propose that achieves incremental efficiency without Btrfs
-   on the primary filesystem?
+## XFS filling up faster than du suggests
+- Likely: preallocation or reflink
+- Diagnosis commands: [list]
 
-**Reference answers at end of document.**
+## XFS AG contention (single CPU pegged on metadata)
+- Diagnosis: [perf, /proc/fs/xfs/stat]
+- Mitigation: [directory restructuring]
+- Long-term: [reformat with higher agcount]
+```
+
+This is what someone on-call wants at 3am. Make it the kind of document
+where you can scroll directly to the symptom you're seeing.
 
 ---
 
-## 4. Hands-On: Stack Verification
+## 6. Hands-On Drill — Without Looking Anything Up
 
-Build the full stack on loopback and verify it works end to end:
+Build up the entire stack on loopback devices. No notes. Time yourself.
 
 ```bash
-# 1. Create test "HDDs"
-for i in $(seq 0 5); do
-    dd if=/dev/zero of=/tmp/disk${i}.img bs=1M count=1024
-    DISK[$i]=$(losetup --find --show /tmp/disk${i}.img)
+# Goal: build dm-crypt + md RAID-5 + XFS, mount, write a file, unmount cleanly
+
+# 1. Create 4 loop devices for the RAID
+for i in 0 1 2 3; do
+    dd if=/dev/zero of=/tmp/d$i.img bs=1M count=256
+    losetup --find --show /tmp/d$i.img
 done
 
-# 2. RAID-6 (4 data + 2 parity)
-mdadm --create /dev/md0 --level=6 --raid-devices=6 \
-    ${DISK[0]} ${DISK[1]} ${DISK[2]} ${DISK[3]} ${DISK[4]} ${DISK[5]}
-cat /proc/mdstat
+# 2. Build RAID-5 on the loops
+# (write the command from memory before reading further)
 
-# 3. dm-crypt on top of RAID
-cryptsetup luksFormat --type luks2 \
-    --cipher aes-xts-plain64 --key-size 512 --batch-mode \
-    --key-file /dev/urandom /dev/md0
+# 3. Wait for initial sync to complete
 
-cryptsetup open /dev/md0 encrypted_raid --key-file /dev/urandom
+# 4. dm-crypt the RAID device
+# (LUKS format with sector-size=4096 and modern cipher)
 
-# 4. XFS on top of dm-crypt
-mkfs.xfs -d agcount=8 -l size=512m /dev/mapper/encrypted_raid
-mount /dev/mapper/encrypted_raid /mnt/stack-test
+# 5. Open the encrypted device
 
-# 5. Verify stack
-dmsetup deps /dev/mapper/encrypted_raid
-# Should show dependency on md0
+# 6. mkfs.xfs on top, with reflink
 
-xfs_info /mnt/stack-test
+# 7. Mount, write data, sync, unmount
 
-# 6. Write a large file and measure throughput
-dd if=/dev/zero of=/mnt/stack-test/testfile bs=1M count=1024 \
-    oflag=direct status=progress
-# Measure: how much overhead does the full stack add?
-
-# 7. Simulate one disk failure during read
-mdadm --fail /dev/md0 ${DISK[2]}
-dd if=/mnt/stack-test/testfile of=/dev/null bs=1M status=progress
-# Should still read successfully (RAID-6 tolerates 1 failure)
-md5sum /mnt/stack-test/testfile   # data integrity check
-
-# Cleanup
-umount /mnt/stack-test
-cryptsetup close encrypted_raid
-mdadm --stop /dev/md0
-for d in "${DISK[@]}"; do losetup -d $d; done
+# 8. Tear it all down cleanly
 ```
+
+If any step takes more than 30 seconds of thinking, that's the topic to
+re-read.
 
 ---
 
-## 5. Tools Drill: Week 3 Commands
+## 7. The Filesystem-Independent Mistakes to Avoid
 
-Run without looking up syntax:
+Some lessons that apply regardless of XFS / ext4 / Btrfs / ZFS:
 
-```bash
-# dm-crypt
-cryptsetup luksDump /dev/sda1
-cryptsetup benchmark
-cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 /dev/sda1
+1. **`fsync()` is not free.** Database "we sync every commit" is a major
+   workload property. XFS log force vs ext4 JBD2 commit have different
+   cost models; pick the FS that fits, then size the underlying device for
+   the resulting fsync rate.
 
-# md/RAID
-cat /proc/mdstat
-mdadm --detail /dev/md0
-mdadm --fail /dev/md0 /dev/sdb
-mdadm --add /dev/md0 /dev/sdc
-echo 100000 > /sys/block/md0/md/sync_speed_max
+2. **The page cache hides the storage layer.** A workload that "works fine"
+   on a single dev box might run from 256GB of RAM with cold disks barely
+   touched. Cold-cache benchmarks reveal what the storage actually does.
 
-# XFS
-xfs_info /mnt/xfs
-xfs_bmap -v /mnt/xfs/largefile
-xfs_db -r /dev/sda -c "freesp -d"
-xfs_logprint /dev/sda | tail -20
-xfs_repair -n /dev/sda    # dry run
+3. **Allocation patterns set at mkfs time.** Block size, AG count, inode
+   count, journal size — you live with these for the filesystem's lifetime.
+   "Default options" is a defensible choice for general workloads; not for
+   ones you know are unusual.
 
-# ext4/JBD2
-tune2fs -l /dev/sdb | grep -E "Journal|journal"
-debugfs /dev/sdb -R "logdump -c"
-mount -o data=ordered /dev/sdb /mnt/ext4
+4. **`du` ≠ `df` for many reasons.** Reflink shares blocks; preallocation
+   reserves space without using it; sparse files have logical >> physical
+   size; XFS speculative preallocation; deleted-but-held-open files (`lsof
+   +L1`). Don't panic when they disagree; understand why.
 
-# Btrfs
-btrfs subvolume snapshot -r /mnt/btrfs/data /mnt/btrfs/snap_$(date +%Y%m%d)
-btrfs send -p /mnt/btrfs/snap_yesterday /mnt/btrfs/snap_today | wc -c
-btrfs scrub start /mnt/btrfs
-btrfs filesystem defragment -r /mnt/btrfs/data
-```
+5. **TRIM/discard policy is a security knob.** dm-crypt swallows discards
+   by default (privacy). Filesystem-level `discard` mount option does
+   inline TRIM (latency). `fstrim` from cron is the usual compromise.
+
+6. **Repair is not the first response to errors.** Errors mean: stop,
+   capture state, diagnose, then decide. Reflexive `e2fsck -y` can turn
+   a fixable problem into a restore-from-backup.
 
 ---
 
-## 6. Week 3 → Week 4 Bridge
+## 8. Week 3 → Week 4 Bridge
 
-Week 4: Modern I/O path — NVMe, NVMe-oF, io_uring, ZNS, pmem.
+Week 4: Modern I/O path — NVMe, NVMe-oF, io_uring, ZNS, pmem, cgroup I/O.
 
-Before starting, ask yourself:
+**Day 22** — NVMe driver: queue pair model at source level
+(`drivers/nvme/host/pci.c`), multi-namespace management, NVMe passthrough.
+
+**Day 23** — NVMe-oF architecture: TCP vs RDMA transport comparison,
+discovery protocol, queue allocation, ANA multipathing model.
+
+**Day 24** — NVMe-oF failure handling + O_DIRECT gap-fill: simulating
+path failure, reconnect behavior, and a targeted look at the O_DIRECT
+kernel path (what BlueStore bypasses and why).
+
+**Day 25** — io_uring deep dive: SQ/CQ rings, fixed buffers, registered
+files, NVMe passthrough via `uring_cmd`.
+
+**Day 26** — ZNS: zone types, write pointer, zone append, dm-zoned shim.
+
+**Day 27** — Persistent memory / DAX: how DAX bypasses both page cache and
+block layer, the durability model (clwb/sfence), tiering implications.
+
+**Day 28** — cgroup I/O: `io.max`, `io.weight`, `io.latency` — three
+distinct enforcement mechanisms and when to use each.
+
+Before starting Week 4, ask yourself:
 - You know virtio-blk's queue model. How does NVMe's queue pair model differ?
 - You know O_DIRECT (from BlueStore). How does io_uring's fixed-buffer mode
   eliminate a cost that even O_DIRECT pays?
 - You know NVMe. What does NVMe-oF/TCP add, and what latency cost does it impose?
 - What is a ZNS zone and why can't bcache run on a ZNS device?
-
-Week 4 will answer the last two in depth. The first two will be fast-pass
-given your existing knowledge — focus will be on the source-level details
-and the architect's decision points that blogs don't cover.
+If you can answer comfortably, Week 4 will reinforce what you know and add
+source-level depth. If not, Week 4 will fill the gaps.
 
 ---
 
-## Reference Answers: Media Storage Scenario
+## Reference Answer: SaaS Analytics Platform
 
-**1. RAID level:**
-RAID-6 (requires 2-failure tolerance — RAID-5 cannot meet this).
-24 disks RAID-6: usable = (24-2) × 20TB = 440TB per node × 4 nodes = 1.76PB usable.
-RAID-5 becomes inadequate at any array size where rebuild time × URE probability
-exceeds acceptable risk. For 20TB HDDs: rebuild reads ~22 × 20TB = 440TB per failed
-disk; at consumer URE rate (1/10^14 bits), ~5 URE events expected during rebuild.
-RAID-6 is mandatory for any array with disks >4TB or >6 drives.
+**1. Layer stack.** The HDDs hold the bulk dataset (4× 16TB = 64TB raw,
+~48TB after RAID-6). The NVMes accelerate. Reasonable layout:
 
-**2. Filesystem:**
-XFS with external checksumming (or accept the gap). The team knows XFS, which
-is the right answer for 40GB large files with parallel access. However, XFS does
-not checksum file data (only metadata in newer versions). To address bit-rot
-detection: add periodic `sha256sum` verification runs (cron), or use a checksumming
-layer above the filesystem. Btrfs would give native checksums but the team
-has no experience and Btrfs on 2PB with heavy write-once ingest is risky.
-Pragmatic answer: XFS + periodic integrity verification.
+```
+Application: append-only event ingest, scan for aggregation
+   │
+   ▼
+XFS (one big FS, with directories per tenant + project quota for isolation)
+   │
+   ▼
+dm-cache writeback (using one NVMe partition for cache, other NVMe for metadata)
+   │
+   ▼
+dm-crypt (aes-xts-plain64, sector=4096, no_*_workqueue, allow_discards)
+   │
+   ▼
+md RAID-6 (4× 16TB HDDs, chunk=256K, write-intent bitmap)
+```
 
-**3. Encryption ordering:**
-`filesystem → dm-crypt → RAID → HDD` — this IS correct. dm-crypt sits above
-RAID, so all data written to RAID devices is encrypted. The filesystem sees
-plaintext; dm-crypt encrypts before data reaches RAID.
-IV mode: `aes-xts-plain64`, key size 512 bits (2×256-bit XTS keys).
-Performance impact on large sequential reads: minimal with AES-NI hardware.
-AES-XTS at 2-4GB/s on modern CPUs; 24×20TB HDD saturates at ~3.6GB/s aggregate —
-dm-crypt will not be the bottleneck. Queue depth matters: run at iodepth≥32.
+Encryption at the bottom: every block on persistent media is encrypted,
+including the cache. Cost: ~3-5% on NVMe (with workqueue bypass), nearly
+invisible on HDD.
 
-**4. XFS tuning:**
-- AG count: 24 cores → 24 AGs (one per core for parallel allocation).
-  But filesystem size constrains AG size: 440TB / 24 AGs = ~18TB per AG.
-  18TB AG is within XFS limits (max ~16TB in older kernels, larger in 6.x).
-  Use `agcount=24` or let mkfs auto-calculate for large filesystem.
-- Log size: write-once ingest at 20TB/month = heavy metadata activity.
-  Use 2GB internal log or external log on NVMe.
-- Mount options: `noatime,nodiscard,logbufs=8,logbsize=256k,largeio`
-- Journal mode: `data=ordered` (default, appropriate). For write-once video
-  files, writeback gives marginal gain; ordered is safer and the overhead
-  is irrelevant for large sequential writes.
+Skip md write-journal — RAID-6 partial-stripe penalty matters less for
+append-mostly workloads. Bitmap is enough.
 
-**5. NVMe role:**
-- NVMe 0 (2TB): XFS external log (`mkfs.xfs -l logdev=/dev/nvme0`).
-  Separates journal I/O from data I/O — eliminates HDD head contention
-  between log checkpoints and video ingest writes.
-- NVMe 1 (2TB): Read cache (dm-cache) for hot video content.
-  Video streaming is read-heavy once ingested. Cache recently accessed
-  video segments in NVMe to reduce HDD read load. Use writethrough mode
-  (write-once assets — no benefit from writeback; simpler failure semantics).
+**2. Filesystem.** XFS. Reasons:
+- Per-tenant directories with project quotas (XFS quota infrastructure is mature)
+- No inode-count limit (each tenant may have many files)
+- Reflink for nightly backups via `cp --reflink`
+- Sequential-append workload benefits from XFS's larger extent sizes
+- AG count: 32 — match the 32 cores, give each ingest thread room to run
 
-**6. Incremental backup without Btrfs on primary:**
-Options in order of preference:
-1. **LVM snapshots + `rsync --link-dest`**: Take LVM snapshot of XFS volume
-   daily, rsync changed files to backup with hardlinks for unchanged files.
-   Space-efficient on backup destination.
-2. **Restic or Borg Backup**: Content-addressable backup with deduplication.
-   Only changed blocks transferred; efficient incremental. Works on any filesystem.
-3. **ZFS on backup destination**: Send data from XFS via rsync to ZFS backup
-   server; ZFS manages incremental snapshots on the backup side.
-   Best option: Restic to object storage (S3/Ceph RGW) gives scalable,
-   content-deduplicated backups without filesystem constraints.
+`mkfs.xfs -m reflink=1 -d agcount=32 -l logdev=<separate nvme partition>`
+
+External log on a small NVMe partition keeps log writes off the HDD —
+metadata throughput stays high even as HDDs get pounded by reads.
+
+**3. Encryption.** dm-crypt under everything:
+- aes-xts-plain64 with sector_size=4096
+- no_read_workqueue, no_write_workqueue (the cache-NVMe perf matters most)
+- allow_discards (so dm-cache can free up SSD blocks when data ages out)
+
+LUKS2 keys in TPM2 or sealed against PCRs, with a recovery passphrase
+stored offline. Per-node key — losing one drive doesn't compromise the
+others.
+
+**4. Tenancy.** Per-tenant directories with XFS project quotas:
+```bash
+mkdir /data/tenant_42
+xfs_quota -x -c "project -s -p /data/tenant_42 42" /data
+xfs_quota -x -c "limit -p bsoft=400G bhard=500G 42" /data
+```
+
+100 separate filesystems would be wasteful (100 logs, 100 quotas, 100
+metadata footprints). Project quotas give isolation without the overhead.
+
+For data isolation (one tenant's data invisible to another), use ordinary
+filesystem permissions + per-tenant containers with mount namespaces.
+
+**5. Durability / recovery.**
+- Single HDD failure: RAID-6 keeps the array online. Resync from spare
+  takes ~6 hours on 16TB drive. RTO=immediate, RPO=0 for committed writes.
+- Node failure (whole machine): need replication. RAID protects against
+  disk failure, not node failure. RPO depends on application-level
+  replication or backup cadence. Nightly backups give RPO ≤ 24h; if
+  unacceptable, add Kafka-style replicated ingest.
+- dm-cache NVMe failure: writeback mode → up to writeback_rate * latency
+  worth of dirty data lost. To get RPO=0 from cache failure, use
+  writethrough (acceptable for append-heavy ingest where writes are
+  large enough to bypass cache anyway), OR mirror the NVMe cache.
+- Filesystem corruption: XFS log recovers automatically. Major
+  corruption: restore from backup; the application has nightly snapshots
+  via reflink-based cp.
+
+---
+
+## Tomorrow: Day 22 — NVMe Driver: Queue Pairs, Namespaces & Passthrough
+
+We start Week 4 by going deep on the NVMe driver itself: the queue pair
+model at source level, multi-namespace management, and NVMe passthrough.

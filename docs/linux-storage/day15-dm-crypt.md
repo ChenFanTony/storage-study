@@ -1,362 +1,336 @@
-# Day 15: dm-crypt — Per-Bio Encryption & Performance Architecture
+# Day 15: dm-crypt — IV Modes, Queue Depth, and Performance Overhead
 
 ## Learning Objectives
-- Understand dm-crypt's per-bio encryption model at source level
-- Know the IV (initialization vector) modes and their security/performance tradeoffs
-- Measure encryption overhead at different queue depths
-- Know when hardware inline encryption (blk-crypto) changes the picture
-- Be able to specify encryption architecture in a design review
+- Understand dm-crypt's architecture and where in the stack encryption happens
+- Know the IV modes (`plain64`, `essiv`, `random`) and their security/performance trade-offs
+- Understand why dm-crypt's internal workqueues hurt fast SSDs, and how to bypass them
+- Measure the actual overhead of encryption at different queue depths and block sizes
+- Know the architect-level recommendations for production deployments
 
 ---
 
-## 1. dm-crypt in the Stack
+## 1. Where dm-crypt Sits in the Stack
 
 ```
-Application write
-  → VFS → filesystem → block layer
-    → dm-crypt target
-        → encrypt bio data (in-place or new pages)
-        → resubmit encrypted bio to underlying device
-          → NVMe / HDD
+        Filesystem (ext4 / XFS / ...)
+              │
+              ▼ submit_bio()
+        ┌─────────────────────────────────┐
+        │   dm-crypt (device-mapper)      │
+        │   - intercepts bio              │
+        │   - per-sector IV generation    │
+        │   - calls kernel crypto API     │
+        │   - clones bio with ciphertext  │
+        └────────────────┬────────────────┘
+                         │
+                         ▼
+              Underlying block device (SSD/HDD/RAID)
 ```
 
-dm-crypt sits as a device mapper target. Every bio passing through gets
-encrypted (writes) or decrypted (reads) before being passed down or up.
-
-```c
-// drivers/md/dm-crypt.c — the core structure
-
-struct crypt_config {
-    struct dm_dev       *dev;           // underlying block device
-    sector_t            start;          // offset on underlying device
-
-    struct crypto_skcipher *tfm[];      // array of cipher transform handles
-                                        // one per CPU (avoid lock contention)
-
-    char                *cipher_string; // e.g. "aes-xts-plain64"
-    struct crypt_iv_operations *iv_gen_ops; // IV generation method
-
-    unsigned int        key_size;
-    u8                  *key;
-
-    mempool_t           req_pool;       // pre-allocated crypto request pool
-    mempool_t           page_pool;      // pre-allocated page pool for bounce buffers
-    // ...
-};
-```
-
-Key design: **one cipher transform handle per CPU** — this is how dm-crypt
-avoids per-request lock contention on the crypto hardware or software path.
+dm-crypt is **synchronous from the filesystem's view**: a write returns only
+after encryption + underlying device write completes. But internally, dm-crypt
+has historically used kernel workqueues (`kcryptd`) to offload the actual
+encryption work — which adds latency on fast devices. That's the central
+performance story today.
 
 ---
 
-## 2. The Per-Bio Encryption Path
+## 2. Cipher Specification Format
 
-### Write path (encrypt before writing to disk)
-
-```c
-// dm-crypt.c: crypt_map() — called for every bio
-
-crypt_map(struct dm_target *ti, struct bio *bio):
-    io = crypt_io_alloc(cc, bio, ...);
-
-    if (bio_data_dir(bio) == WRITE):
-        kcryptd_queue_crypt(io);
-        // → worker thread: kcryptd_crypt_write_io_submit()
-        //   → crypt_convert() — encrypt each bio_vec segment
-        //     → for each sector:
-        //       1. generate IV for this sector
-        //       2. skcipher_request_set_crypt(req, src, dst, len, iv)
-        //       3. crypto_skcipher_encrypt(req)
-        //     → encrypted data written to cloned bio
-        //   → submit cloned bio to underlying device
-
-    if (bio_data_dir(bio) == READ):
-        // submit read to underlying device first
-        // on completion: decrypt in kcryptd_crypt_read_done()
+```
+cipher-chainmode-ivmode[:ivopts]
 ```
 
-**Bounce buffers:** dm-crypt typically allocates new pages for encrypted data
-rather than encrypting in-place. This means every I/O involves:
-- Allocate page(s) for encrypted/decrypted copy
-- Crypto operation
-- Free original page(s)
+Common combinations (from kernel docs):
+- `aes-xts-plain64` — current default; **XTS mode with plain64 IV**
+- `aes-cbc-essiv:sha256` — older default; CBC mode with ESSIV
+- `aes-cbc-plain64` — INSECURE for disk encryption; vulnerable to watermarking
+- `capi:gcm(aes)-random` — authenticated mode (AEAD); higher cost, integrity
 
-This is why dm-crypt has measurable memory allocation overhead at high IOPS.
+Verify with `cryptsetup luksDump <device>` or `dmsetup table <name>`:
+```bash
+dmsetup table cryptroot | head -1
+# 0 1953125000 crypt aes-xts-plain64 :64:logon:cryptsetup:... 0 8:1 4096 ...
+#                    ^^^^^^^^^^^^^^^ cipher-mode-iv
+```
 
 ---
 
-## 3. IV Modes — Security vs Performance
+## 3. IV Modes — What They Are and Why It Matters
 
-The IV (Initialization Vector) ensures that identical plaintext blocks
-encrypt to different ciphertexts. The IV mode is the most security-critical
-design decision in full-disk encryption.
+The IV (initialization vector) prevents two encryptions of the same plaintext
+from producing the same ciphertext. For disk encryption, each sector needs a
+unique IV that the kernel can recompute on read.
 
-### `plain` / `plain64`
+### plain64
+- IV is just the sector number (64-bit). Cheap to compute.
+- **Required for XTS** — XTS uses the IV as a "tweak"; the security
+  proof relies on tweaks being unique but not secret. Using sector number
+  directly is fine in XTS.
+- **NOT acceptable for CBC** — predictable IVs in CBC enable watermarking
+  attacks (an attacker who knows the plaintext can detect when specific
+  files appear on disk).
+
+### essiv:hash
+- IV is computed by encrypting the sector number with a hash of the master key.
+- Adds one extra encryption per sector (modest cost).
+- Used historically with CBC to make the IV unpredictable to attackers.
+- `aes-cbc-essiv:sha256` is the canonical "secure CBC" combination.
+
+### random
+- IV is a fresh random number per sector, stored alongside the ciphertext.
+- Used by AEAD modes (`gcm`, `chacha20-poly1305`) because GCM is catastrophically
+  broken under IV reuse.
+- Requires extra space on disk per sector for the IV + auth tag — only viable
+  with the integrity-aware on-disk format.
+
+### Architect's rule
+- **Use `aes-xts-plain64` for everything new.** This is what cryptsetup defaults
+  to and what every modern Linux distro uses. XTS is hardware-accelerated via
+  AES-NI and gives the best performance.
+- If you see `aes-cbc-essiv:sha256` in old systems, that was the previous
+  default. Don't change a working system without reason.
+- If integrity matters (you want to detect tampering, not just secrecy),
+  use an AEAD mode like `capi:gcm(aes)-random` and accept the overhead.
+
+---
+
+## 4. The Cloudflare Discovery: dm-crypt's Internal Queues Hurt Fast SSDs
+
+This is the single most important production knob to know.
+
 ```
-IV = sector_number (32-bit / 64-bit)
-Performance: best (trivial computation)
-Security: vulnerable to watermarking attacks if attacker knows plaintext
-Use: legacy, avoid for new deployments
+Default dm-crypt I/O path:
+  bio in → kcryptd workqueue → encrypt → submit to disk
+  disk completion → kcryptd_io workqueue → decrypt → return to caller
+
+Each workqueue hop = a context switch + cache miss + scheduler latency.
+On a 7200rpm HDD: invisible (disk is the bottleneck anyway).
+On a fast NVMe: visible — kcryptd becomes a serialization point.
 ```
 
-### `essiv`
-```
-IV = encrypt(sector_number, hash(key))
-Performance: one extra block cipher per IV (small overhead)
-Security: protects against watermarking; sector numbers are not predictable
-Use: was the recommended default; now superseded by xts mode
-```
+Cloudflare's investigation (Speeding up Linux disk encryption, 2020) added
+two flags that let dm-crypt bypass these workqueues:
 
-### `xts` (XEX-based tweaked-codebook mode with ciphertext stealing)
-```
-Mode: XTS-AES (aes-xts-plain64)
-IV: sector number used directly as "tweak" — XTS handles this internally
-Performance: ~same as plain64 but mode provides stronger security
-Security: current standard for disk encryption
-          resistant to chosen-plaintext attacks
-          does NOT provide authentication (no integrity check)
-Use: recommended default for all new deployments
-```
+- `no_read_workqueue` — encrypt/decrypt the read path inline in the bio
+  completion context.
+- `no_write_workqueue` — submit the encrypted write directly to the underlying
+  device from the submitter's context (no kcryptd hop).
 
-### `adiantum`
-```
-Mode: ChaCha12 + Poly1305-based (ARM-optimized)
-Performance: significantly faster than AES on systems WITHOUT AES-NI
-Security: strong, but not FIPS-approved
-Use: embedded/ARM systems without hardware AES acceleration
-```
+Both can be set persistently in the LUKS2 header so they apply at every boot:
 
 ```bash
-# Check what cipher your LUKS volume uses
-cryptsetup luksDump /dev/nvme0n1 | grep -E "Cipher|Mode|Hash"
+# One-time set, persisted in LUKS2 metadata
+cryptsetup --perf-no_read_workqueue --perf-no_write_workqueue \
+           --persistent refresh <crypt_name>
 
-# Benchmark cipher performance
+# Verify they're set
+cryptsetup luksDump /dev/nvme0n1p3 | grep -i flags
+# Flags:       no-read-workqueue no-write-workqueue
+
+# Verify on the active device
+dmsetup table cryptroot | grep -o "no_[rw]*_workqueue"
+```
+
+### When this helps vs hurts
+
+| Backing device | Workload | Effect |
+|----------------|----------|--------|
+| Fast NVMe | Sequential, small block (4K) | **Big speedup** (often 2–5×) |
+| Fast NVMe | High queue depth, parallel | Helps modestly; thread sharing matters |
+| SATA SSD | Mixed | Helps moderately |
+| HDD | Anything | Negligible (disk dominates) |
+| Heavy CPU contention | Anything | Can hurt — workqueue let crypto run on free CPUs |
+
+The flags trade workqueue offload for inline execution. On a CPU-saturated
+system, inline encryption blocks the submitting thread. Measure before
+making it persistent on a multi-tenant box.
+
+---
+
+## 5. Sector Size: Another Major Knob
+
+dm-crypt's default sector size is 512 bytes — even when the device and
+filesystem use 4096. This means:
+- Every 4K filesystem block triggers 8 separate IV computations + 8 crypto API calls.
+- Per-bio overhead dominates the actual crypto cost on fast hardware.
+
+Setting the dm-crypt sector size to 4096 collapses this to 1 IV + 1 crypto
+call per filesystem block.
+
+```bash
+# Must be set at LUKS format time (not retroactively changeable)
+cryptsetup luksFormat --sector-size=4096 /dev/nvme0n1p3
+```
+
+Verify:
+```bash
+cryptsetup luksDump /dev/nvme0n1p3 | grep -i sector
+# sector: 4096 [bytes]
+```
+
+Reported gains on NVMe: 50–100% on small-block sequential workloads.
+
+---
+
+## 6. AES-NI and Hardware Acceleration
+
+Modern x86 CPUs accelerate AES via the AES-NI instruction set. Verify:
+
+```bash
+# CPU has AES-NI?
+grep -m1 -o 'aes' /proc/cpuinfo
+
+# Kernel using accelerated AES module?
+grep -m1 'name\s*: aes' /proc/crypto -A2
+# Look for "module" referencing aesni_intel or similar
+
+# Benchmark crypto modes
 cryptsetup benchmark
-# Shows: cipher, key size, encryption speed (MB/s), decryption speed (MB/s)
-# On AES-NI capable hardware: AES-XTS typically 2-10 GB/s
-# Without AES-NI: 200-500 MB/s
+# Shows MB/s for aes-cbc, aes-xts at 128- and 256-bit keys
 ```
+
+If `cryptsetup benchmark` reports ~2GB/s or more for AES-XTS on a modern CPU,
+AES-NI is active. Without it, expect roughly 5–10× slower throughput and
+much higher CPU load — non-AES-NI is rarely viable for fast storage.
+
+ARM has equivalents (`aes`, `pmull` features in `/proc/cpuinfo`).
 
 ---
 
-## 4. Performance Impact: Queue Depth Is Critical
-
-dm-crypt's crypto operations happen in worker threads (`kcryptd`). At low
-queue depth, the crypto threads are the bottleneck. At high queue depth,
-the underlying device becomes the bottleneck.
-
-```
-Queue depth = 1:
-  Request arrives → crypto thread encrypts → submits to NVMe
-  → crypto thread idle while NVMe processes
-  → next request
-  CPU utilization: low; throughput: limited by crypto thread latency
-
-Queue depth = 32:
-  32 requests arrive → 32 concurrent crypto operations (one per CPU if enough CPUs)
-  → all submitted to NVMe simultaneously
-  → NVMe saturated; crypto threads stay busy
-  CPU utilization: high; throughput: near-device maximum
-```
+## 7. Hands-On: Measure the Real Overhead
 
 ```bash
-# Measure dm-crypt overhead at various queue depths
-LUKS_DEV=/dev/mapper/crypted
+# Setup: take any NVMe partition, encrypt it, benchmark both ways.
+RAW=/dev/nvme0n1p3
+NAME=test_crypt
 
-for depth in 1 4 16 32 64; do
-    echo "=== iodepth=$depth ==="
-    fio --name=crypt-test-${depth} \
-        --filename=${LUKS_DEV} \
-        --rw=randread \
-        --bs=4k \
-        --ioengine=libaio \
-        --iodepth=${depth} \
-        --time_based --runtime=15 \
-        --output-format=terse | grep -oP 'iops=\K[0-9]+'
-done
+cryptsetup luksFormat --type luks2 --sector-size=4096 $RAW
+cryptsetup open $RAW $NAME
+# /dev/mapper/$NAME is now usable
 
-# Compare against raw device (no encryption)
-for depth in 1 4 16 32 64; do
-    echo "=== raw iodepth=$depth ==="
-    fio --name=raw-${depth} \
-        --filename=/dev/nvme0n1 \
-        --rw=randread \
-        --bs=4k \
-        --ioengine=libaio \
-        --iodepth=${depth} \
-        --time_based --runtime=15 \
-        --output-format=terse | grep -oP 'iops=\K[0-9]+'
-done
-# Overhead = (raw_iops - crypt_iops) / raw_iops × 100%
-# Expected: <5% at depth 32+ with AES-NI; 20-40% at depth 1
-```
+# Baseline: raw device random 4K reads
+fio --name=raw --filename=$RAW --rw=randread --bs=4k \
+    --ioengine=libaio --iodepth=32 --time_based --runtime=30 \
+    --percentile_list=50,99 --output-format=terse | grep -E 'iops|lat'
 
----
+# Encrypted, default settings
+fio --name=def --filename=/dev/mapper/$NAME --rw=randread --bs=4k \
+    --ioengine=libaio --iodepth=32 --time_based --runtime=30 \
+    --percentile_list=50,99 --output-format=terse | grep -E 'iops|lat'
 
-## 5. Hardware Inline Encryption: blk-crypto
+# Enable workqueue bypass and refresh the active mapping
+cryptsetup --perf-no_read_workqueue --perf-no_write_workqueue \
+           refresh $NAME
 
-blk-crypto (kernel 5.8+) moves encryption out of dm-crypt and into the
-block layer, using hardware engines in modern NVMe controllers and eMMC.
-
-```
-dm-crypt path (software):
-  bio data → CPU encrypts → encrypted bio → NVMe controller → NAND
-
-blk-crypto path (hardware inline):
-  bio data → NVMe controller → encrypts during DMA → NAND
-  (CPU does zero crypto work)
-```
-
-```c
-// block/blk-crypto.c
-
-// bio gets an encryption context attached:
-struct bio_crypt_ctx {
-    const struct blk_crypto_key *bc_key;
-    u64                          bc_dun[BLK_CRYPTO_DUN_ARRAY_SIZE]; // IV/DUN
-};
-
-// blk-crypto checks if hw supports the key/algorithm:
-// If yes → hardware does encryption during DMA
-// If no  → blk-crypto-fallback: software encrypt same as dm-crypt
-```
-
-```bash
-# Check if your NVMe supports inline encryption
-cat /sys/block/nvme0n1/queue/crypto/max_dun_bits 2>/dev/null
-# If file exists and non-zero → hardware inline encryption supported
-
-# fscrypt uses blk-crypto for per-file encryption (Android, ChromeOS)
-# For full-disk encryption with inline crypto: use fscrypt or blk-crypto directly
-# dm-crypt does NOT automatically use blk-crypto hardware (as of kernel 6.x)
-```
-
----
-
-## 6. dm-crypt + dm-cache: Stack Ordering Matters
-
-Two valid orderings, very different behavior:
-
-### Option A: dm-crypt below dm-cache (encrypt at rest)
-```
-filesystem → dm-cache (plaintext cache) → dm-crypt → NVMe/HDD
-```
-- SSD cache stores **plaintext** data — if SSD is stolen, data exposed
-- Encryption happens at the physical device boundary
-- Cache performance unaffected by encryption (plaintext in SSD)
-- **Not encrypt-at-rest for cache device**
-
-### Option B: dm-crypt above dm-cache (cache encrypted data)
-```
-filesystem → dm-crypt → dm-cache (encrypted cache) → NVMe/HDD
-```
-- SSD cache stores **ciphertext** — both SSD and HDD are encrypted at rest
-- Every cache hit still requires decryption (CPU cost on read)
-- Every cache write requires encryption (CPU cost on write)
-- Correct for full encrypt-at-rest security model
-
-```bash
-# Verify your stack ordering
-dmsetup deps /dev/mapper/your_device
-# Shows what each dm device depends on
-# Trace from top to bottom to see the ordering
-```
-
-**Architect recommendation:** Option B is almost always correct for security.
-Option A is only acceptable if the SSD cache device is physically secured
-(encrypted at hardware level or in a tamper-evident enclosure).
-
----
-
-## 7. LUKS2 vs LUKS1: Architect Differences
-
-```bash
-# LUKS2 (recommended for new deployments)
-cryptsetup luksFormat --type luks2 \
-    --cipher aes-xts-plain64 \
-    --key-size 512 \          # 512 bits = 2×256-bit XTS keys
-    --hash sha256 \
-    --pbkdf argon2id \        # memory-hard KDF (resistant to GPU cracking)
-    /dev/nvme0n1
-
-# Key LUKS2 improvements over LUKS1:
-# - Argon2id PBKDF (LUKS1 uses PBKDF2 — weaker against GPU attacks)
-# - JSON metadata header (more robust, supports more keyslots)
-# - Integrity support (with --integrity option: adds per-sector auth tags)
-# - Header backup areas (more resilient to partial corruption)
-
-# LUKS2 with integrity (encrypt + authenticate — protects against bit-flip attacks)
-cryptsetup luksFormat --type luks2 \
-    --cipher aes-xts-plain64 \
-    --integrity hmac-sha256 \   # adds 32-byte integrity tag per sector
-    /dev/nvme0n1
-# Note: integrity reduces usable capacity by ~1.6% and adds overhead
-```
-
----
-
-## 8. Hands-On: Measure Encryption Overhead
-
-```bash
-# Setup LUKS2 on a test device or file
-dd if=/dev/zero of=/tmp/crypt-test.img bs=1M count=4096
-LOOP=$(losetup --find --show /tmp/crypt-test.img)
-
-cryptsetup luksFormat --type luks2 \
-    --cipher aes-xts-plain64 --key-size 512 \
-    --batch-mode --key-file /dev/urandom \
-    $LOOP
-
-cryptsetup open $LOOP crypttest --key-file /dev/urandom
-
-# Benchmark: raw vs encrypted
-echo "=== Raw loopback ==="
-fio --name=raw --filename=$LOOP \
-    --rw=randwrite --bs=4k --ioengine=libaio --iodepth=32 \
-    --time_based --runtime=20 --output-format=terse \
-    | awk -F';' '{print "write IOPS:", $49, "read IOPS:", $8}'
-
-echo "=== Encrypted (dm-crypt) ==="
-fio --name=enc --filename=/dev/mapper/crypttest \
-    --rw=randwrite --bs=4k --ioengine=libaio --iodepth=32 \
-    --time_based --runtime=20 --output-format=terse \
-    | awk -F';' '{print "write IOPS:", $49, "read IOPS:", $8}'
-
-# Check CPU usage during encrypted I/O
-iostat -x 1 5 &
-fio --name=enc-cpu --filename=/dev/mapper/crypttest \
-    --rw=randread --bs=4k --ioengine=libaio --iodepth=32 \
-    --time_based --runtime=10
+# Same fio run again — compare
+fio --name=opt --filename=/dev/mapper/$NAME --rw=randread --bs=4k \
+    --ioengine=libaio --iodepth=32 --time_based --runtime=30 \
+    --percentile_list=50,99 --output-format=terse | grep -E 'iops|lat'
 
 # Cleanup
-cryptsetup close crypttest
-losetup -d $LOOP
+cryptsetup close $NAME
 ```
 
----
-
-## 9. Self-Check Questions
-
-1. Why does dm-crypt allocate one cipher transform handle per CPU?
-2. What is the security weakness of the `plain` IV mode compared to `xts`?
-3. At queue depth 1 vs queue depth 32, what changes about dm-crypt's performance bottleneck?
-4. In a stack with both dm-cache and dm-crypt, which ordering encrypts the SSD cache data at rest?
-5. What does blk-crypto hardware inline encryption change vs dm-crypt software encryption?
-6. LUKS2 with `--integrity hmac-sha256` adds what security property that plain XTS does not have?
-
-## 10. Answers
-
-1. Crypto operations are not thread-safe on a single transform handle. Per-CPU handles eliminate locking — each CPU encrypts its own requests without contention.
-2. `plain` uses the sector number directly as IV. An attacker who knows two plaintexts that differ by exactly one block can detect the pattern in ciphertexts — watermarking attack. XTS mode uses the sector number as a tweak value processed through a second AES operation, eliminating this vulnerability.
-3. At depth 1: crypto thread is the bottleneck — request waits for encrypt, then submits, then idles while device processes. At depth 32: 32 crypto operations run in parallel (across CPUs), device is kept saturated. The bottleneck shifts from crypto CPU to device throughput.
-4. Option B: `filesystem → dm-crypt → dm-cache → device`. dm-cache stores ciphertext, so both SSD and HDD are encrypted at rest.
-5. Hardware inline encryption offloads crypto from CPU to NVMe controller — done during DMA. CPU overhead drops to near zero. dm-crypt still uses CPU even with AES-NI.
-6. Authentication/integrity: each sector has an HMAC tag. Bit-flip attacks (flipping encrypted bits to corrupt decrypted data in a controlled way) are detected and rejected. Plain XTS provides confidentiality only — an attacker can flip bits in ciphertext and corrupt plaintext in predictable ways without detection.
+What you're looking for:
+- IOPS difference between raw and encrypted (with workqueues): the cost of dm-crypt.
+- IOPS difference between default and bypassed workqueues: how much the
+  workqueue overhead specifically costs you.
+- p99 latency comparison: workqueue path typically adds 20–100µs of tail.
 
 ---
 
-## Tomorrow: Day 16 — md/RAID: Resync, Bitmap Journal & Failure Recovery
+## 8. Discard / TRIM Through dm-crypt
 
-We go deep on RAID-5's partial-stripe write problem, write-intent bitmap
-impact on resync time, and md's personality model at source level.
+By default dm-crypt **swallows discards** — the underlying SSD never sees TRIM.
+This is for plausible-deniability reasons (TRIM patterns reveal which blocks
+contain data), but for typical full-disk encryption it just means your SSD's
+internal GC gets worse over time.
+
+```bash
+# Enable discard passdown at open time (one-shot)
+cryptsetup --allow-discards open $RAW $NAME
+
+# Or persistently
+cryptsetup --allow-discards --persistent refresh $NAME
+
+# Verify
+dmsetup table $NAME | grep -o allow_discards
+```
+
+**Security note:** an attacker with offline disk access can see which sectors
+are unmapped vs encrypted. For most production use cases this is acceptable;
+for plausible-deniability scenarios it isn't.
+
+---
+
+## 9. CPU Affinity: `same_cpu_crypt` and `submit_from_crypt_cpus`
+
+Two more optional dm-crypt features worth knowing:
+
+- `same_cpu_crypt` — perform the encryption on the same CPU that submitted
+  the bio. Improves cache locality but loses the ability to parallelize
+  encryption across CPUs for a single submitter.
+- `submit_from_crypt_cpus` — submit the resulting encrypted bio from the
+  CPU that did the encryption (rather than the original submitter). Pairs
+  well with `same_cpu_crypt`.
+
+These matter on multi-socket NUMA boxes where bouncing bios across sockets
+adds latency. On a typical single-socket NVMe server they make little
+difference; measure before setting.
+
+---
+
+## 10. Architect's Decision Matrix
+
+| Scenario | Cipher | Sector | Flags | Reasoning |
+|----------|--------|--------|-------|-----------|
+| New NVMe-backed system | `aes-xts-plain64` | 4096 | `no_*_workqueue`, `allow_discards` | Modern default, big perf gains |
+| SATA SSD | `aes-xts-plain64` | 4096 | `allow_discards` (workqueue optional) | Crypto isn't bottleneck; workqueue helps less |
+| HDD | `aes-xts-plain64` | 512 or 4096 | none needed | Disk dominates; tuning negligible |
+| Integrity required | `capi:gcm(aes)-random` + dm-integrity | n/a | n/a | Cost is real; only when threat model demands |
+| Legacy system | `aes-cbc-essiv:sha256` | 512 | leave alone | Don't break what works without reason |
+
+---
+
+## 11. Source Reading Checklist
+
+```
+drivers/md/dm-crypt.c          # the whole target
+  crypt_map()                  # bio entry point
+  kcryptd_io()                 # workqueue handlers
+  crypt_convert()              # actual encryption loop
+  crypt_iv_*_gen()             # IV generators (one per mode)
+```
+
+The IV generator functions (`crypt_iv_plain64_gen`, `crypt_iv_essiv_gen`,
+`crypt_iv_random_gen`) are short and worth reading to internalize what each
+IV mode actually computes.
+
+---
+
+## 12. Self-Check Questions
+
+1. Why is `aes-cbc-plain64` insecure for disk encryption while `aes-xts-plain64` is fine?
+2. What do `no_read_workqueue` and `no_write_workqueue` do, and on what hardware do they help most?
+3. Why does setting dm-crypt sector size to 4096 (vs 512) typically improve performance on NVMe?
+4. A customer reports 1GB/s throughput on a raw NVMe but only 200MB/s with dm-crypt. AES-NI is enabled. What's the most likely cause and what would you try first?
+5. Why is enabling `allow_discards` a security/performance trade-off?
+6. When would you NOT enable the workqueue-bypass flags?
+
+## 13. Answers
+
+1. CBC with predictable IVs (the sector number) lets an attacker compare ciphertext patterns across devices and detect known plaintext files — the watermarking attack. XTS uses the IV as a "tweak" in a different way; its security proof allows public, sector-number-derived tweaks.
+2. They make dm-crypt do encryption/decryption inline in the submitter's context instead of bouncing through the `kcryptd`/`kcryptd_io` workqueues. Each workqueue hop adds context-switch and scheduler latency that becomes visible on fast SSDs (NVMe especially) where the underlying I/O is already in the tens-of-microseconds range. On HDDs the workqueue overhead is invisible.
+3. With 512-byte sectors, each 4K filesystem block becomes 8 separate IV computations + 8 crypto API calls + 8 bio splits, multiplying the per-operation overhead. 4K sector size collapses this to one operation per filesystem block.
+4. Most likely the default workqueue path is the bottleneck. Try `cryptsetup --perf-no_read_workqueue --perf-no_write_workqueue refresh`. Also check the LUKS sector size with `cryptsetup luksDump` — if it's 512, you'd need to re-format with `--sector-size=4096` to fix it (data loss; back up first).
+5. Discard reveals which blocks are unmapped/empty on the underlying device. An attacker with offline access can see your filesystem's allocation pattern (rough file sizes, free space). In exchange, the SSD's internal GC works correctly and write performance doesn't degrade over time. For typical FDE this trade is fine; for plausible-deniability scenarios it isn't.
+6. On a CPU-saturated, multi-tenant box, the workqueues let crypto run on otherwise-idle CPUs. Inline execution blocks the submitting thread. If your bottleneck is CPU rather than I/O latency, the bypass flags can hurt. Measure both ways under realistic load.
+
+---
+
+## Tomorrow: Day 16 — md/RAID: Partial-Stripe Writes and Resync
+
+We go deep on the RAID-5/6 small-write problem, why write-intent bitmaps
+matter for resync time, and how md's stripe cache interacts with the
+block layer's plug mechanism.

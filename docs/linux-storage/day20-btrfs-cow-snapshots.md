@@ -3,7 +3,7 @@
 ## Learning Objectives
 - Understand Btrfs's CoW B-tree as the foundation for all Btrfs features
 - Follow snapshot creation and the subvolume model at source level
-- Understand send/receive stream format and its use in backup/replication
+- Understand the send/receive stream format and incremental backup mechanics
 - Know Btrfs's production limits and where it fails
 - Know when to recommend Btrfs vs XFS for backup/snapshot architectures
 
@@ -11,21 +11,21 @@
 
 ## 1. Btrfs's Core: The CoW B-tree
 
-Everything in Btrfs — data, metadata, snapshots, subvolumes — is stored
-in a single CoW (copy-on-write) B-tree. Understanding this tree is the key
-to understanding all Btrfs features.
+Everything in Btrfs — data extents, metadata, snapshots, subvolumes — is
+stored in a single CoW (copy-on-write) B-tree. Understanding this tree is
+the key to understanding all Btrfs features.
 
 ```
 Btrfs on-disk structure:
 
 Superblock
-  └── Root tree (tree of trees)
+  └── Root tree (a tree of trees — points to other trees)
        ├── FS tree (filesystem data/metadata)
        │    ├── inode items
        │    ├── dir items
        │    └── extent data items → data extents on disk
-       ├── Extent tree (tracks allocated disk blocks)
-       ├── Chunk tree (maps logical → physical addresses)
+       ├── Extent tree (tracks allocated disk blocks + refcounts)
+       ├── Chunk tree (maps logical → physical addresses across devices)
        ├── Dev tree (device management)
        └── Subvolume trees (one per subvolume/snapshot)
             ├── subvol A tree (independent filesystem tree)
@@ -37,39 +37,45 @@ Superblock
 ```c
 // fs/btrfs/ctree.c — the CoW B-tree implementation
 
-// Every modification:
-// 1. Do NOT modify the existing node
-// 2. Copy the node to a new location
-// 3. Modify the copy
-// 4. Update parent to point to new copy
-// 5. Old node becomes free space (after transaction commits)
+// Every modification follows the CoW path:
+//   1. Do NOT modify the existing node
+//   2. Allocate a new block
+//   3. Copy the node's contents to the new block
+//   4. Modify the copy
+//   5. Update parent to point to the new copy (CoW the parent too if needed)
+//   6. Old node becomes free space (after transaction commits)
 
-btrfs_cow_block(trans, root, buf, parent, parent_slot, cow_ret):
-    // Allocate new block
-    new = btrfs_alloc_tree_block(trans, root, ...)
+__btrfs_cow_block(trans, root, buf, parent, parent_slot, cow_ret, ...):
+    // Allocate new block at a fresh logical address
+    cow = btrfs_alloc_tree_block(trans, root, ...);
     // Copy content from old block
-    copy_extent_buffer(new, buf, ...)
-    // Link parent to new block
-    btrfs_set_node_blockptr(parent, parent_slot, new->start)
-    // Old block will be freed at transaction commit
+    copy_extent_buffer_full(cow, buf);
+    // Link parent to new block (parent itself may need CoW first)
+    btrfs_set_node_blockptr(parent, parent_slot, cow->start);
+    // Decrement refcount on old block; it will be freed at transaction commit
+    btrfs_free_tree_block(trans, btrfs_root_id(root), buf, ...);
 ```
 
-**Why CoW B-tree enables snapshots:**
+### Why CoW B-tree enables snapshots
+
 ```
 Before snapshot:
   Root → Node A → Node B → Leaf (data)
 
-Create snapshot (instant — just copy root pointer):
+Create snapshot — just copy the root pointer:
   FS root   → Node A → Node B → Leaf (data)
-  Snap root → Node A ↗           (same nodes, reference counted)
+  Snap root ─┘  (points to SAME Node A; refcount of Node A incremented)
 
-Modify data in FS (triggers CoW path from root to leaf):
+Modify data in FS (triggers CoW from root to leaf along the modified path):
   FS root   → Node A' → Node B' → Leaf' (new data)
   Snap root → Node A  → Node B  → Leaf  (original data, unchanged)
 
-Cost: CoW copies only the path from root to modified leaf
-      O(log N) copies per modification, not full tree copy
+Cost of modification: CoW copies only the path root→leaf (O(log N) nodes)
+Cost of snapshot creation: O(1) — just one new root entry
 ```
+
+This is the architecturally important property: **snapshot creation is
+constant-time regardless of subvolume size.**
 
 ---
 
@@ -83,65 +89,77 @@ btrfs subvolume create /mnt/btrfs/subvol_b
 # List subvolumes
 btrfs subvolume list /mnt/btrfs
 
-# Create read-write snapshot of subvol_a
+# Read-write snapshot
 btrfs subvolume snapshot /mnt/btrfs/subvol_a /mnt/btrfs/snap_a_rw
 
-# Create read-only snapshot (for send/receive)
+# Read-only snapshot (REQUIRED for send/receive)
 btrfs subvolume snapshot -r /mnt/btrfs/subvol_a /mnt/btrfs/snap_a_ro
 
-# Snapshots are instant (microseconds regardless of subvolume size)
+# Verify it was instant
 time btrfs subvolume snapshot -r /mnt/btrfs/large_subvol /mnt/btrfs/snap_instant
-# real 0m0.003s — just a new root pointer, no data copy
+# real  0m0.003s — microseconds regardless of data size
 ```
 
 ```c
-// fs/btrfs/subpage.c, fs/btrfs/volumes.c
+// fs/btrfs/transaction.c, fs/btrfs/ioctl.c
 
-// Snapshot creation:
-btrfs_snapshot_root():
-    // 1. Allocate new tree root item
-    // 2. Copy root node reference (NOT the entire tree)
-    // 3. Increment reference counts on shared nodes
-    // 4. Insert new root into root tree
+// Snapshot creation (via BTRFS_IOC_SNAP_CREATE_V2 ioctl):
+create_pending_snapshot(trans, pending):
+    // 1. CoW the source subvolume's root node (creates a duplicate root)
+    // 2. Create a new root item in the root tree pointing to the duplicated root
+    // 3. Increment refcounts on the shared tree nodes
+    //    (so freeing source nodes doesn't break the snapshot)
+    // 4. Insert new directory entry making the snapshot visible
     // Transaction commits → snapshot is permanent
-    // Total: O(1) — constant time regardless of data size
+
+    // Total work: O(1) — one CoW of the source root + a few metadata updates
 ```
+
+**Subvolumes vs snapshots: a key distinction.**
+A subvolume is a separate filesystem tree (its own root in the root tree).
+A snapshot IS a subvolume — there's no separate "snapshot type." A snapshot
+just starts life sharing all its tree nodes with the source. Over time, as
+either side is modified (via CoW), they diverge.
 
 ---
 
-## 3. Send/Receive: The Backup Architecture
+## 3. Send/Receive: Stream-Based Replication
 
-Btrfs send/receive generates a stream of changes between two snapshots,
-enabling efficient incremental backups and replication.
+`btrfs send` produces a stream of operations that, when applied by
+`btrfs receive`, recreates a snapshot on another filesystem.
 
 ```
-Full send (no parent):
-  Generates stream describing all data in snapshot
-  Stream contains: create dirs, create files, write data for every byte
+Full send (no parent reference):
+  Walks the entire snapshot, emits: create dirs, create files, write data
+  for every byte. Stream size ≈ snapshot size.
 
-Incremental send (with parent snapshot):
-  Compares two snapshots → generates only the DIFFERENCES
-  Stream contains: only changed/added/deleted files since parent snapshot
-  
-  Efficiency: 1TB filesystem with 1MB changed → ~1MB send stream
+Incremental send (with parent reference):
+  Compares two snapshots, emits ONLY the differences.
+  Stream size ≈ size of changed data.
+  Efficiency: 50 TB FS with 100 GB changed → ~100 GB stream, not 50 TB.
 ```
 
 ```bash
-# Full backup (initial)
-btrfs subvolume snapshot -r /mnt/btrfs/data /mnt/btrfs/snap_20260401
-btrfs send /mnt/btrfs/snap_20260401 | btrfs receive /mnt/backup/
+# Initial full backup
+btrfs subvolume snapshot -r /mnt/source/data /mnt/source/snap_20260401
+btrfs send /mnt/source/snap_20260401 | btrfs receive /mnt/backup/
 
-# Incremental backup (daily)
-btrfs subvolume snapshot -r /mnt/btrfs/data /mnt/btrfs/snap_20260402
-btrfs send -p /mnt/btrfs/snap_20260401 /mnt/btrfs/snap_20260402 \
+# Daily incremental
+btrfs subvolume snapshot -r /mnt/source/data /mnt/source/snap_20260402
+btrfs send -p /mnt/source/snap_20260401 /mnt/source/snap_20260402 \
     | btrfs receive /mnt/backup/
 
-# Send over network (SSH)
-btrfs send /mnt/btrfs/snap_20260402 | ssh backup-server btrfs receive /backup/
+# Over network (most common production pattern)
+btrfs send -p /mnt/source/snap_yesterday /mnt/source/snap_today \
+    | ssh backup-host btrfs receive /backup/
 
-# Send to file (for offline backup)
-btrfs send /mnt/btrfs/snap_20260402 > /backup/snap_20260402.btrfs
+# To a file (offline transport)
+btrfs send /mnt/source/snap_20260402 > /backup/snap_20260402.btrfs
 btrfs receive /mnt/restore/ < /backup/snap_20260402.btrfs
+
+# Verify integrity after receive
+btrfs scrub start /mnt/backup
+btrfs scrub status /mnt/backup
 ```
 
 ### Send stream format
@@ -149,130 +167,220 @@ btrfs receive /mnt/restore/ < /backup/snap_20260402.btrfs
 ```c
 // fs/btrfs/send.c — send stream generation
 
-// Stream header:
+// Stream begins with a header:
 struct btrfs_stream_header {
-    char    magic[sizeof(BTRFS_SEND_STREAM_MAGIC)]; // "btrfs-stream"
-    __le32  version;                                 // stream version (1 or 2)
+    char    magic[sizeof(BTRFS_SEND_STREAM_MAGIC)]; // "btrfs-stream\0"
+    __le32  version;                                 // 1 or 2
 };
 
-// Commands in stream:
-// BTRFS_SEND_C_MKFILE    — create file
-// BTRFS_SEND_C_MKDIR     — create directory
-// BTRFS_SEND_C_WRITE     — write data to file
-// BTRFS_SEND_C_CLONE     — clone extent (reflink — same data, no transfer)
-// BTRFS_SEND_C_UPDATE_EXTENT — update extent (for incremental)
-// BTRFS_SEND_C_RENAME    — rename file/dir
-// BTRFS_SEND_C_UNLINK    — delete file
-
-// Key optimization: CLONE command
-// If two files share an extent (via reflink), send uses CLONE:
-// → receiver relinks the extent (no data transfer over network)
-// → deduplication is preserved across backup
+// Stream commands (selected):
+// BTRFS_SEND_C_SUBVOL         — start of new subvolume
+// BTRFS_SEND_C_SNAPSHOT       — declare this is incremental, ref parent
+// BTRFS_SEND_C_MKFILE         — create regular file
+// BTRFS_SEND_C_MKDIR          — create directory
+// BTRFS_SEND_C_SYMLINK        — create symlink
+// BTRFS_SEND_C_WRITE          — write data to file
+// BTRFS_SEND_C_CLONE          — clone extent from a reference subvolume
+// BTRFS_SEND_C_RENAME         — rename file/dir
+// BTRFS_SEND_C_UNLINK         — delete file
+// BTRFS_SEND_C_TRUNCATE       — truncate file
+// BTRFS_SEND_C_UTIMES         — update timestamps
+// BTRFS_SEND_C_CHMOD/CHOWN    — change permissions
+// BTRFS_SEND_C_END            — end of subvolume stream
+// BTRFS_SEND_C_UPDATE_EXTENT  — used for "no_data" mode (metadata-only stream)
 ```
+
+**The CLONE command — critical for efficiency:**
+
+If the receiver already has an extent (because it received an earlier
+snapshot containing it), the sender emits CLONE rather than WRITE. The
+receiver creates a reflink to its existing copy. **Zero data transferred
+over the wire** for blocks that already exist on both sides.
+
+This is what makes Btrfs backup of container images and VM clusters
+efficient: shared base layers turn into CLONE commands.
 
 ---
 
-## 4. CoW Fragmentation Over Time
+## 4. The Subvolume Tree Walk That Drives Send
 
-This is Btrfs's main production performance problem:
+```c
+// fs/btrfs/send.c
+
+send_subvol(sctx):
+    // 1. Walk the send subvolume's tree
+    btrfs_search_slot(...) ; for each item:
+
+        // 2. If incremental mode: also walk the parent's tree at same position
+        // Compare items. Emit one of:
+        //   - WRITE / CLONE (data changed)
+        //   - MKFILE / MKDIR (new in send subvol)
+        //   - UNLINK (in parent but not in send subvol)
+        //   - RENAME (moved)
+
+    // 3. For each WRITE: read data from extent map, emit data in stream
+    //    For each CLONE: emit just the reference to source extent
+
+// Throughout: send uses "commit roots" — snapshot's tree as it existed at commit
+// time, not the live tree. This is why send REQUIRES read-only snapshots.
+```
+
+**Why read-only snapshots are required:**
+A writable snapshot might be modified during the send. The send walks the
+tree assuming it's frozen; a concurrent write could relocate nodes via CoW
+and break the walk. Read-only snapshots can't be modified, so the walk is
+consistent. (This is enforced at the kernel level; trying to send a
+read-write subvolume returns EINVAL.)
+
+---
+
+## 5. CoW Fragmentation Over Time
+
+This is Btrfs's main production performance problem.
 
 ```
-Initial state: 1GB file, one contiguous extent
+Initial state: 1 GB file, written once as one contiguous extent
 
-After 1 year of small modifications (CoW path):
-  1GB file → 50,000 small extents scattered across device
-  Sequential read of file: 50,000 seeks (or random NVMe reads)
-  
-  Why: each small write → CoW of that block → new location
-       over time, file's extents spread across entire device
+After 1 year of small in-place modifications:
+  Each small write → CoW of that block → new physical location
+  After 50,000 modifications: 50,000 small extents scattered across the device
+  Sequential read of the file: 50,000 seeks (or random NVMe reads)
+  Performance degrades by orders of magnitude over time
 ```
 
 ```bash
-# Check fragmentation of a Btrfs file
-btrfs filesystem defragment -v -r /mnt/btrfs/fragmented_file  # fix it
-# OR check before fixing:
+# Check fragmentation of a file
 filefrag -v /mnt/btrfs/fragmented_file
-# Shows extent count — high count = fragmented
+# Output: "/mnt/btrfs/fragmented_file: 50234 extents found"
+# Healthy: a few extents. Fragmented: thousands.
 
-# Filesystem-wide defragmentation (online, but I/O intensive)
+# Defragment a file (online)
+btrfs filesystem defragment -v /mnt/btrfs/fragmented_file
+
+# Defragment a directory tree
 btrfs filesystem defragment -r /mnt/btrfs/
-# WARNING: this BREAKS reflinks and snapshots for defragmented files
-#          (CoW extents get re-written as non-shared extents)
-#          Use with caution if you rely on snapshots for dedup savings
+
+# Compress while defragmenting
+btrfs filesystem defragment -r -c zstd /mnt/btrfs/
 ```
+
+**Critical warning about defragment:**
+`btrfs filesystem defragment` BREAKS reflinks. A defragmented file is
+rewritten to a new contiguous extent, losing the sharing with snapshots.
+Disk usage can balloon as snapshot data becomes independent. For
+snapshot-heavy systems, defragment is dangerous.
+
+Workarounds:
+- For database files: use `chattr +C` to disable CoW on that file (no
+  snapshots possible for that file either)
+- For VM images: same — `chattr +C`
+- For general use: just accept the fragmentation, or migrate workload away
+  from Btrfs
 
 ---
 
-## 5. Checksums: Btrfs's Unique Data Integrity Feature
+## 6. Checksums: Btrfs's Unique Integrity Feature
 
 ```bash
 # Btrfs checksums all data and metadata by default
-# Algorithm: crc32c (default), xxhash, sha256, or blake2b
+# Algorithms: crc32c (default), xxhash, sha256, blake2b
 
-# Check checksum algorithm in use
+# Check checksum algorithm
 btrfs inspect-internal dump-super /dev/nvme0n1 | grep csum_type
+# csum_type 0 = crc32c, 1 = xxhash64, 2 = sha256, 3 = blake2
+
+# Set at mkfs time only:
+mkfs.btrfs --csum sha256 /dev/nvme0n1   # stronger but slower
+mkfs.btrfs --csum xxhash /dev/nvme0n1   # faster than crc32c, modern default for many
 
 # Verify all checksums (scrub)
 btrfs scrub start /mnt/btrfs
 btrfs scrub status /mnt/btrfs
-# Scrub reads every block, verifies checksum, repairs if RAID configured
-
-# With RAID-1: scrub detects + repairs silently
-# Without RAID: scrub detects but cannot repair (single device)
+# Scrub reads every block, verifies checksum
+# With RAID-1: scrub detects + REPAIRS silently using the good replica
+# Without RAID: scrub detects but cannot repair (reports error)
 ```
 
-**Architect implication:** Btrfs can detect bit-rot (silent data corruption)
-that XFS and ext4 cannot. For archival storage, this is a significant advantage.
+```c
+// fs/btrfs/disk-io.c, fs/btrfs/raid56.c
+
+// On every read:
+btrfs_validate_metadata_buffer():
+    // Compute checksum of the block
+    // Compare to stored checksum
+    // If mismatch:
+    //   - If RAID-1/10: try the other copy
+    //   - If RAID-5/6: try parity reconstruction
+    //   - Otherwise: return EIO to upper layer
+```
+
+**Architect implication:** Btrfs can detect silent data corruption (bit-rot,
+controller errors, bad cables) that XFS and ext4 cannot. For archival
+storage where bit-rot accumulates over years, this is significant.
 
 ---
 
-## 6. Btrfs Production Stability Assessment
+## 7. Btrfs Production Stability Assessment
 
 ```
-Mature/stable (safe for production):
-  ✓ Single device
-  ✓ RAID-1 (mirroring)
+Mature / production-ready:
+  ✓ Single device with checksums
+  ✓ RAID-1 (mirror) / RAID-10 (striped mirror)
   ✓ Snapshots and send/receive
   ✓ Subvolumes
-  ✓ Checksums and scrub
-  ✓ Online grow
+  ✓ Compression (zstd, lzo, zlib)
+  ✓ Online grow / shrink
+  ✓ scrub for corruption detection and repair (with RAID-1/10)
 
 Use with caution:
-  ⚠ RAID-5/6 — known bugs; NOT recommended for production data
-    (parity rebuild is buggy; data loss possible on RAID-5/6 crash)
-  ⚠ Very large filesystems (>100TB) — performance degrades
+  ⚠ Very large filesystems (>100 TB) — performance degrades
   ⚠ Heavy random-write workloads — CoW fragmentation
+  ⚠ Quota groups (qgroups) — high overhead, occasional accuracy bugs
 
-Avoid:
-  ✗ RAID-5/6 for any critical data
-  ✗ Database workloads (CoW overhead + fragmentation)
-  ✗ VM image storage with many small random writes
+Do not use in production:
+  ✗ RAID-5/6 — long-standing parity write-hole and rebuild bugs
+    See: https://btrfs.readthedocs.io/en/latest/Status.html
+    Multiple documented data-loss scenarios. Use mdadm RAID-6 underneath
+    Btrfs if you need parity RAID with Btrfs features.
 ```
+
+The RAID-5/6 caveat has been the standing recommendation for years. The
+core problem: parity calculation during partial-stripe writes is not
+atomic with respect to the CoW B-tree updates, and crash recovery doesn't
+reliably reconstruct correct parity.
 
 ---
 
-## 7. When to Recommend Btrfs vs XFS for Backup Architecture
+## 8. When to Recommend Btrfs vs XFS for Backup Architectures
 
 | Use Case | Recommendation | Reason |
 |----------|---------------|--------|
-| Primary filesystem, OLTP | XFS | Better random write perf, no CoW overhead |
-| Primary filesystem, large files | XFS | Less fragmentation long-term |
-| Backup destination with incremental | Btrfs | Send/receive is efficient and native |
-| Archival with bit-rot detection | Btrfs | Checksums catch silent corruption |
-| Container image store | Either | Btrfs reflink efficient; XFS also supports reflink |
+| Primary filesystem, OLTP database | XFS | Better random write perf; CoW overhead too high |
+| Primary filesystem, large files | XFS | Less fragmentation long-term; mature at scale |
+| Backup destination with incremental | **Btrfs** | Send/receive is native; CLONE deduplication |
+| Archival with bit-rot detection | **Btrfs** | Checksums catch silent corruption |
+| Container image store | Either | Btrfs subvolumes + reflinks; XFS reflinks also work |
 | NFS server | XFS | Better concurrent access, stable |
-| Snapshot-heavy VM host | Btrfs | Native snapshots cheaper than LVM thin |
+| Snapshot-heavy VM host | Btrfs | Native snapshots; cheaper than LVM thin |
+| RAID-5/6 with parity | XFS | Btrfs RAID-5/6 unsafe; use mdadm + XFS |
 
 ---
 
-## 8. Hands-On: Send/Receive Incremental Backup
+## 9. Hands-On: Incremental Send/Receive
 
 ```bash
 # Setup: source and backup Btrfs filesystems
-mkfs.btrfs /dev/sda
-mkfs.btrfs /dev/sdb
-mount /dev/sda /mnt/source
-mount /dev/sdb /mnt/backup
+dd if=/dev/zero of=/tmp/src.img bs=1M count=2048
+dd if=/dev/zero of=/tmp/bak.img bs=1M count=2048
+SRC=$(losetup --find --show /tmp/src.img)
+BAK=$(losetup --find --show /tmp/bak.img)
+
+mkfs.btrfs $SRC
+mkfs.btrfs $BAK
+
+mkdir -p /mnt/source /mnt/backup
+mount $SRC /mnt/source
+mount $BAK /mnt/backup
 
 # Create source subvolume with data
 btrfs subvolume create /mnt/source/data
@@ -282,58 +390,85 @@ dd if=/dev/urandom of=/mnt/source/data/file2 bs=1M count=100
 # Day 1: full backup
 btrfs subvolume snapshot -r /mnt/source/data /mnt/source/snap_day1
 btrfs send /mnt/source/snap_day1 | btrfs receive /mnt/backup/
-echo "Full backup size:"
-du -sh /mnt/backup/snap_day1
 
-# Day 2: modify source, incremental backup
-dd if=/dev/urandom of=/mnt/source/data/file1 bs=1M count=10  # modify 10MB
-dd if=/dev/urandom of=/mnt/source/data/file3 bs=1M count=50  # add 50MB
+du -sh /mnt/backup/snap_day1   # ~200 MB
 
+# Day 2: modify source, take new snapshot
+dd if=/dev/urandom of=/mnt/source/data/file1 bs=1M count=10  # rewrite 10 MB
+dd if=/dev/urandom of=/mnt/source/data/file3 bs=1M count=50  # add 50 MB
 btrfs subvolume snapshot -r /mnt/source/data /mnt/source/snap_day2
 
-# Incremental send (only changes since snap_day1)
+# Incremental: measure stream size
+btrfs send -p /mnt/source/snap_day1 /mnt/source/snap_day2 \
+    | wc -c
+# Expect: ~60 MB (just the changes), not 260 MB (full)
+
+# Apply the incremental
 btrfs send -p /mnt/source/snap_day1 /mnt/source/snap_day2 \
     | btrfs receive /mnt/backup/
 
-echo "Incremental send size (should be ~60MB, not 200MB):"
-# Measure send size
-btrfs send -p /mnt/source/snap_day1 /mnt/source/snap_day2 \
-    | wc -c
+# Backup now has both snapshots
+btrfs subvolume list /mnt/backup
 
 # Verify backup integrity
-btrfs scrub start /mnt/backup
-btrfs scrub status /mnt/backup
+btrfs scrub start /mnt/backup ; btrfs scrub status /mnt/backup
+
+# Cleanup
+umount /mnt/source /mnt/backup
+losetup -d $SRC $BAK
+rm /tmp/src.img /tmp/bak.img
 ```
 
 ---
 
-## 9. Week 3 Review: Filesystem Architecture Decision Summary
+## 10. Source Reading Checklist
 
-| Filesystem | Parallel Metadata | Write Model | Snapshot | Checksums | Best For |
-|-----------|------------------|-------------|----------|-----------|---------|
-| XFS | Excellent (AG model) | Direct + delalloc | Via LVM thin | No | Production primary FS, large files, parallel workloads |
-| ext4 | Good | Journal + delalloc | Via LVM thin | No | Simple workloads, small filesystems, familiarity |
-| Btrfs | Good | CoW (fragmentation risk) | Native (instant) | Yes | Backup destination, archival, snapshot-heavy |
+```
+fs/btrfs/ctree.c            — the CoW B-tree implementation
+fs/btrfs/ctree.h            — B-tree structures and item types
+fs/btrfs/transaction.c      — transaction commit, create_pending_snapshot()
+fs/btrfs/send.c             — send stream generation
+fs/btrfs/disk-io.c          — checksum validation on read
+fs/btrfs/extent_io.c        — extent-level I/O
+fs/btrfs/file.c             — file write path (CoW for data extents)
+fs/btrfs/ioctl.c            — snapshot, defrag, send ioctls
+```
+
+Reading order: `ctree.c` (`btrfs_cow_block`, `btrfs_search_slot`),
+then `transaction.c` (`create_pending_snapshot`), then `send.c`
+(`send_subvol`). The first two explain everything else.
 
 ---
 
-## 10. Self-Check Questions
+## 11. Week 3 Review: Filesystem Architecture Summary
 
-1. How does the CoW B-tree enable instant snapshot creation regardless of subvolume size?
+| Filesystem | Parallel Metadata | Write Model | Snapshot | Checksums | Best For |
+|-----------|------------------|-------------|----------|-----------|---------|
+| XFS | Excellent (AG model) | Direct + delalloc | Via LVM thin / reflink | No (metadata only) | Production primary, large files, parallel workloads |
+| ext4 | Good | Journal + delalloc | Via LVM thin | No | Simple workloads, smaller filesystems |
+| Btrfs | Good | CoW (fragmentation risk) | Native (instant) | Yes (all data) | Backup destination, archival, snapshot-heavy |
+
+---
+
+## 12. Self-Check Questions
+
+1. How does Btrfs's CoW B-tree make snapshot creation O(1) regardless of subvolume size?
 2. What is the CLONE command in the Btrfs send stream and why is it important for efficiency?
-3. Why does Btrfs CoW lead to fragmentation over time on a database workload?
-4. Btrfs RAID-5/6 is marked as not production-ready. What specific behavior makes it dangerous?
-5. You need to replicate a 50TB Btrfs filesystem to a remote site daily, with only ~100GB changing per day. What is the send/receive command sequence and estimated transfer size?
-6. A customer wants per-file checksums for archival storage to detect bit-rot over 10+ years. XFS or Btrfs?
+3. Why does Btrfs send REQUIRE read-only snapshots? What would break with a writable source?
+4. A 1 GB file on Btrfs has been modified many times in-place over a year. What is its likely physical layout and why?
+5. Btrfs RAID-5/6 is not recommended for production. What is the underlying technical reason?
+6. You need to replicate a 50 TB Btrfs filesystem to a remote site daily, with only ~100 GB changing per day. Give the command sequence and estimate the daily transfer size.
+7. A customer wants per-file checksums for archival storage to detect bit-rot over 10+ years. XFS or Btrfs? Justify.
 
-## 11. Answers
+## 13. Answers
 
-1. A snapshot is just a new root pointer in the root tree, pointing to the same B-tree root as the source subvolume. No data is copied. Reference counts on shared nodes are incremented. The operation is O(1) — microseconds regardless of data size.
-2. CLONE sends a `clone` command instead of `write` + data when two files share an extent (via reflink). The receiver relinks the extent rather than receiving data bytes. For filesystems with many reflinked files (container images, VM images, deduped data), this drastically reduces send stream size and network transfer.
-3. Every small write triggers a CoW of the modified block to a new physical location. Over time, a file's extents spread across the entire device rather than staying contiguous. Sequential reads become random I/O. Databases do many small random writes — maximum CoW overhead, maximum fragmentation.
-4. The parity calculation for RAID-5/6 is not atomic with respect to the CoW B-tree updates. A crash during a RAID-5 stripe write can leave parity inconsistent (the RAID-5 write hole), and Btrfs's recovery doesn't reliably handle this. Data loss is possible on RAID-5/6 arrays after crashes.
-5. Commands: `btrfs subvolume snapshot -r /mnt/source/data /mnt/source/snap_$(date +%Y%m%d)` then `btrfs send -p /mnt/source/snap_yesterday /mnt/source/snap_today | ssh remote btrfs receive /backup/`. Estimated transfer: ~100GB (only changed data) + stream overhead, not 50TB. With CLONE optimization for reflinked data, possibly less.
-6. Btrfs — it checksums all data and metadata blocks using crc32c (or stronger algorithms). Scrub can detect and (with RAID) repair silent corruption from bit-rot. XFS has no per-block data checksums (metadata only in newer versions). For 10-year archival, Btrfs's checksums are the architecturally correct choice.
+1. A snapshot is just a new root entry in the root tree, pointing to the same B-tree root node as the source subvolume. No data or tree nodes are copied. The kernel increments reference counts on the shared nodes. The operation is constant-time — microseconds — regardless of subvolume size. Divergence happens later, lazily, as either side is modified (CoW copies only the path from root to modified leaf).
+2. CLONE references an extent in a previously-sent (or otherwise present) subvolume on the receiver. Instead of sending the extent's data bytes, the sender emits a CLONE command with a reference; the receiver creates a reflink to its existing copy. Zero data transferred for shared blocks. For workloads with deduplicated content (container images, VM bases, deduped data), this drastically reduces stream size.
+3. Send walks the source subvolume's commit-time tree assuming it's frozen. A writable source could be modified during send, triggering CoW that relocates tree nodes; the walk would see partial or inconsistent state. Read-only snapshots cannot be modified, so the tree is guaranteed stable. The kernel enforces this by rejecting send on read-write subvolumes.
+4. Highly fragmented — likely thousands or tens of thousands of small extents. Every in-place modification triggered CoW: the modified block was written to a new physical location, leaving the file's extent map pointing to many scattered locations. Sequential reads degrade to nearly-random I/O. Defragment can fix it but breaks any reflinks/snapshots sharing the file's extents.
+5. Parity calculation during partial-stripe writes interacts badly with the CoW B-tree updates. Btrfs's crash recovery does not reliably reconstruct correct parity after a power loss during a partial-stripe write, leading to data corruption or unrecoverable arrays. The bugs have existed for years and the upstream maintainers explicitly recommend against RAID-5/6 in production. Use mdadm RAID-6 underneath Btrfs (or a different filesystem) for parity RAID.
+6. Daily routine: `btrfs subvolume snapshot -r /mnt/source/data /mnt/source/snap_$(date +%Y%m%d)`, then `btrfs send -p /mnt/source/snap_yesterday /mnt/source/snap_today | ssh backup-host btrfs receive /backup/`. Estimated daily transfer: ~100 GB (the changed data) plus stream overhead — possibly less if changes are reflinks of existing data (CLONE commands carry references, not bytes). Definitely not 50 TB.
+7. Btrfs. It checksums all data and metadata blocks (crc32c by default; xxhash, sha256, or blake2b available). `btrfs scrub` walks every block, verifies checksums, and (with RAID-1/10) repairs corruption automatically. XFS checksums only metadata (in v5/CRC format), not data — silent data corruption from bit-rot is invisible to XFS. For 10-year archival, Btrfs's data checksums are the architecturally correct choice. Pair with RAID-1 or send/receive replication so corruption can be repaired, not just detected.
 
 ---
 

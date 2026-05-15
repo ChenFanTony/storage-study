@@ -1,396 +1,391 @@
-# Day 16: md/RAID — Resync, Bitmap Journal & Failure Recovery
+# Day 16: md/RAID — Partial-Stripe Writes, Bitmaps, and the Write Hole
 
 ## Learning Objectives
-- Understand md's personality model and how RAID levels are implemented
-- Deeply understand the partial-stripe write (RAID-5 write hole) problem
-- Understand write-intent bitmap and its effect on resync time
-- Follow RAID-1 resync and RAID-5 rebuild at source level
-- Know the architect-level tradeoffs: RAID-5 vs RAID-6 vs RAID-10
+- Understand the RAID-5/6 partial-stripe write problem and why it matters more than people think
+- Understand the write hole and the three md mechanisms that close it (raid5-cache, PPL, write-intent bitmap)
+- Know how md's stripe cache interacts with the block-layer plug
+- Be able to size, tune, and reason about RAID-5/6 in production
+- Know when to use which redundancy mechanism
 
 ---
 
-## 1. md Architecture: Personalities
+## 1. The RAID-5/6 Architecture, Briefly
 
-md (multiple devices) uses a **personality** plugin model — each RAID level
-is a separate module implementing a common interface.
+```
+RAID-5 (4 disks, chunk size 64KB):
 
-```c
-// drivers/md/md.h
-
-struct md_personality {
-    char    *name;          // "raid1", "raid5", "raid10", etc.
-    int     level;          // RAID level number
-
-    // Core operations:
-    void    (*make_request)(struct mddev *mddev, struct bio *bio);
-    int     (*run)(struct mddev *mddev);        // start the array
-    void    (*free)(struct mddev *mddev, void *priv);
-    void    (*status)(struct seq_file *seq, struct mddev *mddev);
-    void    (*error_handler)(struct mddev *mddev, struct md_rdev *rdev);
-    int     (*hot_add_disk)(struct mddev *mddev, struct md_rdev *rdev);
-    int     (*hot_remove_disk)(struct mddev *mddev, struct md_rdev *rdev);
-    void    (*sync_request)(struct mddev *mddev, sector_t sector_nr,
-                            int *skipped);      // resync/rebuild
-    // ...
-};
+         disk0       disk1       disk2       disk3
+stripe 0 [data A0]   [data A1]   [data A2]   [parity Ap]
+stripe 1 [data B0]   [data B1]   [parity Bp] [data B3]
+stripe 2 [data C0]   [parity Cp] [data C2]   [data C3]
+stripe 3 [parity Dp] [data D1]   [data D2]   [data D3]
+                                              ^
+                                  parity rotates across stripes
 ```
 
-Personalities registered at module load:
-```bash
-# See loaded RAID personalities
-cat /proc/mdstat | head -5
-lsmod | grep -E "raid|md_mod"
-```
+Each stripe is `(N-1) × chunk_size` of data plus one chunk of parity.
+The parity location rotates so no single disk becomes a bottleneck for parity writes.
+
+Stripe size matters: with chunk_size=64K and 4 disks, one full stripe = 192K
+of data + 64K parity. RAID-6 has two parity chunks per stripe.
 
 ---
 
-## 2. RAID-5: The Partial-Stripe Write Problem
+## 2. The Partial-Stripe Write Problem
 
-This is the most important RAID-5 concept for architects and the most
-commonly misunderstood.
+This is the single most important performance fact about RAID-5/6:
 
-### Full-stripe write (good case)
+### Full-stripe write (the good case)
+The caller writes data covering an entire stripe. md can compute parity from
+the new data alone:
 ```
-RAID-5 with 4 data disks + 1 parity disk, stripe size 64KB
-
-Full stripe write: 256KB data (fills all 4 data disks)
-  Disk 0: 64KB  Disk 1: 64KB  Disk 2: 64KB  Disk 3: 64KB  Disk P: parity
-  
-  Operation: write all 4 data blocks + compute parity + write parity
-  I/Os: 5 writes (all parallel)
-  Write amplification: 1.25× (5 writes for 4 data blocks)
+new_parity = data0 XOR data1 XOR data2
 ```
+Cost: 1 read of nothing, N writes (data + parity). Optimal.
 
-### Partial-stripe write (bad case — the write hole)
+### Partial-stripe write (the problem)
+The caller writes only part of a stripe. md must compute new parity, but it
+doesn't have the unmodified blocks in memory. Two strategies:
+
+**Read-Modify-Write (RMW):** read the old data being overwritten + the old parity:
 ```
-Partial stripe write: 4KB data (only updates 1 disk in the stripe)
-
-Problem: must update parity to stay consistent
-Two approaches:
-
-Approach 1: Read-Modify-Write (RMW)
-  1. Read old data block (1 read)
-  2. Read old parity block (1 read)
-  3. Compute new parity: new_parity = old_parity XOR old_data XOR new_data
-  4. Write new data block (1 write)
-  5. Write new parity block (1 write)
-  I/Os: 2 reads + 2 writes for 1 block of user data
-  Write amplification: 4× at worst case (4KB write → 4 I/Os)
-
-Approach 2: Reconstruct-Write (RW)
-  1. Read all OTHER data blocks in stripe (3 reads)
-  2. Compute parity from scratch
-  3. Write new data + parity (2 writes)
-  I/Os: 3 reads + 2 writes
-  Only better than RMW when most of the stripe is being updated
+new_parity = old_parity XOR old_data XOR new_data
 ```
+Cost: 2 reads + 2 writes for one small write. **4× I/O amplification**.
 
-```bash
-# Observe read-modify-write in action with blktrace
-# Create RAID-5 on loopback devices
-for i in 0 1 2 3 4; do
-    dd if=/dev/zero of=/tmp/raid-disk${i}.img bs=1M count=512
-    DISKS[$i]=$(losetup --find --show /tmp/raid-disk${i}.img)
-done
-
-mdadm --create /dev/md0 --level=5 --raid-devices=5 \
-    ${DISKS[0]} ${DISKS[1]} ${DISKS[2]} ${DISKS[3]} ${DISKS[4]}
-
-# Write a small random block (partial stripe) and observe the I/O pattern
-blktrace -d ${DISKS[0]} -d ${DISKS[1]} -d ${DISKS[2]} -o - &
-TRACE_PID=$!
-
-dd if=/dev/urandom of=/dev/md0 bs=4k count=1 seek=100
-
-kill $TRACE_PID
-# Observe: one write on one disk triggers reads+writes on parity disk
+**Reconstruct-Write:** read ALL the unmodified data chunks in the stripe:
 ```
-
-### The Write Hole (crash between RMW steps)
-
+new_parity = new_data XOR unmodified_data_0 XOR unmodified_data_1 ...
 ```
-Crash scenario during partial-stripe write:
+Cost: (N-2) reads + 2 writes. Worse when N is large.
 
-Step 4 complete: new data written to disk 0
-Step 5 incomplete: crash before parity written
+md picks whichever has fewer I/Os. For a small write to a wide array, both are
+expensive.
 
-After reboot:
-  Disk 0: new data (updated)
-  Disk P: old parity (stale — doesn't match new disk 0 data)
-  
-  RAID array appears consistent (no detected error)
-  But: parity is WRONG for this stripe
-  
-  If disk 1 now fails:
-    Reconstruct disk 1 using: disk 0 XOR disk 2 XOR disk 3 XOR disk P
-    = new_data_0 XOR data_2 XOR data_3 XOR old_parity
-    = CORRUPTED reconstruction (wrong answer)
-    Silent data corruption — no error reported
-```
+### Why this matters for architects
 
-This is the RAID-5 write hole. It's why RAID-5 without a write-intent
-journal is not safe for critical data on systems that can crash.
+A naive RAID-5 of 8 HDDs doing small random writes will deliver something like
+**1/4 to 1/8 the IOPS** of a single disk. Workloads that look fine on a JBOD
+collapse on RAID-5. The fix is either: avoid RAID-5/6 for small-write
+workloads, or aggregate writes into full stripes (the stripe cache and the
+raid5-cache journal exist for exactly this).
 
 ---
 
-## 3. Write-Intent Bitmap
+## 3. The Stripe Cache
 
-The write-intent bitmap (WIB) tracks which stripes have been recently
-written but not yet fully committed to all disks.
-
-```c
-// drivers/md/bitmap.c
-
-// Bitmap structure: one bit per chunk (default 512KB chunks)
-// Bit set = this chunk was recently written (in-flight or committed)
-// Bit clear = this chunk is clean
-
-// Write path:
-bitmap_startwrite(bitmap, sector, sectors, behind):
-    // Set bits for all chunks covered by this write
-    // Written to disk before the actual data I/O
-
-// Completion path:
-bitmap_endwrite(bitmap, sector, sectors, success, behind):
-    // Decrement in-flight counter for these chunks
-    // When counter reaches 0: clear bits (chunk is clean)
-    // Periodically flush bitmap to disk
-```
-
-**Effect on crash recovery:**
-```
-Without bitmap: after crash, must resync ENTIRE array
-  (don't know which stripes are dirty)
-  RAID-5, 10TB: resync time = 10TB / HDD_speed = 10TB / 150MB/s ≈ 18 hours
-
-With bitmap: after crash, resync only dirty chunks
-  Typical dirty chunks after crash: <1% of array
-  Resync time: <1% × 18 hours ≈ 11 minutes
-```
+md keeps an in-memory cache of "stripe head" objects (`struct stripe_head`).
+Each represents the in-flight state of one stripe. The cache enables:
+- Coalescing multiple bios into full-stripe writes before issuing them
+- Holding the read-old-data results during RMW
+- Tracking sync state during reshape and rebuild
 
 ```bash
-# Create RAID-1 with write-intent bitmap
-mdadm --create /dev/md1 --level=1 --raid-devices=2 \
-    --bitmap=internal \       # bitmap stored on array member devices
-    /dev/sda /dev/sdb
+# View / tune stripe cache size
+cat /sys/block/md0/md/stripe_cache_size       # default 256
+cat /sys/block/md0/md/stripe_cache_active     # currently in use
 
-# Or add bitmap to existing array
-mdadm --grow /dev/md0 --bitmap=internal
+# Each stripe head uses ~chunk_size × (N+1) bytes of memory.
+# For 4-disk array with 64K chunks: 256 stripes ≈ 80MB.
+# For heavy write loads, increase:
+echo 4096 > /sys/block/md0/md/stripe_cache_size   # ~1.3GB at the same parameters
 
-# Check bitmap status
-mdadm --detail /dev/md1 | grep -i bitmap
-cat /proc/mdstat | grep bitmap
-
-# Bitmap chunk size affects granularity vs memory usage
-mdadm --create /dev/md1 --level=1 --raid-devices=2 \
-    --bitmap=internal --bitmap-chunk=1MB \  # default 512KB
-    /dev/sda /dev/sdb
+# Rule of thumb: large enough to absorb writes within a plug window.
+# Too small: every partial-stripe write goes to disk immediately as RMW.
+# Too large: memory wasted; cache management overhead increases.
 ```
+
+The stripe cache and the block-layer plug (Day 3) interact directly: plugged
+writes give md time to discover sequential adjacency and coalesce, turning
+many partial-stripe writes into one full-stripe write. This is one place
+where the block plug matters at the RAID layer, not just the device layer.
 
 ---
 
-## 4. RAID-5 Journal (md-level write-ahead log)
+## 4. The Write Hole
 
-Since kernel 4.4, md RAID-5 supports a write-ahead log to close the write hole:
+The classic RAID-5/6 correctness problem:
+
+```
+A stripe spans N disks. Updating it requires writing to ≥2 disks
+(one data + parity, or more for reconstruct-write). These writes are
+NOT atomic across disks — the kernel issues independent bios.
+
+If the system crashes between writing the data and writing the parity:
+  - Some disks have the new data; others still have the old
+  - Parity no longer matches the data
+  - Array is in an "inconsistent" state
+
+If, *while inconsistent*, another disk fails before resync:
+  - Reconstructing the failed disk uses the bad parity
+  - You get GARBAGE for blocks unrelated to the in-flight write
+  - Silent data corruption
+```
+
+This is unique to redundancy levels that compute parity (RAID-4/5/6).
+RAID-1 and RAID-10 don't have the parity inconsistency form of this problem,
+but they have their own — if one mirror was written and another wasn't,
+which one is "correct"? On reads, md just picks one; on resync, it copies
+one to the other based on the write-intent bitmap.
+
+By default, **md refuses to start a dirty + degraded RAID-5/6 array**
+precisely because of this risk.
+
+---
+
+## 5. The Three Write-Hole Solutions in md
+
+### Option A: Write-intent bitmap (always recommended)
+```
+A bitmap tracks which regions of the array have writes in progress.
+On unclean shutdown + restart:
+  - Bitmap shows which stripes were possibly in-flight
+  - Only those stripes need resync (not the whole array)
+  - Resync time: minutes instead of hours
+```
+
+The bitmap doesn't close the write hole — it just **reduces the resync
+window**. During that smaller window, data corruption is still possible
+if a disk fails. But for most workloads, the time-window reduction is
+sufficient.
 
 ```bash
-# Create RAID-5 with journal device
+# Add bitmap to existing array
+mdadm --grow --bitmap=internal /dev/md0
+
+# Verify
+cat /proc/mdstat | grep -A2 md0
+# md0 : active raid5 ...
+#       12345 blocks ... bitmap: 1/2 pages [4KB], 65536KB chunk
+
+# Bitmap chunk size: power of 2 between 4K and array_size/2^16
+# Smaller = more precise (less resync) but more bitmap update overhead
+# Default works fine; tune only if you have a specific problem
+mdadm --grow --bitmap=internal --bitmap-chunk=64M /dev/md0
+```
+
+The bitmap update is on the hot path of every write — md updates the bitmap
+bit before issuing the data write. On fast NVMe arrays this can be a
+measurable overhead; on HDDs it's noise.
+
+### Option B: raid5-cache (write-through or write-back journal)
+```
+Dedicated journal device (typically a small SSD or NVMe):
+  - All writes hit the journal first
+  - Then propagate to the RAID disks
+  - On crash: replay the journal; no inconsistent state can be observed
+```
+
+Two modes:
+- **write-through** (default, since 4.4): IO completes only after data is on
+  the RAID disks. Journal exists only to close the write hole; not for speed.
+  Journal can be small (hundreds of MB).
+- **write-back** (since 4.10): IO completes as soon as data is in the
+  journal. Journal aggregates writes and flushes them to RAID disks as full
+  stripes. Big speedup for small-write workloads. Journal must be large
+  (several GB) and fast.
+
+```bash
+# Create RAID-5 with a journal device
 mdadm --create /dev/md0 --level=5 --raid-devices=4 \
-    /dev/sda /dev/sdb /dev/sdc /dev/sdd \
-    --write-journal /dev/nvme0n1p1    # fast SSD journal device
+      --write-journal=/dev/nvme0n1p1 \
+      /dev/sd[a-d]1
 
-# Journal mode options:
-# write-through: journal every write before committing to disk (safe, slower)
-# write-back: batch writes in journal (faster, still safe if journal survives crash)
+# Switch modes at runtime
+echo write-back > /sys/block/md0/md/journal_mode
+
+# Verify
+cat /sys/block/md0/md/journal_mode
 ```
 
+**Critical caveat for write-back mode:** the journal device becomes a
+single point of failure for in-flight writes. If the journal SSD fails
+while in write-back mode, you lose dirty data. Use a mirrored journal
+(two SSDs in dm-raid1) for production write-back.
+
+### Option C: PPL (Partial Parity Log)
 ```
-RAID-5 journal write path:
-  1. Write data + parity to journal (NVMe — fast)
-  2. Journal write committed (FUA/flush)
-  3. Write data + parity to RAID disks (HDDs — slower)
-  4. Mark journal entry as complete
-
-On crash between steps 2 and 3:
-  Replay journal → complete the RAID-5 write
-  No write hole possible
-```
-
----
-
-## 5. md/RAID Source Code: Key Functions
-
-```
-drivers/md/md.c          — core md framework
-drivers/md/raid1.c       — RAID-1 personality
-drivers/md/raid5.c       — RAID-5/6 personality (largest, most complex)
-drivers/md/bitmap.c      — write-intent bitmap
-drivers/md/raid5-log.c   — RAID-5 write-ahead log (journal)
-
-Key functions to read:
-
-RAID-1:
-  raid1_make_request()   — mirror write to all disks, read from one
-  sync_request()         — resync: read from one mirror, write to other
-
-RAID-5:
-  raid5_make_request()   — dispatch to stripe cache
-  handle_stripe()        — THE core function — manages one stripe's state machine
-  ops_run_io()           — submit actual I/Os for a stripe
-  raid5_build_block()    — reconstruct missing data (rebuild)
+Stores "partial parity" (XOR of unmodified chunks of a stripe) in the
+metadata area on each member disk. No dedicated journal device needed.
 ```
 
-### The RAID-5 stripe cache
-
-RAID-5 uses an in-memory **stripe cache** to collect partial-stripe writes
-and convert them to full-stripe writes where possible:
-
-```c
-// drivers/md/raid5.c
-
-struct stripe_head {
-    // One per active stripe (sector range = one full RAID stripe)
-    struct hlist_node   hash;       // hash table for lookup
-    struct r5conf       *raid_conf;
-    sector_t            sector;     // start sector of this stripe
-    int                 pd_idx;     // parity disk index
-    struct r5dev        dev[];      // one per disk in array
-    // state machine: STRIPE_ACTIVE, STRIPE_SYNCING, etc.
-};
-
-// handle_stripe() processes a stripe through its state machine:
-// EMPTY → LOCKED (collecting writes) → COMPUTING_P (parity calc) →
-// WRITING (submitting I/Os) → CLEAN
-```
+Trade-offs:
+- No dedicated journal device required — uses spare space in the per-disk metadata
+- Distributed: no single journal bottleneck or SPOF
+- **30–40% write performance penalty** (every partial-stripe write does
+  an extra small write to log partial parity)
+- **NOT a true journal**: protects against silent corruption from the write
+  hole, but doesn't recover in-flight data. If a disk dies during the write,
+  the stripe's data is gone — same as plain RAID-5.
+- **Incompatible with write-intent bitmap.** You pick one or the other.
 
 ```bash
-# Tune stripe cache size
-cat /sys/block/md0/md/stripe_cache_size
-echo 32768 > /sys/block/md0/md/stripe_cache_size  # increase for write-heavy workloads
-# Larger cache = more coalescing of partial writes = less RMW overhead
-# Memory cost: ~5KB per stripe entry
+# Enable PPL on a RAID-5 (requires v1.x superblock)
+mdadm --grow --consistency-policy=ppl /dev/md0
+
+# Verify
+mdadm --detail /dev/md0 | grep "Consistency Policy"
 ```
+
+### Which one to use?
+
+| Situation | Choice |
+|-----------|--------|
+| Most production | Write-intent bitmap; tolerate the small resync window |
+| Need to start dirty-degraded array safely | raid5-cache (write-through) with a small dedicated SSD |
+| Heavy small-write workload, can afford a fast journal SSD | raid5-cache write-back with mirrored journal |
+| No spare device for journal, OK with 30–40% write hit | PPL |
+| RAID-10, RAID-1 | Bitmap only (parity write hole doesn't apply) |
 
 ---
 
-## 6. Resync and Rebuild: Architect's View
+## 6. Resync Behavior and Tuning
+
+After unclean shutdown or new disk insertion, md runs a sync_action across
+the array.
 
 ```bash
-# Monitor resync/rebuild progress
-watch -n1 "cat /proc/mdstat"
-# Shows: [====>................]  recovery = 23.5% (...)
-#        finish=47.3min speed=142857K/sec
+# Watch resync progress
+cat /proc/mdstat
+# md0 : active raid5 sd[a-d]1[0]
+#       12345 blocks ... [UUUU] resync = 23.4% (1234/5678) finish=12.3min speed=400000K/sec
 
-# Control resync speed (balance rebuild speed vs production I/O impact)
-cat /sys/block/md0/md/sync_speed_min  # minimum resync speed (KB/s)
-cat /sys/block/md0/md/sync_speed_max  # maximum resync speed (KB/s)
+# Resync speed limits — important for production!
+cat /proc/sys/dev/raid/speed_limit_min   # 1000 KB/s — never go below this
+cat /proc/sys/dev/raid/speed_limit_max   # 200000 KB/s — never exceed this
 
-# Throttle resync to protect production workload
-echo 10000  > /sys/block/md0/md/sync_speed_min   # 10 MB/s minimum
-echo 100000 > /sys/block/md0/md/sync_speed_max   # 100 MB/s maximum
-
-# For emergency rebuild (production down, need it fast):
-echo 1000000 > /sys/block/md0/md/sync_speed_max  # 1 GB/s
+# On a busy production array, lower max so resync doesn't hammer disks:
+echo 50000 > /proc/sys/dev/raid/speed_limit_max
 ```
 
-**RAID-5 rebuild time estimation:**
-```
-Array: 4+1 RAID-5, 4TB per disk = 12TB usable
-Failed disk: 4TB
-Rebuild reads: 3 remaining disks × 4TB = 12TB reads
-Rebuild writes: 4TB to new disk
-At 150MB/s sustained HDD read: 12TB / 150MB/s ≈ 22 hours
-
-During rebuild: second disk failure = total data loss
-RAID-6 gives one more failure margin
-```
-
----
-
-## 7. RAID Level Decision Matrix
-
-| RAID Level | Min Disks | Usable % | Write Penalty | Fault Tolerance | Best For |
-|-----------|-----------|----------|---------------|-----------------|----------|
-| RAID-1 | 2 | 50% | 1× (mirror) | 1 disk (N-1 with more) | Boot, small critical data |
-| RAID-5 | 3 | (N-1)/N | 4× (partial) | 1 disk | Read-heavy, cost-sensitive |
-| RAID-6 | 4 | (N-2)/N | 6× (partial) | 2 disks | Large arrays, high rebuild risk |
-| RAID-10 | 4 | 50% | 1× (mirror) | 1 per mirror pair | Write-heavy, databases |
-
-**RAID-5 is dangerous for large HDD arrays:**
-```
-12× 8TB HDD RAID-5 array:
-  Usable: 88TB
-  Rebuild time on failure: ~24-30 hours
-  During rebuild: URE (Unrecoverable Read Error) probability per TB read:
-    Consumer HDD: 1 in 10^14 bits = 1 error per 12.5TB read
-    Rebuild reads 11 × 8TB = 88TB → ~7 URE events expected
-  Each URE during rebuild = second failure = TOTAL DATA LOSS
-
-Recommendation: RAID-6 for >6 disk arrays, or RAID-10 for write-heavy.
-```
-
----
-
-## 8. Hands-On: RAID-1 Failure and Rebuild
+These limits are **per-device**, not per-array. An 8-disk array doing resync
+at speed_limit_max=200000 will move 1.6 GB/s across the bus.
 
 ```bash
-# Setup RAID-1 on loopback
-dd if=/dev/zero of=/tmp/r1-disk0.img bs=1M count=1024
-dd if=/dev/zero of=/tmp/r1-disk1.img bs=1M count=1024
-D0=$(losetup --find --show /tmp/r1-disk0.img)
-D1=$(losetup --find --show /tmp/r1-disk1.img)
+# Manual scrub (re-verify all parity)
+echo check > /sys/block/md0/md/sync_action     # read-only verification
+echo repair > /sys/block/md0/md/sync_action    # also rewrite bad parity
 
-mdadm --create /dev/md10 --level=1 --raid-devices=2 --bitmap=internal $D0 $D1
-mkfs.ext4 /dev/md10
-mount /dev/md10 /mnt/raid-test
+# Cancel an in-progress sync
+echo idle > /sys/block/md0/md/sync_action
+```
 
-# Write test data
-dd if=/dev/urandom of=/mnt/raid-test/testfile bs=1M count=128
-md5sum /mnt/raid-test/testfile > /tmp/raid-expected.md5
+Production rule: run `check` monthly on long-lived arrays. Silent disk
+corruption is more common than people think; you want to know before
+the second disk fails.
 
-# Simulate disk failure
-mdadm --fail /dev/md10 $D1
-cat /proc/mdstat   # array is degraded
+---
 
-# Verify data still accessible
-md5sum -c /tmp/raid-expected.md5 && echo "Data intact on degraded array"
+## 7. Chunk Size and Workload Alignment
 
-# "Replace" failed disk (add spare)
-dd if=/dev/zero of=/tmp/r1-disk2.img bs=1M count=1024
-D2=$(losetup --find --show /tmp/r1-disk2.img)
-mdadm --add /dev/md10 $D2
+```bash
+# Show chunk size
+cat /sys/block/md0/md/chunk_size
 
-# Watch rebuild
-watch -n1 "cat /proc/mdstat"
+# Choosing chunk size at create time:
+# Small chunks (16K–64K): better for small random I/O — more stripes
+#   touched per workload, more parallelism, more partial-stripe writes
+# Large chunks (256K–1M): better for sequential I/O — single workload thread
+#   stays within one chunk longer, less inter-disk parity overhead
+```
 
-# Verify after rebuild
-md5sum -c /tmp/raid-expected.md5 && echo "Data intact after rebuild"
-mdadm --detail /dev/md10
+Match chunk size to the filesystem and workload:
+- Random 4K database I/O on RAID-5 of SSDs: 64K chunks
+- Sequential video/backup on RAID-6 HDDs: 256K–1M chunks
+- ZFS/Btrfs handle this themselves; pure md+filesystem stacks should think
+  about it.
+
+Filesystem alignment matters too: ext4 and XFS both have stripe-aware
+allocation. `mkfs.xfs` reads md's stripe geometry automatically; `mkfs.ext4`
+takes `-E stride=,stripe-width=` to align allocations to chunk boundaries.
+
+---
+
+## 8. Hands-On: Observing the Partial-Stripe Penalty
+
+```bash
+# Build a small test RAID-5 from loop devices
+for i in 0 1 2 3; do
+    dd if=/dev/zero of=/tmp/disk$i.img bs=1M count=512
+    losetup --find --show /tmp/disk$i.img
+done > /tmp/loops
+LOOPS=$(cat /tmp/loops)
+
+mdadm --create /dev/md99 --level=5 --raid-devices=4 \
+      --chunk=64 $LOOPS
+
+# Wait for initial sync
+while grep -q resync /proc/mdstat; do sleep 2; done
+
+# Test 1: full-stripe writes (192K aligned)
+fio --name=fullstripe --filename=/dev/md99 --rw=write --bs=192k \
+    --direct=1 --time_based --runtime=15 --ioengine=libaio --iodepth=8 \
+    --output-format=terse | grep -E 'bw|iops'
+
+# Test 2: small partial-stripe writes (4K random)
+fio --name=partial --filename=/dev/md99 --rw=randwrite --bs=4k \
+    --direct=1 --time_based --runtime=15 --ioengine=libaio --iodepth=8 \
+    --output-format=terse | grep -E 'bw|iops'
+
+# Expect: full-stripe ~3× the bandwidth of partial-stripe
+# Increase stripe_cache_size and re-run partial test:
+echo 4096 > /sys/block/md99/md/stripe_cache_size
+fio --name=partial2 --filename=/dev/md99 --rw=randwrite --bs=4k \
+    --direct=1 --time_based --runtime=15 --ioengine=libaio --iodepth=8 \
+    --output-format=terse | grep -E 'bw|iops'
+# Larger stripe cache can help by absorbing writes into full stripes
+
+# Cleanup
+mdadm --stop /dev/md99
+for l in $LOOPS; do losetup -d $l; done
+rm /tmp/disk*.img /tmp/loops
 ```
 
 ---
 
-## 9. Self-Check Questions
+## 9. Architect's Decision Reference
 
-1. What is the RAID-5 write hole and under what exact condition does it cause data corruption?
-2. Why does the write-intent bitmap reduce resync time from hours to minutes after a crash?
-3. What is the read-modify-write sequence for a 4KB partial-stripe write on RAID-5?
-4. A 10-disk RAID-5 array with 6TB HDDs: estimate rebuild time, and calculate the approximate probability of a URE during rebuild.
-5. The stripe cache in RAID-5 serves what purpose in reducing write amplification?
-6. Why is RAID-10 preferred over RAID-5 for write-heavy database workloads?
+| Workload | RAID level | Notes |
+|----------|-----------|-------|
+| OLTP database (random small writes) | RAID-10 | Write hole doesn't apply; 2× space cost; predictable latency |
+| Bulk storage, sequential | RAID-6 | Tolerate dual disk failure; partial-stripe penalty hidden by sequential pattern |
+| Mixed read-heavy | RAID-5 with bitmap | Small write penalty acceptable if reads dominate |
+| Mixed write-heavy | RAID-5/6 with raid5-cache write-back | Journal absorbs partial-stripe penalty |
+| Critical, write-heavy | RAID-10 + LVM mirroring | Don't compose parity RAID with critical workloads |
+| Don't use | RAID-0 with anything important | No redundancy at all |
 
-## 10. Answers
+### A note on hardware RAID controllers
 
-1. The write hole occurs when a crash happens between writing new data and writing the updated parity in a partial-stripe write. After reboot: the data block is updated but parity is stale. If another disk then fails, reconstruction using the stale parity produces corrupted data with no error reported.
-2. Without bitmap: md doesn't know which stripes were in-flight at crash time, must verify the entire array (full resync). With bitmap: only stripes with set bits (recently written) need resync — typically <1% of the array after a normal crash.
-3. (1) Read old data block from disk. (2) Read old parity block. (3) Compute new parity: `new_P = old_P XOR old_data XOR new_data`. (4) Write new data block. (5) Write new parity block. Total: 2 reads + 2 writes per user write.
-4. 9 data disks × 6TB = 54TB usable. Rebuild reads: 9 × 6TB = 54TB at ~150MB/s = ~100 hours. URE rate (consumer): 1 per 12.5TB read. 54TB rebuild reads → ~4 URE events expected → high probability of data loss. RAID-6 or RAID-10 strongly recommended.
-5. The stripe cache collects multiple partial writes to the same stripe and can merge them into a single full-stripe write, eliminating the need for read-modify-write and reducing write amplification from 4× to 1.25×.
-6. RAID-10 has no partial-stripe write penalty (each write goes to a mirror pair — no parity computation needed). Write latency matches single-disk write latency. RAID-5's RMW adds 2 extra I/Os per partial write, severely impacting random write IOPS for databases.
+Hardware controllers with battery-backed write cache (BBWC) close the write
+hole the same way raid5-cache write-back does — the BBWC is the journal.
+But you give up visibility (proprietary on-disk format) and flexibility.
+mdadm + raid5-cache + a mirrored NVMe journal gives most of the same
+performance with full Linux observability.
 
 ---
 
-## Tomorrow: Day 17 — XFS: AG Model, Log Design & Allocator
+## 10. Self-Check Questions
 
-First of two XFS deep-dive days. We read `xfs_alloc.c`, `xfs_log.c`,
-and understand why XFS dominates production Linux storage.
+1. What is the "write hole" and why is it specific to RAID-4/5/6?
+2. Why does a 4K random write to a wide RAID-5 array cause 4× write amplification?
+3. What does `stripe_cache_size` do and what's a reasonable value for a write-heavy workload?
+4. What's the difference between raid5-cache write-through and write-back modes?
+5. Why is PPL not compatible with write-intent bitmap?
+6. A production RAID-5 of 8 HDDs is doing random 4K writes at ~50 IOPS total. Performance is unacceptable. What three things would you investigate?
+
+## 11. Answers
+
+1. After a crash, data + parity on a stripe may be inconsistent (some disks updated, others not). If a member disk fails before resync, reconstructing the failed disk's data uses the bad parity, producing garbage. It's specific to parity-based RAID because RAID-1/10 don't have the data/parity consistency constraint (only the mirror agreement question, which is handled differently).
+2. RMW path: 1 read of old data + 1 read of old parity + 1 write of new data + 1 write of new parity = 4 I/Os for one 4K write. Reconstruct-write is the same order of magnitude for wide arrays.
+3. It's the number of `stripe_head` objects md keeps in memory to coalesce writes and hold RMW intermediate state. For a write-heavy workload, increase to 2048–8192; calculate memory cost as `chunk_size × (N+1) × stripe_cache_size`.
+4. Write-through: I/O completes only when data is on the RAID disks. Journal exists only to close the write hole. Write-back: I/O completes when data is in the journal; journal absorbs partial-stripe writes and flushes full stripes later. Write-back is faster but journal failure = data loss.
+5. PPL stores partial parity in the per-disk metadata area, and that space is the same region the bitmap would occupy. The two features compete for the same on-disk space and are implemented as alternative consistency policies.
+6. (1) Confirm it's partial-stripe penalty: check `iostat -x` — RAID disks should show 4× the IO rate of the array device. (2) Check `stripe_cache_size`; if it's the default 256, raise to 4096. (3) Look at the workload: 4K random writes on RAID-5 of HDDs is the wrong stack — recommend RAID-10 or adding a raid5-cache write-back journal on SSD. Also check for missing write-intent bitmap and missing FS-level stripe alignment (`-E stride=,stripe-width=` for ext4).
+
+---
+
+## Tomorrow: Day 17 — XFS Internals Part 1: AG Model and On-Disk Layout
+
+We go deep on XFS's allocation group model, how it enables parallel
+metadata operations, and what the on-disk superblock and AG headers
+actually contain.
