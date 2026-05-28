@@ -152,7 +152,8 @@ dmsetup status <cache_name>
 
 ## The Amplification Stack — Why It Compounds
 
-Architects must reason about write amplification at every layer simultaneously:
+Architects must reason about write amplification at every layer simultaneously.
+For a detailed breakdown of each WA source in bcache writeback specifically, see [bcache-write-amplification.md](bcache-write-amplification.md).
 
 ```
 App writes 1 block (4KB)
