@@ -444,6 +444,60 @@ core is clear.
 
 ---
 
+## 12. Architect Perspective — Is io_uring a Syscall Path?
+
+**Short answer: no. io_uring is specifically designed to eliminate syscalls from the hot I/O path.**
+
+### Three operational modes
+
+| Mode | Syscall per I/O | Mechanism |
+|------|----------------|-----------|
+| Default | ~1 per **batch** | `io_uring_enter()` submits N SQEs at once; amortized cost approaches zero at high IOPS |
+| SQPOLL (`IORING_SETUP_SQPOLL`) | **0** | Kernel thread polls SQ ring; app writes SQE, kernel picks it up without any syscall |
+| Hybrid | 0 when busy, 1 on idle wake | SQPOLL with `sq_thread_idle` timeout; `io_uring_enter()` only used to wake the sleeping thread |
+
+Completion path is **always zero syscalls** — app polls the CQ ring directly via shared memory.
+
+### Syscall overhead math
+
+At 1M IOPS, syscall cost compounds fast:
+
+```
+read()/write():         1M syscalls/sec × 150ns = 150ms CPU/sec overhead per core
+libaio io_submit():     1 syscall per submission (still 1M/sec at 1 SQE/call)
+io_uring (batched):     1 syscall per 64 SQEs → ~16K syscalls/sec → ~2.4ms overhead
+io_uring (SQPOLL):      0 syscalls → 0 overhead, but 1 dedicated CPU core spinning
+```
+
+This is why io_uring matters at NVMe speeds. At HDD speeds (100–200 IOPS), the syscall cost is invisible.
+
+### SQPOLL trade-off
+
+SQPOLL eliminates syscall overhead but burns a CPU core. Use it only when:
+- Sustained I/O rate > ~500K IOPS where syscall savings exceed the dedicated-core cost
+- The machine has spare CPU capacity (NVMe workloads on high-core-count servers)
+- Workload is sustained, not bursty (a bursty workload wastes the spinning core during idle gaps)
+
+For lower IOPS, default batched `io_uring_enter()` gives most of the benefit without the core cost.
+
+### Comparison to other I/O APIs
+
+```
+read()/write()          → 1 syscall per I/O, blocking, data copied through kernel buffer
+preadv2() + O_DIRECT    → 1 syscall per I/O, avoids buffer copy, still 1 syscall
+libaio (aio_submit)     → 1 syscall per submission + 1 syscall per completion poll
+io_uring (default)      → 1 syscall per batch of N I/Os; completions are syscall-free
+io_uring (SQPOLL)       → 0 syscalls on hot path; completions are syscall-free
+```
+
+### The architectural insight
+
+io_uring's design premise: **at NVMe speeds (~20µs device latency), a 150ns syscall per I/O is not free — it is 0.75% overhead per I/O, and it serializes across CPUs**. Shared-memory rings remove the syscall boundary entirely. The kernel and user space share the same physical memory for SQ/CQ — no copy, no context switch, no cache line bounce on the submission/completion path.
+
+This is the same insight as DPDK (bypass kernel network stack) and SPDK (bypass kernel block stack) — the kernel boundary itself is the bottleneck, not just the kernel's internal logic.
+
+---
+
 ## Tomorrow: Day 26 — ZNS: Zone Types, Write Pointer & Zone Append
 
 We understand Zoned Namespace NVMe devices, the zone model, and the
