@@ -2,7 +2,7 @@
 
 **Audience:** Senior storage architect
 **Context:** Continuation of cache-framework-design.md — multi-level architecture, partitioning, coherency, cold start, production observability, write amplification stacking
-**Related:** cache-framework-design.md, Month 3 tiering automation (day22), Month 1 bcache (day08-10), dm-cache (day11)
+**Related:** cache-framework-design.md, Month 3 tiering automation (day22), Month 1 bcache (day08-10), dm-cache (day11), [working-set-measurement.md](working-set-measurement.md) (how to measure working set size in production)
 
 ---
 
