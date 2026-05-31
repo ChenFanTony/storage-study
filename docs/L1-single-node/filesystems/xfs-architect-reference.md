@@ -6,6 +6,86 @@
 
 ---
 
+## 0. Abbreviation and Terminology Reference
+
+XFS documentation and source code use a dense set of abbreviations. This section is the decoder ring — read it first, refer back as needed.
+
+### Structural units
+
+| Abbreviation | Full name | What it is |
+|-------------|-----------|------------|
+| **AG** | Allocation Group | The fundamental parallelism unit in XFS. The filesystem is divided into N equal-sized AGs. Each AG manages its own free space and inodes independently with its own locks. AG count is fixed at mkfs time. |
+| **SB** | Superblock | The filesystem-wide metadata header: total size, block size, AG count, feature flags, log location, root inode number. Stored at byte 0 of AG 0; a backup copy is stored at byte 0 of every other AG (for recovery). |
+| **AGF** | AG Freespace header | Sector 1 of every AG. The control block for free-space management. Stores: the root block numbers of the BNObt and CNTbt B-trees, the root of the RMAPbt, total free blocks in this AG, and the AGFL head/tail pointers. **Nothing is allocated or freed in an AG without touching its AGF.** |
+| **AGI** | AG Inode header | Sector 2 of every AG. The control block for inode management. Stores: the root block number of the inobt and finobt B-trees, total inode count, free inode count, and the unlinked inode list head (for recovery of open-but-deleted inodes). **All inode allocation/deallocation goes through the AGI.** |
+| **AGFL** | AG Freelist | Sector 3 of every AG. A small circular array of pre-reserved block numbers (typically 4–16 blocks). These blocks are reserved exclusively for use by the allocator's own B-tree splits and merges. The allocator cannot call itself recursively to get a new block while in the middle of a split — the AGFL breaks this deadlock by providing pre-committed free blocks. |
+| **AG header region** | — | The first 4 sectors of every AG (SB copy, AGF, AGI, AGFL). Fixed location within each AG. All other metadata is in B-tree blocks that can be anywhere within the AG. |
+
+### B-tree abbreviations (per-AG)
+
+| Abbreviation | Full name | Location | Guards |
+|-------------|-----------|----------|--------|
+| **BNObt** | Free Space B-tree by Block Number | Rooted in AGF.bnoroot | Free extents indexed by starting block address. Used to check if a specific block is free and to coalesce adjacent free extents after a free operation. |
+| **CNTbt** | Free Space B-tree by Count | Rooted in AGF.cntroot | Free extents indexed by (length, startblock). Used during allocation to find the best-fit (largest available) free extent. Key is length-first so a scan for "give me ≥ 128 blocks" is a single B-tree lookup. |
+| **inobt** (INObt) | Inode B-tree | Rooted in AGI.root | All inode chunks (allocated and partially free). Each record covers 64 inodes. Bitmap in each record tracks which of the 64 slots are free. Used for inode deallocation and full chunk management. |
+| **finobt** (FINObt) | Free Inode B-tree | Rooted in AGI.free_root | Subset of inobt: only chunks that have at least one free inode slot. Introduced in v5. Inode allocation = one finobt lookup instead of scanning the full inobt. |
+| **RMAPbt** | Reverse Mapping B-tree | Rooted in AGF.rmaproot | Every physical block → its owner (inode + offset, or AG metadata type). Key is (agbno, owner, offset). v5 feature. Enables online repair and reflink CoW. |
+| **REFCNTbt** | Reference Count B-tree | Rooted in AGF.refcntroot | Physical extents that are shared between two or more files (via reflink). Key is agbno; value is reference count. When refcount drops to 1, the block is no longer shared. v5 feature. |
+
+### B-tree abbreviation (per-file)
+
+| Abbreviation | Full name | Location | Guards |
+|-------------|-----------|----------|--------|
+| **BMBTbt** (bmbt) | Block Map B-tree | Rooted in inode data fork (when di_format = BTREE) | The file's logical-offset → physical-extent mapping. Also called the "extent B-tree." Key is file logical block offset; value is a 128-bit packed extent record. Only used when a file has too many extents to fit inline in the inode. |
+
+### Inode fork terminology
+
+| Abbreviation | Full name | Meaning |
+|-------------|-----------|---------|
+| **di_format** | Data fork format | Field in the inode core. Values: `LOCAL` (data inline in inode), `EXTENTS` (array of packed extent records fits in inode), `BTREE` (extent list overflows inode → BMBTbt). |
+| **data fork** | — | The part of the inode after the core that holds file data, extent records, or B-tree root — depending on di_format. |
+| **attr fork** | Attribute fork | Optional second fork in the inode holding extended attribute data or a B-tree of xattr records. Shares the inode space with the data fork via a split point. |
+| **di_forkoff** | Fork offset | Byte offset within the inode where the attribute fork begins. Divides inode space between data fork and attr fork. Zero means no attr fork. |
+
+### Log and transaction abbreviations
+
+| Abbreviation | Full name | Meaning |
+|-------------|-----------|---------|
+| **CIL** | Committed Item List | An in-memory buffer of all logged metadata changes since the last log checkpoint. XFS batches many small per-item log writes into one large CIL checkpoint write, amortizing log I/O. Only when CIL exceeds a threshold (or fsync forces it) does it flush to the on-disk log. |
+| **LSN** | Log Sequence Number | A 64-bit monotonically increasing counter identifying a position in the log. Format: (cycle << 32) | block_number. The cycle increments each time the circular log wraps around. LSNs are stamped on every metadata block — used to detect which on-disk version is newer during recovery. |
+| **ILI** | Inode Log Item | The log item type for inode changes. Logs the inode core, data fork extent changes, attr fork changes. |
+| **BLI** | Buffer Log Item | The log item type for raw metadata block changes (B-tree nodes, AG headers). Logs the changed bytes within a 4 KB block, not the whole block. |
+| **EFI / EFD** | Extent Free Intent / Done | A two-part log record. EFI is written before freeing extents ("I will free [X, Y]"). EFD is written after completion. On recovery, unmatched EFIs are re-executed. Ensures extent frees are atomic across crash. |
+| **BUI / BUD** | Block Use Intent / Done | Same intent/done pattern for block mapping operations (adding extents to a file's BMBT). |
+| **RUI / RUD** | RMap Update Intent / Done | Intent/done pair for RMAPbt modifications. |
+| **CUI / CUD** | Refcount Update Intent / Done | Intent/done pair for REFCNTbt modifications. |
+| **grant head** | — | A log-space accounting pointer. A transaction must acquire (consume) grant-head space before it can log anything. If the log is full (grant head exhausted), the transaction blocks until checkpointing frees space. This is the mechanism that creates back-pressure when the log fills. |
+
+### Allocation and space management terms
+
+| Term | Meaning |
+|------|---------|
+| **agbno** | AG-relative block number. Block addresses within an AG are expressed as offsets from the start of the AG (0 to agsize-1). The full filesystem block address (fsbn) = AG_number × agsize + agbno. |
+| **fsbn** | Filesystem block number. Absolute block address across the whole filesystem. |
+| **extlen** | Extent length in blocks. |
+| **delalloc** | Delayed allocation. The kernel accepts a write into the page cache and reserves logical space (marks the page dirty) without assigning a physical block. Physical block assignment happens at writeback time. This allows large, contiguous physical extents to be allocated rather than many small ones. |
+| **unwritten extent** | An allocated but not-yet-initialized physical extent (F=1 in the packed extent record). Created by `fallocate()`. Reads return zeros without touching disk. Converted to a "written" extent on first write. |
+| **speculative prealloc** | XFS proactively allocates more physical space than currently written for a growing file (up to 2× or more). The extra space is held as an unwritten extent and trimmed on `close()` or `fsync()`. Reduces fragmentation for files that grow incrementally. |
+| **sunit / swidth** | Stripe unit and stripe width. Set at mkfs to align all XFS allocations to RAID stripe boundaries. `sunit` = stripe unit per disk; `swidth` = total stripe width (sunit × number of data disks). Misalignment causes partial-stripe reads on every write. |
+
+### Version and feature terms
+
+| Term | Meaning |
+|------|---------|
+| **v4 / v5** | XFS on-disk format version. v4 = old format, no per-block CRCs, no self-describing metadata. v5 = current format (default since ~2013), adds CRC32c on every metadata block, UUID stamped on every block, and enables finobt, RMAPbt, REFCNTbt, reflink. Always use v5 (`crc=1` at mkfs). |
+| **self-describing metadata** | Every v5 metadata block carries its own magic number, UUID, LSN, and CRC32c checksum. If a block is read with a mismatched UUID or bad CRC, XFS knows immediately — no silent corruption. |
+| **reflink** | Copy-on-write file sharing. `cp --reflink=always src dst` shares physical extents between two files. On first write to either file, only the written blocks are copied to new physical locations. The REFCNTbt tracks shared block reference counts. |
+| **CoW fork** | A temporary per-inode fork that holds "pending CoW" extent mappings during a reflink copy-on-write. When a write hits a shared extent, XFS allocates the replacement blocks into the CoW fork first, then atomically updates the data fork after the write completes. |
+| **inode64** | Mount option (now default since kernel 3.7) allowing inode numbers to be assigned from any AG, not just the first few AGs. Without inode64, on a large filesystem, only AG 0 and AG 1 are used for inodes → hot AGI locks. Always use inode64. |
+| **bigtime** | v5 feature that extends inode timestamps beyond Y2038. Default in modern kernels/xfsprogs. |
+
+---
+
 ## 1. The Seven B-Trees — What XFS Actually Is
 
 XFS is fundamentally a collection of B-trees, one or more per Allocation Group. Understanding which B-tree protects what is the foundation of everything else.
