@@ -231,160 +231,722 @@ With extents (EXT4_EXTENTS_FL set):
 
 ## Section 3: Extent Tree
 
-The extent tree replaced the old block map in ext4. It maps file logical blocks to physical blocks using a balanced tree of variable-length extents.
+The extent tree replaced the old indirect block map in ext4. It maps file logical blocks to physical blocks using a balanced B+-tree of variable-length contiguous runs (extents). Understanding it deeply requires tracing: structure layout → lookup → insertion → split → merge → hole → unwritten → punch hole.
 
-### Data Structures
+### 3.1 Data Structures (Byte-Level Layout)
 
 ```c
 // include/linux/ext4_extents.h
 
-struct ext4_extent_header {
-    __le16  eh_magic;      // 0xF30A — magic number for validation
-    __le16  eh_entries;    // valid entries in this node
-    __le16  eh_max;        // max entries capacity of this node
-    __le16  eh_depth;      // depth of tree (0 = leaf node)
-    __le32  eh_generation; // for external tools; kernel ignores
-};
+struct ext4_extent_header {   // 12 bytes, always first in any node
+    __le16  eh_magic;         // must be 0xF30A; validated on every read
+    __le16  eh_entries;       // number of valid entries currently in this node
+    __le16  eh_max;           // maximum entries this node can hold
+    __le16  eh_depth;         // 0 = leaf node; N = internal node with N levels below
+    __le32  eh_generation;    // version counter for external tools (fsck); kernel ignores
+};                            // total: 12 bytes
 
-struct ext4_extent_idx {   // internal node entry
-    __le32  ei_block;      // logical block covered by this subtree
-    __le32  ei_leaf_lo;    // physical block of child node (low 32 bits)
-    __le16  ei_leaf_hi;    // physical block (high 16 bits)
+struct ext4_extent_idx {      // 12 bytes, internal node entry
+    __le32  ei_block;         // first logical block covered by this subtree
+    __le32  ei_leaf_lo;       // physical block# of child node (low 32 bits)
+    __le16  ei_leaf_hi;       // physical block# of child node (high 16 bits → 48-bit total)
     __u16   ei_unused;
+};                            // total: 12 bytes
+
+struct ext4_extent {          // 12 bytes, leaf node entry
+    __le32  ee_block;         // first logical block# of this extent
+    __le16  ee_len;           // number of blocks; bit 15 encodes initialized vs unwritten:
+                              //   bit15=0: initialized extent, length = ee_len (1..32767)
+                              //   bit15=1: unwritten extent, length = ee_len & 0x7FFF
+    __le16  ee_start_hi;      // physical start block# (high 16 bits)
+    __le32  ee_start_lo;      // physical start block# (low 32 bits)
+};                            // total: 12 bytes
+```
+
+**All three structs are 12 bytes.** This is intentional — the same slot size means a node can hold either N index entries or N leaf entries, simplifying the capacity formula.
+
+**Capacity of a node:**
+```
+Root (in inode i_block, 60 bytes):
+  60 - 12 (header) = 48 bytes → 48/12 = 4 leaf extents OR 3 index entries
+
+Internal/leaf block (4096 bytes):
+  4096 - 12 (header) = 4084 bytes → 4084/12 = 340 entries per node
+```
+
+**Max tree depth and file size:**
+```
+Depth 0 (root only):         4 extents × 32767 blocks × 4096 = 512MB
+Depth 1 (root → 3 leaves):  3 × 340 = 1020 extents
+Depth 2:                     3 × 340 × 340 = ~347K extents
+Depth 3:                     ~118M extents → handles files > 1 PB
+Depth 4:                     ~40B extents → theoretical maximum
+```
+Kernel caps tree depth at 5 (EXT_MAX_LEVELS). For practical use, depth 1-2 covers nearly all real workloads.
+
+### 3.2 Lookup: `ext4_find_extent()`
+
+```c
+// fs/ext4/extents.c — simplified
+
+struct ext4_ext_path *ext4_find_extent(struct inode *inode, ext4_lblk_t block,
+                                        struct ext4_ext_path **orig_path, int flags)
+{
+    // path[] array tracks one entry per tree level (depth+1 entries total)
+    // path[0] = root (in inode buffer, always cached)
+    // path[1] = level-1 node block
+    // ...
+    // path[depth] = leaf node
+
+    eh = ext_inode_hdr(inode);           // pointer to header in i_block[]
+    depth = ext_depth(inode);            // eh->eh_depth
+
+    for (i = 0; i < depth; i++) {
+        // Binary search in current index node for largest ei_block ≤ target
+        ext4_ext_binsearch_idx(inode, path + i, block);
+        // Read child block from disk (or buffer cache)
+        bh = read_extent_tree_block(inode, path[i].p_idx->ei_leaf_lo, depth - i - 1);
+        path[i+1].p_hdr = ext_block_hdr(bh);
+    }
+
+    // Now at leaf node — binary search for the extent containing 'block'
+    ext4_ext_binsearch(inode, path + depth, block);
+    // path[depth].p_ext points to the matching extent (or NULL if hole)
+
+    return path;
+}
+```
+
+**Binary search within a node:**
+```
+Entries are sorted by ee_block (or ei_block for index nodes).
+Binary search finds the largest entry whose ee_block ≤ target logical block.
+If found extent covers target (ee_block ≤ target < ee_block + ee_len): hit.
+Otherwise: hole (sparse file) or beyond EOF.
+```
+
+**Path structure — what it tracks:**
+```c
+struct ext4_ext_path {
+    ext4_fsblk_t    p_block;   // physical block# of this node
+    __u16           p_depth;   // depth of this level
+    __u16           p_maxdepth;
+    struct ext4_extent      *p_ext;   // points to matching leaf entry (leaf level)
+    struct ext4_extent_idx  *p_idx;   // points to matching index entry (internal level)
+    struct ext4_extent_header *p_hdr; // header of this node's block
+    struct buffer_head      *p_bh;   // buffer holding this node (NULL for root)
 };
+```
+The path is stack-allocated per lookup; it pins the buffer_heads along the traversal path, which prevents the nodes from being evicted from the buffer cache while a write operation modifies them.
 
-struct ext4_extent {       // leaf node entry
-    __le32  ee_block;      // first logical block of this extent
-    __le16  ee_len;        // blocks in extent:
-                           //   bit 15 = 0 → initialized (ee_len = actual count, 1..32767)
-                           //   bit 15 = 1 → unwritten (ee_len & 0x7FFF = count)
-    __le16  ee_start_hi;   // physical start block (high 16 bits)
-    __le32  ee_start_lo;   // physical start block (low 32 bits)
+### 3.3 Insertion and Splitting
+
+When a new extent is inserted (e.g., after delalloc assigns physical blocks), the kernel calls `ext4_ext_insert_extent()`:
+
+```
+Case 1: New extent is adjacent and contiguous with an existing extent
+  → Merge: extend ee_len of the existing entry. No structural change.
+  Condition: new.ee_block == existing.ee_block + existing.ee_len
+             AND new physical start == existing physical start + existing.ee_len
+             AND both are initialized (or both unwritten)
+             AND combined length ≤ 32767 (max ee_len)
+
+Case 2: Leaf has space (eh_entries < eh_max)
+  → Shift entries to make room; insert new extent in sorted position.
+  One journal credit for the modified leaf block.
+
+Case 3: Leaf is full (eh_entries == eh_max == 340)
+  → Leaf split required:
+     a. Allocate a new filesystem block for the second half of the leaf
+     b. Move the upper half of entries to the new block
+     c. Insert a new index entry in the parent pointing to the new leaf
+     d. If parent is also full → recursive split upward
+     e. If root is full → tree grows one level (root splits into two leaves;
+        root becomes a depth-1 internal node pointing to both leaves)
+
+Journal credits for a split:
+  - 1 credit per leaf block modified or created
+  - 1 credit per index block modified or created
+  - 1 credit for the inode (root node)
+  - ext4_ext_calc_credits_for_single_extent() computes the max worst case
+```
+
+**Tree growth example (root overflow):**
+```
+Before (depth=0, root has 4 extents, full):
+  inode i_block:
+    header: depth=0, entries=4, max=4
+    extent[0]: logical 0..999   → phys 1000
+    extent[1]: logical 1000..1999 → phys 2000
+    extent[2]: logical 2000..2999 → phys 3000
+    extent[3]: logical 3000..3999 → phys 4000
+
+Insert extent[4]: logical 4000..4999 → phys 5000:
+  → root is full → must split
+
+After (depth=1):
+  inode i_block (now depth=1, root has 2 index entries):
+    header: depth=1, entries=2, max=3
+    idx[0]: ei_block=0,    ei_leaf=block A
+    idx[1]: ei_block=2000, ei_leaf=block B
+
+  block A (leaf, depth=0):
+    header: entries=2, max=340
+    extent[0]: logical 0..999   → phys 1000
+    extent[1]: logical 1000..1999 → phys 2000
+
+  block B (leaf, depth=0):
+    header: entries=3, max=340
+    extent[0]: logical 2000..2999 → phys 3000
+    extent[1]: logical 3000..3999 → phys 4000
+    extent[2]: logical 4000..4999 → phys 5000   ← newly inserted
+```
+
+### 3.4 Extent Merging
+
+The kernel tries to merge adjacent extents aggressively after insert, via `ext4_ext_try_to_merge()`:
+
+```
+Merge conditions (all must hold):
+  1. Right extent immediately follows left: right.ee_block == left.ee_block + left.ee_len
+  2. Right extent is physically adjacent: right.ee_start == left.ee_start + left.ee_len
+  3. Same type: both initialized OR both unwritten (cannot merge initialized+unwritten)
+  4. Combined length ≤ 32767 (the max representable in 15 bits of ee_len)
+
+When merge happens:
+  left.ee_len += right.ee_len
+  Remove right entry from leaf node (shift entries down, decrement eh_entries)
+  Mark leaf buffer dirty for journaling
+
+Why merging matters:
+  - Fewer extents → shallower tree → fewer block reads per lookup
+  - Sequential write workload that mballoc serves from a PA window
+    typically produces adjacent physical blocks → merge keeps the tree flat
+  - Without merge, a 1GB sequential file written in 4KB chunks would produce
+    262144 extents (very deep tree, slow lookup)
+  - With merge, it produces 1 extent (root depth 0, single lookup)
+```
+
+### 3.5 Hole Handling (Sparse Files)
+
+Holes are regions of a file with no backing physical blocks — reads return zeros without any disk I/O.
+
+```
+In the extent tree, a hole is simply the absence of an extent covering that logical range.
+
+Example: file with data at offsets 0-4KB and 1GB-1GB+4KB, hole in between:
+  inode i_block (depth=0):
+    header: entries=2
+    extent[0]: ee_block=0,       ee_len=1, ee_start=phys_A
+    extent[1]: ee_block=262144,  ee_len=1, ee_start=phys_B
+                                 ↑ 262144 = 1GB / 4KB
+
+Read at offset 512KB (logical block 128):
+  ext4_find_extent() binary search: largest ee_block ≤ 128 is extent[0] (ee_block=0)
+  Coverage check: 0 + 1 = 1, target 128 ≥ 1 → not covered → hole
+  ext4_ext_map_blocks() returns 0 blocks, flags=FIEMAP_EXTENT_UNWRITTEN? no, hole flag
+  Page cache fills with zeros, no bio submitted
+
+Write to hole:
+  Triggers delalloc → mballoc allocates physical blocks → new extent inserted
+  Hole is replaced with a real extent covering the written range
+  Unwritten regions between existing extents and new extent remain as holes
+
+lseek(fd, 0, SEEK_DATA) / lseek(fd, 0, SEEK_HOLE):
+  Kernel walks extent tree to find boundaries between data and holes
+  O(log N + number of extents) time
+```
+
+### 3.6 Unwritten Extents — Full Lifecycle
+
+Unwritten extents (bit 15 of ee_len set) exist to provide pre-allocated space that is safe to read (returns zeros) before the application writes to it.
+
+```
+Step 1: fallocate(fd, 0, offset, length)   [or FALLOC_FL_KEEP_SIZE]
+  ext4_fallocate()
+    → ext4_ext_map_blocks(..., EXT4_GET_BLOCKS_CREATE_UNWRIT_EXT)
+    → mballoc allocates physical blocks
+    → Inserts extents with EXT_INIT_MAX_LEN bit set in ee_len (bit 15)
+    → Journal: inode + leaf block modified
+  Result: blocks allocated, block bitmap updated, extent marked unwritten
+
+Step 2: read() from unwritten extent
+  ext4_readpages() → ext4_ext_map_blocks()
+  map->m_flags has EXT4_MAP_UNWRITTEN set
+  → do NOT issue bio to disk; fill page with zeros instead
+  → page is clean (not dirty); no writeback triggered
+
+Step 3: write() to unwritten extent
+  ext4_write_begin() → ext4_ext_map_blocks(..., EXT4_GET_BLOCKS_CONVERT_UNWRITTEN)
+  Two sub-cases:
+    a. write covers entire unwritten extent:
+       → Flip bit 15 of ee_len (set to initialized) in place; single journal entry
+    b. write covers partial extent:
+       → Must SPLIT the unwritten extent:
+          Before: [unwritten: logical 0..999]
+          After write at 200..299:
+            [unwritten: 0..199] [initialized: 200..299] [unwritten: 300..999]
+          This is the "unwritten extent conversion" transaction — up to 5 journal credits
+          (split can create 2 new extents + modify existing + inode + leaf block)
+  → page written, dirty
+  → writeback submits bio
+
+Step 4: crash between fallocate and write
+  On recovery: JBD2 replays journal → extents remain unwritten
+  Post-recovery read: still returns zeros (correct; no stale data exposure)
+  This is the key safety property: unwritten guarantees zero-read even after crash
+
+Diagnostic:
+  filefrag -v /path/to/file | grep "unwritten"
+  # shows extents with the 'U' flag (unwritten)
+  debugfs /dev/sda1 -R "dump_extents /path/to/file"
+```
+
+### 3.7 Hole Punching: `FALLOC_FL_PUNCH_HOLE`
+
+```c
+// fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, length)
+// Frees physical blocks in [offset, offset+length), leaving a hole in the extent tree
+
+ext4_punch_hole():
+  1. Truncate page cache pages in range (writeback if dirty first)
+  2. ext4_ext_remove_space(inode, start_block, end_block):
+     Walk extent tree and for each extent overlapping [start, end]:
+       a. Fully covered extent: delete entry, free blocks via ext4_free_blocks()
+       b. Partially overlapping at start: shorten extent (decrease ee_len)
+       c. Partially overlapping at end: advance ee_block + ee_start, decrease ee_len
+       d. Extent fully surrounds punch range: split into two extents (both shortened)
+  3. Journal: inode + all modified leaf blocks
+
+Post-punch extent tree:
+  Before: [initialized: 0..999]
+  Punch 200..299:
+    → [initialized: 0..199] [hole: 200..299] [initialized: 300..999]
+  Physical blocks 200..299 returned to block bitmap (free)
+
+Use case: sparse databases (SQLite WAL, PostgreSQL relation files with deleted rows)
+```
+
+### 3.8 Extent Status Cache (`ext4_es_cache`)
+
+To avoid repeated extent tree lookups for the same inode, ext4 maintains an in-memory extent status (ES) cache per inode:
+
+```c
+// fs/ext4/extents_status.h
+struct extent_status {
+    struct rb_node  rb_node;
+    ext4_lblk_t     es_lblk;    // logical block start
+    ext4_lblk_t     es_len;     // length in blocks
+    ext4_fsblk_t    es_pblk;    // physical block start (or 0 for hole/delayed)
+    // status flags encoded in low bits of es_pblk:
+    // EXTENT_STATUS_WRITTEN    — initialized on disk
+    // EXTENT_STATUS_UNWRITTEN  — unwritten (preallocated)
+    // EXTENT_STATUS_DELAYED    — in delalloc (no physical block yet)
+    // EXTENT_STATUS_HOLE       — known hole (avoids tree lookup to confirm)
 };
 ```
 
-### Extent Tree Walk Example
-
 ```
-File has 5 extents → root holds all 4? no, 4 max at root.
-5th extent forces depth-1 tree:
+ES cache is a red-black tree of extent_status entries, per inode.
+Hit: logical block found in ES cache → return immediately, no disk read.
+Miss: walk on-disk extent tree → insert result into ES cache.
 
-inode i_block (60 bytes):
-  ext4_extent_header: magic=0xF30A, entries=2, max=3, depth=1
-  ext4_extent_idx[0]: ei_block=0,     ei_leaf_lo=12345  → leaf block 12345
-  ext4_extent_idx[1]: ei_block=50000, ei_leaf_lo=12346  → leaf block 12346
+ES cache shrinking:
+  When memory pressure is high, the ES cache shrinker prunes cold entries.
+  This is tracked by ext4_es_stats (see /proc/fs/ext4/<dev>/es_shrinker_info).
 
-leaf block 12345 (4096 bytes):
-  ext4_extent_header: magic=0xF30A, entries=3, max=340, depth=0
-  ext4_extent[0]: ee_block=0,     ee_len=10000, ee_start=100000  → LBA 100000..109999
-  ext4_extent[1]: ee_block=10000, ee_len=5000,  ee_start=200000  → LBA 200000..204999
-  ext4_extent[2]: ee_block=15000, ee_len=25000, ee_start=300000  → LBA 300000..324999  ← unwritten if bit15 set
-
-leaf block 12346 (4096 bytes):
-  ext4_extent_header: entries=2, depth=0
-  ext4_extent[0]: ee_block=50000, ee_len=8000,  ee_start=400000
-  ext4_extent[1]: ee_block=58000, ee_len=12000, ee_start=500000
+Delalloc tracking:
+  A delayed allocation extent appears in ES cache as EXTENT_STATUS_DELAYED
+  before mballoc assigns physical blocks.
+  At writeback time, the ES entry transitions from DELAYED → WRITTEN.
+  This allows the kernel to accurately report file size and handle overwrites
+  of not-yet-allocated regions without touching the on-disk extent tree.
 ```
 
-**Capacity per leaf block:** `(4096 - 12) / 12 = 340` extents per leaf node.
+### 3.9 Observability: Diagnosing the Extent Tree
 
-**Maximum extent tree depth:** 5 levels (rarely needed; 4 levels handles >1PB files).
+```bash
+# Show extents for a file (human-readable)
+filefrag -v /path/to/file
+# Output columns: extent#, logical start, physical start, length, flags
+# Flags: N=not last, C=contiguous with previous, U=unwritten, M=merged
 
-### Unwritten Extents and Initialization
+# Full dump via debugfs
+debugfs /dev/sda1 -R "dump_extents /path/to/file"
+# Shows the full tree with depth, each node's entries
 
-```
-fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 1GB):
-  → mballoc allocates 1GB of blocks
-  → creates extents with ee_len bit 15 set (unwritten)
-  → blocks appear allocated in block bitmap
-  → reading returns zeros (kernel synthesizes)
-  → writing initializes: clears bit 15, writes data, updates journal
+# Count extents (fragmentation proxy)
+filefrag /path/to/file
+# "X extents found" — 1 extent for sequential, many = fragmented
 
-Purpose:
-  - Guarantee space reservation before writing (no ENOSPC mid-write)
-  - Avoid stale data exposure (unlike writeback without zeroing)
-  - Database files: preallocate full size at creation
+# Find highly fragmented files
+find /mountpoint -xdev -type f | xargs filefrag 2>/dev/null | \
+  awk '$NF ~ /[0-9]+/ { if ($NF+0 > 100) print $NF, $0 }' | sort -rn | head -20
+
+# ES cache stats
+cat /sys/fs/ext4/sda1/es_shrinker_info   # how often ES cache is being shrunk
+cat /proc/fs/ext4/sda1/mb_groups         # per-BG free block counts
+
+# Check if a file uses extents
+debugfs /dev/sda1 -R "stat <inode_number>" | grep "Flags"
+# "Flags: 0x80000" → extents flag set
 ```
 
 ---
 
 ## Section 4: Multi-Block Allocator (mballoc)
 
-The multi-block allocator (`fs/ext4/mballoc.c`) is ext4's block allocation engine. It replaced the serial one-block-at-a-time allocator from ext3.
+mballoc (`fs/ext4/mballoc.c`) is ext4's block allocation engine. It replaced ext3's serial one-block allocator and is responsible for deciding *which* physical blocks to hand out for a given request. Understanding mballoc means understanding: the buddy system structure → how it loads from the block bitmap → the allocation criteria search → preallocation → how delalloc integrates → what happens on free.
 
-### Buddy Allocator Structure
+### 4.1 The Buddy Bitmap System
+
+mballoc maintains an in-memory buddy allocator for each block group. This is separate from the on-disk block bitmap — it is a cache that accelerates free-run searches.
 
 ```
-Per-BG buddy system (in memory, loaded from block bitmap):
+On-disk block bitmap (per BG):
+  32768 bits (for 32768 blocks per BG at 4KB), one bit per block
+  bit=0: free; bit=1: allocated
 
-  Order 0: individual blocks     (4KB each)
-  Order 1: pairs                 (8KB each)
-  Order 2: groups of 4           (16KB each)
+In-memory buddy bitmaps (per BG, in struct ext4_group_info):
+  Buddy order 0:  32768 bits — mirrors the block bitmap exactly
+  Buddy order 1:  16384 bits — bit[i]=1 if blocks[2i] AND blocks[2i+1] are BOTH free
+  Buddy order 2:   8192 bits — bit[i]=1 if all 4 blocks starting at 4i are free
+  Buddy order 3:   4096 bits — 8 consecutive blocks all free
   ...
-  Order 13: groups of 8192       (32MB — full BG at 4KB blocks)
+  Buddy order 13:     4 bits — 8192 consecutive blocks all free (= full BG free)
 
-Buddy bitmaps mirror the block bitmap but at each order.
-Allocation: find smallest order ≥ requested size with a free run.
+Total memory per BG: 32768/8 × 2 ≈ 8KB per BG
+Total for 1TB filesystem (8192 BGs): ~64MB (acceptable)
 ```
 
-### Pre-Allocation (PA) System
+**Building the buddy from the block bitmap:**
+```c
+// fs/ext4/mballoc.c — ext4_mb_generate_buddy()
 
-```
-Two PA types:
-
-1. Per-inode PA (for sequential write workloads):
-   - mballoc reserves a window of blocks for a specific inode
-   - Subsequent allocations for that inode are served from the window
-   - Window size doubles with each sequential write (up to mb_stream_req blocks)
-   - Discarded on inode close or when inode stops writing
-
-2. Locality Group PA (for small file / metadata workloads):
-   - Per-CPU pool of pre-allocated blocks
-   - Small allocations (< mb_stream_req) served from LG pool
-   - Keeps small files in same BG → better locality
-
-Key tunables:
-  /sys/fs/ext4/<dev>/mb_stream_req    # min size for per-inode PA (default: 16 blocks = 64KB)
-  /sys/fs/ext4/<dev>/mb_group_prealloc # LG PA window size (default: 512 blocks = 2MB)
-  /sys/fs/ext4/<dev>/mb_max_inode_prealloc # per-inode PA cap
+for (i = 0; i < max_order; i++) {
+    for (block = 0; block < blocks_per_group >> i; block++) {
+        // buddy[i][block] = 1 iff all (2^i) blocks starting at (block << i) are free
+        // Built bottom-up: order 1 derives from order 0, order 2 from order 1, etc.
+        if (buddy[i-1][2*block] && buddy[i-1][2*block+1])
+            set_bit(block, buddy[i]);
+    }
+}
 ```
 
-### mballoc Allocation Goal: Locality
+**Lazy loading:** The buddy is not loaded for a BG until the first allocation request targets that BG. It is built from the on-disk block bitmap via `ext4_mb_load_buddy()`, and freed when memory pressure demands it. A per-BG `bb_prealloc_list` tracks active PAs to ensure they are accounted for even when the buddy is unloaded.
+
+### 4.2 `ext4_group_info` — The Per-BG Allocation State
+
+```c
+// fs/ext4/mballoc.h
+struct ext4_group_info {
+    unsigned long   bb_state;           // EXT4_GROUP_INFO_NEED_INIT_BIT, etc.
+    struct rw_semaphore alloc_sem;       // per-BG lock for allocation
+    ext4_grpblk_t   bb_first_free;      // first free block (hint for bitmap scan)
+    ext4_grpblk_t   bb_free;            // total free blocks in this BG
+    ext4_grpblk_t   bb_fragments;       // number of free fragments (contiguous runs)
+    ext4_grpblk_t   bb_largest_free_order; // largest contiguous run in buddy order units
+    struct          list_head bb_prealloc_list; // active PAs with blocks in this BG
+    void            *bb_bitmap;          // pointer to buddy bitmap (NULL if unloaded)
+    // ...
+};
+```
+
+`bb_largest_free_order` is the critical fast-path field: before locking a BG and doing a full buddy scan, mballoc checks `bb_largest_free_order` to quickly skip BGs that cannot satisfy the request. This avoids loading buddy bitmaps for BGs that are too full.
+
+### 4.3 The Allocation Search: Criteria Levels
+
+When `ext4_mb_new_blocks()` is called, it runs `ext4_mb_regular_allocator()` which implements a multi-pass search with progressively relaxed criteria:
 
 ```
-For each allocation, mballoc tries in order:
-  1. Per-inode PA window (if exists and has space)
-  2. Locality group PA (if small allocation)
-  3. Best-fit search in goal BG (BG where inode lives or was recently active)
-  4. Expand search to nearby BGs
-  5. Any BG with enough free space
+Allocation request: (inode, goal BG, nblocks)
 
-"cr" (criteria) levels in mb_find_extent():
-  cr=0: exact hit in goal BG, large contiguous run
-  cr=1: good hit in goal BG
-  cr=2: any hit in goal BG
-  cr=3: any hit in any BG
+Pass cr=0 — Best quality, goal BG only:
+  Criteria: buddy order ≥ ceil(log2(nblocks)), in the goal BG.
+  If found: return the free run immediately (best locality, contiguous).
+  If not found: try cr=1.
+
+Pass cr=1 — Relaxed contiguity, goal BG first then neighbors:
+  Criteria: any free run ≥ nblocks in goal BG, then neighboring BGs.
+  Uses bb_largest_free_order to skip BGs that are definitely too full.
+  If not found: try cr=2.
+
+Pass cr=2 — Any match in goal BG:
+  Criteria: any free blocks in goal BG, even if fragmented.
+  mballoc will allocate whatever fits.
+
+Pass cr=3 — Any BG in the filesystem:
+  Linear scan of all BGs ordered by free block count.
+  This is the "allocation of last resort" — fragmentation is likely.
+  Triggered when filesystem is > ~85% full.
+
+After each pass, if a match is found:
+  → Try to carve it from a pre-allocation (PA) first (see Section 4.4).
+  → If no PA, call ext4_mb_use_best_found() to claim from buddy bitmap.
 ```
 
-### Delayed Allocation (`delalloc`)
+**Why cr=0 is rare to hit in practice:**
+A newly written large file starts with cr=0 and finds a large contiguous run in its goal BG. But once the filesystem fills up and BGs become fragmented, cr=0 misses and the allocator falls through to cr=1, cr=2, cr=3. The `mb_cr_score` stat tracks how often each criterion level is used.
+
+### 4.4 Pre-Allocation (PA) System — Detailed Mechanics
+
+PA exists to bridge the gap between allocation granularity (one logical block at a time, potentially) and physical contiguity (want a large run on disk).
+
+**Per-inode PA:**
+```
+Trigger: an inode writes more than mb_stream_req blocks in the same call.
+         (default: 16 blocks = 64KB threshold)
+
+mballoc allocates a LARGER window than requested:
+  Initial PA size: 2 × requested (rounded up to power of 2)
+  Each subsequent sequential write: PA window doubles (up to mb_max_inode_prealloc)
+
+Example: sequential writes of 16 blocks each:
+  1st write: request 16 → PA window allocated = 32 blocks
+             inode gets blocks 0..15; blocks 16..31 reserved in PA
+  2nd write: request 16 → served from PA (blocks 16..31); no mballoc call needed
+  3rd write: request 16 → PA exhausted; new PA allocated, window = 64 blocks
+  4th write: served from new PA; ...
+
+Per-inode PA lifecycle:
+  Allocated: ext4_mb_new_inode_pa() → inserts struct ext4_prealloc_space into
+             ei->i_prealloc_list AND into bg_info->bb_prealloc_list
+  Released on inode close: ext4_mb_release_inode_pa() → returns unused blocks to
+             block bitmap (they are NOT freed until PA is discarded)
+  Force-released under memory pressure or filesystem sync
+
+struct ext4_prealloc_space {
+    struct list_head    pa_inode_list;  // linked from inode's i_prealloc_list
+    struct list_head    pa_group_list;  // linked from BG's bb_prealloc_list
+    spinlock_t          pa_lock;
+    atomic_t            pa_count;       // reference count
+    unsigned            pa_deleted;     // being discarded
+    ext4_fsblk_t        pa_pstart;      // physical start of pre-allocated window
+    ext4_lblk_t         pa_lstart;      // logical start
+    ext4_grpblk_t       pa_len;         // total length of window
+    ext4_grpblk_t       pa_free;        // blocks remaining unused in window
+    unsigned short      pa_type;        // MB_INODE_PA or MB_GROUP_PA
+};
+```
+
+**Locality Group (LG) PA:**
+```
+Trigger: allocation request < mb_stream_req (small file or metadata)
+
+Per-CPU per-BG structure (struct ext4_locality_group):
+  - Each CPU has its own locality group to avoid cross-CPU contention
+  - mballoc pre-allocates mb_group_prealloc blocks (default: 512 = 2MB)
+    from the goal BG and places them in the LG PA
+  - Small allocations are carved from the LG PA without acquiring the BG lock
+
+Why per-CPU:
+  In a high-concurrency workload creating many small files:
+  Without LG PA: every allocation acquires bg alloc_sem → serialized per BG
+  With LG PA: each CPU carves from its own LG PA → nearly lockless until LG PA exhausted
+
+LG PA does NOT track which inode owns which blocks:
+  Small files land in the same BG, but not necessarily contiguous with each other.
+  Goal is BG locality, not per-file contiguity.
+```
+
+### 4.5 Delayed Allocation (`delalloc`) — Integration with Extent Tree
+
+Delayed allocation is the key mechanism that lets mballoc make better allocation decisions by seeing larger write extents.
 
 ```
-Write path with delalloc:
-  1. write() → data goes to page cache
-  2. Kernel assigns a LOGICAL block (fake block number 0) — no physical block yet
-  3. writeback (pdflush/work queue) fires:
-     a. ext4_writepages() → mballoc allocates physical blocks
-     b. Assigns real block numbers, updates extent tree
-     c. Submits bio with real physical addresses
+Without delalloc (ext3 behavior):
+  write(1 block) → allocate 1 physical block immediately → write to disk
+  write(1 block) → allocate 1 physical block → write to disk
+  ...
+  1000 writes = 1000 separate allocation calls = potentially 1000 fragments
+
+With delalloc (ext4 default):
+  write(1 block) → data goes to page cache
+                 → ES cache records: logical block 0 as EXTENT_STATUS_DELAYED
+  write(1 block) → data goes to page cache
+                 → ES cache: logical block 1 as EXTENT_STATUS_DELAYED
+  ... (writeback timer fires or page cache pressure)
+  writeback runs on inode:
+    ext4_writepages() collects all dirty pages → finds 1000 DELAYED blocks
+    mballoc sees request for 1000 contiguous blocks → allocates 1 large run
+    Result: 1 extent on disk covering all 1000 blocks
+
+The full delalloc write path:
+
+  write(fd, buf, size):
+    generic_file_write_iter()
+      ext4_write_begin():
+        grab pages in page cache
+        ext4_da_reserve_space():          // "da" = delayed allocation
+          check if we have enough free blocks (balloc_reserve check)
+          increment ei->i_reserved_data_blocks counter
+          does NOT allocate physical blocks yet
+        copy data to pages (dirty)
+        ext4_da_write_end():
+          ext4_da_get_block_prep():       // called per page block
+            mark page's buffer_heads as BH_Delay (no physical block)
+            insert EXTENT_STATUS_DELAYED into ES cache
+
+  writeback fires (dirty_writeback_centisecs or memory pressure):
+    ext4_writepages():
+      mpage_prepare_extent_to_map():      // collect contiguous dirty page range
+      ext4_map_blocks(..., EXT4_GET_BLOCKS_CREATE):
+        sees EXTENT_STATUS_DELAYED range
+        calls ext4_mb_new_blocks() with full range as request
+        mballoc allocates contiguous physical blocks (PA system engaged)
+        ext4_ext_map_blocks() inserts new extent into on-disk extent tree
+        buffer_heads updated with real physical block numbers (BH_Delay cleared)
+      submit bio with real physical addresses
+
+delalloc and ENOSPC:
+  Space reservation happens at write() time via ext4_da_reserve_space():
+    if (free_blocks - reserved_blocks < request): return -ENOSPC
+  Physical allocation happens at writeback time.
+  If mballoc fails at writeback (e.g., fragmentation prevented contiguous alloc):
+    → journal error; filesystem remounts read-only (with errors=remount-ro)
+  This is why keeping filesystem < 85% full is important:
+    mballoc needs contiguous free space to honor reservations.
+
+nodelalloc mount option:
+  Disables delayed allocation. Physical block allocated immediately at write().
+  Restores ext3-style behavior.
+  Use for: databases that call fsync() per transaction and want deterministic ENOSPC.
+  Cost: more fragmentation, more allocation calls, lower write throughput.
+```
+
+### 4.6 Block Free Path: `ext4_free_blocks()`
+
+Understanding free is important because it directly affects future allocation quality.
+
+```c
+// fs/ext4/balloc.c + mballoc.c
+ext4_free_blocks(inode, block, count, flags):
+  1. Mark blocks free in the block bitmap (or defer if discard is pending)
+  2. Update bg_free_blocks_count in the BG descriptor
+  3. Update sb_free_blocks_count in the superblock
+  4. Rebuild buddy bitmap entries for the affected BG:
+       ext4_mb_free_metadata() updates in-memory buddy at each order
+       If order N is now fully free: propagate up to order N+1
+  5. If trim/discard is enabled (mount -o discard):
+       Immediately issue blkdev_issue_discard() for freed blocks
+       This hints to SSD FTL that blocks are no longer in use
+     If discard not enabled: blocks remain in buddy; no trim
+
+Journal interaction on free:
+  Free operations are journaled: block bitmap change + BG descriptor change
+  journaled atomically with the metadata operation that freed the blocks
+  (e.g., unlink: inode delete + block free in same transaction)
+
+PA interaction on free:
+  If freed blocks overlap a PA window:
+    PA is invalidated; remaining PA blocks also freed
+    ext4_mb_discard_inode_preallocations() called on inode close or trim
+
+Buddy update after free example:
+  Free blocks 16, 17 (order 0 pair):
+    buddy[0][16] = 1, buddy[0][17] = 1
+    Both free → buddy[1][8] = 1  (pair 8 = blocks 16..17)
+    Is buddy[1][9] also 1? (blocks 18..19 free?)
+      If yes → buddy[2][4] = 1 (group of 4: blocks 16..19 all free)
+      If no  → stop at order 1
+  bb_largest_free_order updated if this is now the largest free run
+```
+
+### 4.7 bigalloc: Cluster-Based Allocation
+
+The `bigalloc` feature changes mballoc's allocation granularity from 1 block to 1 cluster (multiple blocks), reducing metadata overhead for large files.
+
+```
+Without bigalloc:
+  Allocation granularity: 4KB (1 block)
+  Block bitmap: 1 bit per 4KB
+
+With bigalloc (mkfs.ext4 -C 65536 → 64KB cluster = 16 blocks per cluster):
+  Allocation granularity: 64KB (1 cluster)
+  Cluster bitmap: 1 bit per 64KB
+  Block bitmap size: 32768/16 = 2048 bits → fits in fraction of a block
+  BG size grows proportionally: 32768 clusters × 64KB = 2GB per BG
 
 Benefits:
-  - mballoc sees the full write before allocating → can give contiguous extents
-  - Eliminates allocation of blocks that are overwritten before writeback (write coalescing)
-  - Reduces write amplification for temporary files (never written to disk)
+  - Reduced bitmap I/O (bitmap is smaller)
+  - Better for very large files (each extent covers more bytes per entry)
+  - Metadata overhead (per-extent journaling) amortized over larger allocation units
 
-Risk:
-  - ENOSPC can appear late (at writeback time, not at write() time)
-  - Fix: reserve 5% of blocks (r_blocks_count) for root; tune2fs -m 5 /dev/sdX
+Costs:
+  - Internal fragmentation: a 1KB file wastes 63KB of physical space
+  - NOT suitable for small-file workloads
+  - mkfs.ext4 -C <cluster_size_in_bytes>  (must be power of 2, ≥ block size)
+
+Real use: rarely used in practice. XFS AG allocation naturally achieves similar
+  contiguity without fixed cluster overhead.
+```
+
+### 4.8 mballoc Observability and Tuning
+
+```bash
+# Per-BG free block distribution (shows fragmentation)
+cat /sys/fs/ext4/sda1/mb_groups
+# Format: group [N]: free blocks [M], fragments [F], first free [B], largest free order [O]
+# Large F with small O → fragmented BG (many small runs, no large ones)
+
+# Allocation stats since mount
+cat /sys/fs/ext4/sda1/stats
+# Key lines:
+#   reqs: N         — total allocation requests
+#   cr0: N (X%)     — requests satisfied at criteria level 0 (best quality)
+#   cr1: N (X%)     — satisfied at cr=1
+#   cr2: N (X%)     — cr=2
+#   cr3: N (X%)     — cr=3 (worst; high % indicates near-full or fragmented FS)
+#   hits: N         — served from PA (preallocation hit rate)
+#   groups_scanned  — how many BGs were examined per request on average
+
+# Fragmentation report
+e2freefrag /dev/sda1
+# Shows histogram of free-space chunk sizes
+# Healthy: most free space in large chunks (> 1MB)
+# Fragmented: free space split into many small chunks (< 64KB)
+
+# Enable/disable stats collection
+echo 1 > /sys/fs/ext4/sda1/mb_stats
+
+# Tune PA behavior
+echo 32 > /sys/fs/ext4/sda1/mb_stream_req       # threshold for per-inode PA
+echo 1024 > /sys/fs/ext4/sda1/mb_group_prealloc # LG PA window size (blocks)
+echo 512 > /sys/fs/ext4/sda1/mb_max_inode_prealloc  # cap per-inode PA window
+
+# Trim to reduce SSD fragmentation and reclaim over-reserved PA space
+fstrim -v /mountpoint                           # one-shot trim
+mount -o discard /dev/sda1 /mountpoint          # real-time discard on free
+
+# Defragment individual files or directories
+e4defrag /path/to/file                         # single file
+e4defrag /mountpoint/                          # recursive directory
+# e4defrag copies file data to a temporary location, then replaces the original
+# Requires ~equal free space to the file being defragmented
+```
+
+### 4.9 Design Trade-offs: Why mballoc Is Good Enough but Not Great
+
+```
+mballoc strength: The PA system and delalloc together give good allocation quality
+  for sequential and append workloads. A streaming write to a new file will
+  typically get one or two large extents, matching HDD/SSD performance expectations.
+
+mballoc weakness: The per-BG buddy structure means "contiguous allocation" is limited
+  to within one BG (128MB at 4KB blocks). Cross-BG contiguity is not possible.
+  XFS per-AG allocation can allocate larger contiguous runs within a 1GB AG.
+
+mballoc weakness: The fixed block bitmap (one bit per block) means the allocator must
+  scan/update bitmaps on every allocation, which becomes a bottleneck at high IOPS.
+  XFS's B-tree free-space index (BNObt + CNTbt) is more cache-friendly for random
+  small allocation patterns.
+
+mballoc vs XFS comparison:
+  Workload                   mballoc result    XFS mballoc equivalent
+  Large sequential write     1 extent/128MB    1 extent/1GB
+  Many small files            LG PA, BG-local  Per-AG LG equivalent
+  Near-full FS random write  cr=3 (poor)       CNTbt search (better)
+  Read-modify-write          Adequate          Similar
 ```
 
 ---
