@@ -843,6 +843,288 @@ XFS:   purpose-built for scale. The right choice for NVMe data volumes,
 
 Red Hat switched RHEL default from ext4 to XFS in RHEL 7. This was not a religious choice — it was based on measured performance at the scale of enterprise storage (multi-TB filesystems, 10K+ file/sec creation rates, RAID and SAN workloads). For those workloads, XFS wins on throughput, concurrency, and long-term fragmentation resistance.
 
+### Deep Dive 1: Concurrency Lock Model
+
+The high-level summary ("XFS scales better") hides an important mechanism. Here is the exact lock path for a block allocation in both filesystems:
+
+**ext4 allocation lock path:**
+```
+ext4_mb_new_blocks()
+  → lock BG alloc_sem (one per 128MB block group)
+    → scan buddy bitmap
+    → update block bitmap (BH_Lock on bitmap buffer)
+    → update BG descriptor (free_blocks_count)
+  → unlock alloc_sem
+  → lock inode (ei->i_data_sem) to insert extent
+  → journal: lock transaction handle
+```
+
+**XFS allocation lock path:**
+```
+xfs_alloc_vextent()
+  → lock AGF (xfs_buf lock on AGF buffer)
+    → search CNTbt (B-tree traversal under AGF lock)
+    → update BNObt and CNTbt (under AGF lock)
+    → update AGF free_count
+  → unlock AGF
+  → lock AGI (if inode allocation needed)
+  → lock inode (xfs_ilock) to insert BMBT entry
+  → CIL: lock log item (xfs_log_item)
+```
+
+**Why ext4 hits a concurrency ceiling:**
+```
+Scenario: 32 threads creating files in the same directory
+  → All files land in the same BG (inode allocation policy: same BG as parent dir)
+  → All 32 threads compete for the same BG alloc_sem
+  → Effective parallelism: 1 (serialized on BG lock)
+
+With flex_bg=16 and directory spread across BGs:
+  → 32 threads may land in 16 different BGs → 16-way parallelism
+  → But BG size is 128MB; with 16 BGs that's 2GB of FS used for parallelism
+
+Measurement: on a 32-core machine creating 1M files in one directory,
+  ext4 saturates at ~2-4 cores worth of CPU; rest wait on alloc_sem.
+  XFS with agcount=32: near-linear scaling up to ~24 cores,
+  bottleneck shifts to journal CIL flush, not allocation lock.
+```
+
+**Why XFS scales: AG lock contention model:**
+```
+XFS allocation assigns a goal AG per inode based on:
+  inode_ag = (inode_number >> XFS_INO_AGINO_BITS) & agcount_mask
+
+Files in different directories → different AGs → different AGF locks.
+Files in the same directory → same AG initially, but XFS load-balances:
+  if goal AG's AGF lock is contended → try (goal_ag + 1) % agcount
+  This "AG rotation" under contention distributes load automatically.
+
+Effective parallelism: min(thread_count, agcount).
+On 96-core machine with agcount=64: 64-way metadata parallelism.
+Beyond agcount cores: serialization begins, but rare in practice.
+```
+
+**The lock order matters for deadlock avoidance:**
+```
+ext4 lock order (enforced by code):
+  journal_handle → BG alloc_sem → block bitmap BH → inode
+
+XFS lock order (strictly enforced, violating = kernel BUG):
+  Superblock → AGF → AGI → AGFL → Inode → Buffer
+  (same as Section 6 in this reference)
+
+Key implication: XFS holds the AGF lock only during the B-tree search and
+update, which is O(log N) time. Under high IOPS, the AGF lock hold time
+is microseconds. ext4 holds alloc_sem for the full buddy bitmap scan,
+which can be milliseconds on a fragmented BG.
+```
+
+### Deep Dive 2: Journal I/O Write Amplification
+
+The difference between JBD2 full-block journaling and XFS byte-range logging creates a measurable write amplification gap under metadata-intensive workloads.
+
+**JBD2 logs full 4KB blocks:**
+```c
+// fs/jbd2/transaction.c — jbd2_journal_dirty_metadata()
+// When a buffer is modified, JBD2 adds the ENTIRE buffer to the current transaction.
+// At commit time, the full 4KB block is copied to the journal.
+
+// Example: modify inode i_size (4 bytes out of 256-byte inode,
+//          which lives in a 4096-byte inode table block):
+//   Bytes modified: 4
+//   Bytes written to journal: 4096  (full block)
+//   Write amplification: 4096 / 4 = 1024×
+
+// Why: JBD2 journaling granularity is the block (buffer_head).
+//      It has no sub-block tracking of which bytes changed.
+//      The entire block is journaled atomically.
+```
+
+**XFS logs only changed bytes (log vectors):**
+```c
+// fs/xfs/xfs_log.c — xlog_write()
+// Each log item calls its ->iop_format() method to produce log vectors:
+//   XFS inode log item: only the dirty fields (di_size, di_nblocks, etc.)
+//   XFS buffer log item: only the dirty regions (marked dirty by the
+//                         xfs_trans_log_buf() range API)
+
+// Example: modify inode i_size (8 bytes in XFS inode di_size):
+//   Bytes modified: 8
+//   Bytes written to log: ~8 + log item header (~48 bytes) ≈ 56 bytes
+//   Write amplification: ~7×  (vs 1024× for JBD2)
+
+// XFS inode format produces a log vector only for changed fields:
+//   xfs_inode_item_format():
+//     if (iip->ili_fields & XFS_ILOG_CORE)  → log just the inode core (96 bytes)
+//     if (iip->ili_fields & XFS_ILOG_DEXT)  → log extent tree changes
+//     (only set if that field was actually modified)
+```
+
+**Concrete write amplification comparison:**
+
+| Operation | Bytes modified | JBD2 journal write | XFS log write | Amplification ratio |
+|-----------|---------------|-------------------|---------------|---------------------|
+| inode size update (8B) | 8 | 4096 (full inode table block) | ~56 | JBD2: 512×, XFS: 7× |
+| Add directory entry (32B) | 32 | 4096 (full dir block) | ~80 | JBD2: 128×, XFS: 2.5× |
+| Allocate 1 block (update bitmap + BGD/AGF) | ~20 | 4096 + 4096 = 8192 | ~120 | JBD2: 410×, XFS: 6× |
+| Truncate 1000 extents | ~12000 | 12000 → rounded to blocks | ~12000 + headers | Similar |
+
+**Aggregate effect on journal throughput:**
+```
+Scenario: 10,000 file creates/sec (common for a busy NFS server or container runtime)
+  Each create: inode alloc + dir entry + 2 block allocs = ~4 metadata updates
+
+JBD2 journal write rate:
+  4 updates × 4096 bytes × 10,000/sec = 164 MB/sec of journal writes
+  On a 1GB journal: fills in ~6 seconds → checkpoint pressure
+
+XFS log write rate:
+  4 updates × ~100 bytes × 10,000/sec = 4 MB/sec of log writes
+  On a 512MB log: fills in ~2 minutes → checkpoint pressure negligible
+
+Implication:
+  - JBD2 journal becomes a write bottleneck at high metadata rates
+  - XFS log rarely bottlenecks on metadata-only workloads
+  - For JBD2: moving journal to NVMe (external journal) helps substantially
+  - For XFS: log bottleneck only appears with massive sequential writes + many fsyncs
+```
+
+**CIL batching amplifies XFS log efficiency:**
+```
+XFS Committed Item List (CIL) — introduced in kernel 2.6.37:
+  Modified items accumulate in the CIL in-memory.
+  A single log write flushes the entire CIL batch.
+
+Without CIL: each transaction's log items flushed individually → many small writes.
+With CIL: 1000 transactions buffered → one large log write for all 1000.
+
+Effect on fsync under concurrency:
+  Thread A calls fsync (forces CIL flush).
+  CIL contains dirty items from threads A, B, C, D, E ... (all concurrent writers).
+  One log write covers all of them.
+  Threads B-E see their data committed "for free" by A's fsync.
+  Effective fsync cost per thread: total_log_write_cost / concurrent_threads
+
+JBD2 has no equivalent: each commit is its own journal transaction.
+Under high concurrency, JBD2 commit rate = request rate (no amortization).
+```
+
+### Deep Dive 3: Online Repairability and RTO Implications
+
+This is often the deciding factor for enterprise storage architects choosing between ext4 and XFS.
+
+**ext4 repair model — offline only:**
+```
+fsck (e2fsck) requires the filesystem to be UNMOUNTED (or at minimum read-only mounted).
+
+Typical e2fsck time:
+  1 TB ext4: ~2-5 minutes (with uninit_bg, only used inodes checked)
+  10 TB ext4: ~20-50 minutes
+  100 TB ext4: hours (if many files)
+  
+The bottleneck: e2fsck must read every inode table block and walk every
+directory tree to verify consistency. I/O is sequential but volume is large.
+
+RTO implication:
+  Server crash → filesystem needs fsck → storage offline for duration of fsck.
+  For a 50TB NAS volume: ~2 hours offline.
+  SLA impact: unacceptable for 99.9% uptime targets.
+
+e2scrub (since kernel 5.0):
+  Online consistency check via LVM snapshot.
+  Creates a read-only snapshot → runs e2fsck against snapshot.
+  Original filesystem stays mounted.
+  Limitation: requires LVM; checks snapshot consistency, not live FS;
+              cannot repair the live FS without unmounting.
+```
+
+**XFS repair model — online scrub:**
+```
+xfs_scrub (since kernel 4.15, production-ready in 5.2+):
+  Runs WHILE the filesystem is mounted read-write.
+  No downtime required.
+
+How xfs_scrub works online:
+  1. Lock one AG's AGF/AGI briefly (microseconds per lock)
+  2. Traverse the B-trees (BNObt, CNTbt, inobt, finobt, RMAPbt, REFCNTbt)
+  3. Verify cross-consistency: RMAPbt vs inode extents, AGF counts vs actual B-tree entries
+  4. Release lock
+  5. Repeat for each AG
+
+Why online scrub is possible in XFS:
+  RMAPbt provides a reverse index: given physical block → owner (inode + offset).
+  xfs_scrub can verify "does inode X's extent tree agree with RMAPbt?" online,
+  because both structures can be queried while holding AG locks briefly.
+
+  Without RMAP (ext4 has no equivalent):
+  To verify "is block 10000 owned by exactly one inode and that inode claims it?",
+  you would need to walk ALL inode extent trees — only feasible offline.
+  RMAP turns this from O(total_inodes) to O(1) per block lookup.
+
+xfs_scrub repair:
+  When xfs_scrub finds an inconsistency:
+  - Metadata structures: can often repair in-place (B-tree node rebalance,
+    AGF count correction) with a brief write lock
+  - Inode data: if inode's extent tree is corrupt, xfs_repair is still needed offline
+  - But: most metadata repairs are online
+
+RTO comparison:
+  ext4 metadata corruption detected at mount time → unmount → e2fsck → remount
+  50TB volume: 2 hours downtime
+
+  XFS metadata corruption detected by xfs_scrub (scheduled or triggered):
+  → repair online for B-tree issues: 0 downtime
+  → repair offline for severe inode corruption: xfs_repair
+      50TB XFS: xfs_repair phase 4-6 (inode + free space) ~10-30 minutes
+      (faster than e2fsck because B-tree traversal is faster than bitmap scan)
+
+Practical recommendation:
+  Run xfs_scrub as a weekly cron job on important volumes.
+  It catches corruption early (before it propagates) with no production impact.
+  xfs_scrub -x /mountpoint     # online check
+  xfs_scrub -n /mountpoint     # dry-run (report only, no repair)
+```
+
+**Corruption detection: checksums vs no checksums:**
+```
+Both modern ext4 (metadata_csum feature) and XFS v5 have per-block CRC32c checksums.
+The difference is in what is checksummed and how corruption is handled:
+
+XFS v5 checksum coverage:
+  Every B-tree block: AGF, AGI, inode, extent tree, all B-tree nodes
+  Each block contains: block type, UUID, LSN (log sequence number), CRC32c
+  UUID check: prevents mounting a block device that was partially overwritten
+              with another filesystem's metadata
+  LSN check: detects stale blocks replayed out of order (e.g., write barrier failure)
+
+ext4 metadata_csum:
+  Superblock, group descriptors, inode table blocks, directory blocks
+  Checksum covers: block content + UUID + block number
+  Does NOT include LSN → cannot detect stale block replays
+
+Architect implication:
+  XFS LSN in every metadata block means: if a write barrier failure allows
+  a stale metadata block to survive a crash, XFS recovery detects it
+  (LSN mismatch with what the log says was committed).
+  ext4 cannot detect this scenario → silent corruption is possible on storage
+  hardware without power-loss protection.
+```
+
+**Summary: when repairability drives the decision:**
+```
+Choose ext4 when:
+  - Volume is < 1TB (e2fsck time is acceptable)
+  - Volume is non-critical (desktop, container ephemeral storage)
+  - LVM is available and e2scrub provides sufficient assurance
+
+Choose XFS when:
+  - Volume is > 5TB (e2fsck time breaches SLA)
+  - Volume supports production services with uptime requirements
+  - You need online corruption detection without maintenance windows
+  - Storage hardware lacks power-loss protection (XFS LSN catches stale blocks)
+  - You require xfs_repair < xfs_scrub (XFS repair is faster than e2fsck at scale)
+```
+
 ---
 
 ## Quick Reference: XFS Architect Decision Points
