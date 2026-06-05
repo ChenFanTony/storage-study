@@ -21,6 +21,7 @@ is either complete or does not exist."
 | [checkpoint-reference.md](checkpoint-reference.md) | Consistent checkpoint I/O for distributed training | Chandy-Lamport, async DCP, EC for shards |
 | [training-data-reference.md](training-data-reference.md) | Training data pipeline: format, shuffle, prefetch | Reservoir sampling, double-buffer prefetch |
 | [memory-hierarchy-reference.md](memory-hierarchy-reference.md) | HBM → DRAM → NVMe → object storage tier stack | Spill/prefetch policy, bandwidth math |
+| [3fs-reference.md](3fs-reference.md) | 3FS (Fire-Flyer FS) — DeepSeek's AI-native distributed filesystem | CRAQ protocol, usrbio RDMA bypass |
 
 ## Prerequisite Map
 
