@@ -129,6 +129,17 @@ Hot path:
 Cold path (long context, HBM full):
   Evicted KV blocks → CPU DRAM (spill)
   Prefix cache hits → CPU DRAM → PCIe → HBM (restore)
+  Remote prefix hits → object store / shared KV tier → pinned DRAM → HBM (restore)
+
+A Ceph/S3-backed KV cache extends this hierarchy one more step down:
+- HBM holds hot active blocks
+- CPU DRAM holds warm spill / staging buffers
+- local NVMe may hold colder node-local prefix blocks
+- object storage holds large shared cold KV blocks reusable across nodes
+
+This path only wins when transfer plus copy overhead is lower than recomputing prompt
+prefill. In practice, that usually requires long shared prefixes and large chunked reads,
+not tiny random block fetches.
 
 Throughput formula:
   tokens/sec = HBM_BW / bytes_per_token

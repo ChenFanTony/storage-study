@@ -265,9 +265,97 @@ system prompt blocks are warm. Memory cost: `sys_prompt_tokens / B` blocks (pinn
 
 ---
 
-## 4. Chunked Prefill
+## 4. Remote Prefix Cache via Object Storage
 
-### 4.1 The Prefill/Decode Latency Conflict
+### 4.1 Why Add a Remote Tier?
+
+Local HBM prefix cache is fast but small. CPU DRAM and local NVMe extend capacity per node,
+but they are still node-local: a cache hit only helps if the next request lands on the
+same machine.
+
+Large production systems often want a shared prefix-cache tier:
+- one node computes KV for a long prompt once
+- the resulting KV blocks are stored in a remote shared tier
+- later requests on any node can fetch those blocks instead of recomputing prefill
+
+This is the architectural role of systems such as LMCache with S3/Ceph backends.
+
+### 4.2 Mapping to Classical Storage Concepts
+
+| LLM Inference Concept | Storage Analogy |
+|-----------------------|-----------------|
+| KV block | Cache page / large object chunk |
+| Block hash | Content address / object key |
+| Prefix cache hit | Cache hit on previously materialized intermediate state |
+| Prefill recompute | Cache miss penalty |
+| GPU HBM | L1 cache / hottest tier |
+| CPU pinned DRAM | DMA-friendly staging tier |
+| Local NVMe | Per-node victim cache |
+| Object storage (Ceph/S3) | Shared cold cache tier |
+
+The key idea is that KV cache is not model state and not user data. It is derived,
+reusable intermediate state. That makes it a good fit for a content-addressed cache.
+
+### 4.3 Retrieval vs Recompute Tradeoff
+
+Remote prefix caching only helps when:
+
+```
+remote_fetch_time < recompute_prefill_time
+```
+
+For a long shared prompt, prefill may take hundreds of milliseconds. If the matching KV
+blocks can be fetched quickly enough from a remote tier, TTFT improves because the
+system skips most or all of the prefix prefill.
+
+Costs to account for:
+- object-store latency for each fetch
+- transfer bandwidth from remote tier to host
+- copy overhead into pinned DRAM / GPU HBM
+- any serialization or metadata lookup overhead
+
+Benefits:
+- cross-node cache sharing
+- much larger effective prefix-cache capacity
+- fewer duplicate prefill computations across a fleet
+
+### 4.4 Practical Constraints
+
+- Only full blocks are reusable. If two prompts diverge in the middle of a block,
+  reuse stops at the previous full block.
+- Large transfer units are important. Object storage is too latent for tiny random
+  reads, but can be effective for multi-MiB KV chunks where bandwidth dominates.
+- Copy count matters. A path like `Ceph/S3 -> userspace buffer -> /dev/shm -> pinned
+  DRAM -> GPU HBM` may erase the benefit of a cache hit.
+- A minimum useful hit length exists. Small prefix matches are often cheaper to
+  recompute than to fetch remotely.
+
+### 4.5 Reading the Ceph + vLLM + LMCache Design
+
+A practical mental model for the Ceph blog post:
+
+```
+vLLM:
+  - manages KV in fixed-size blocks (PagedAttention)
+  - hashes prompt blocks for prefix matching
+
+LMCache:
+  - exposes external storage connectors for those blocks
+  - stages blocks through CPU memory and GPU transfer buffers
+
+Ceph/S3:
+  - stores the hashed KV chunks as a shared remote cache tier
+  - trades ms-scale latency for very large capacity and cross-node reuse
+```
+
+The blog's main claim is narrow and important: for repeated long prompts, fetching KV
+from shared object storage can beat recomputing prefill on GPUs.
+
+---
+
+## 5. Chunked Prefill
+
+### 5.1 The Prefill/Decode Latency Conflict
 
 Prefill for a long prompt (e.g., 32K tokens) dominates GPU time for hundreds of milliseconds.
 During this time, no decode steps run — live sequences stall, increasing tail latency (P99).
@@ -284,7 +372,7 @@ With chunked prefill (chunk=1K tokens):
   t=384ms  prefill complete, decode continues uninterrupted
 ```
 
-### 4.2 Scheduling Algorithm
+### 5.2 Scheduling Algorithm
 
 ```python
 def schedule(running: List[Seq], waiting: List[Seq], chunk_size: int):
@@ -315,9 +403,9 @@ pass. The GPU runs them in the same kernel invocation, amortizing launch overhea
 
 ---
 
-## 5. KV Cache Eviction to CPU DRAM / NVMe
+## 6. KV Cache Eviction to CPU DRAM / NVMe
 
-### 5.1 When to Evict
+### 6.1 When to Evict
 
 The scheduler must evict when all of the following hold:
 - Free block pool is empty
@@ -331,7 +419,7 @@ Eviction choices:
    transfer (H100 = 64 GB/s bidirectional PCIe 5.0).
 3. **Evict prefix-cache blocks:** (ref_count=0 blocks). Free immediately, no restore needed.
 
-### 5.2 Swap Bandwidth Math
+### 6.2 Swap Bandwidth Math
 
 Swapping 1 sequence of Llama-70B at seq_len=4K:
 ```
@@ -346,7 +434,7 @@ Total round-trip = 672 ms — larger than typical decode latency
 This means swapping is only viable for sequences that will not be rescheduled soon
 (long waiting queue). For short queues, recompute is cheaper.
 
-### 5.3 NVMe Offload (Extended KV Cache)
+### 6.3 NVMe Offload (Extended KV Cache)
 
 Some systems (e.g., LMDeploy, MLC-LLM) offload cold prefix-cache blocks to NVMe:
 
@@ -366,9 +454,9 @@ The NVMe offload path is useful for **multi-turn conversation** where the earlie
 
 ---
 
-## 6. KV Quantization
+## 7. KV Quantization
 
-### 6.1 Why Quantize KV
+### 7.1 Why Quantize KV
 
 KV tensors are read/written every decode step. Halving their size halves HBM BW pressure.
 For BW-bound decode, this directly increases throughput.
@@ -380,7 +468,7 @@ For BW-bound decode, this directly increases throughput.
 | int8 | 1 | 50% | small, needs per-head scale |
 | int4 | 0.5 | 75% | noticeable, needs careful tuning |
 
-### 6.2 Per-Head Dynamic Quantization
+### 7.2 Per-Head Dynamic Quantization
 
 ```
 For each attention head h, each KV block b:
@@ -397,7 +485,7 @@ happens on load into the attention kernel.
 
 ---
 
-## 7. Architect Cheat Sheet
+## 8. Architect Cheat Sheet
 
 ```
 Problem                     Algorithm/Solution              Key Number
@@ -418,10 +506,12 @@ Block size tradeoff:
 
 ---
 
-## 8. Key Papers
+## 9. Key Papers
 
 - **PagedAttention**: Kwon et al., "Efficient Memory Management for Large Language Model
   Serving with PagedAttention", SOSP 2023 (vLLM paper)
 - **Prefix caching**: SGLang (Zheng et al., 2024) — RadixAttention for tree-structured prefix
 - **Chunked prefill**: Sarathi-Serve (Agrawal et al., 2024)
 - **KV quantization**: KIVI (Liu et al., 2024), KVQuant (Hooper et al., 2024)
+- **Remote/shared KV cache**: practical examples include LMCache integrations with
+  object storage backends such as S3/Ceph
