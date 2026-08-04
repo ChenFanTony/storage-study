@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://squidfunk.github.io/mkdocs-material/schema.json
+site_name: Storage Study Knowledge Base
+site_description: Curated notes on Linux, distributed, and AI storage systems
+site_url: https://chenfantony.github.io/storage-study/
+repo_url: https://github.com/ChenFanTony/storage-study
+repo_name: ChenFanTony/storage-study
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - content.action.edit
+    - navigation.indexes
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+
+exclude_docs: |
+  _meta/

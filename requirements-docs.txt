@@ -1,0 +1,2 @@
+# Keep the documentation build on the current Material major version.
+mkdocs-material==9.*

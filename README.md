@@ -19,14 +19,14 @@ python3 -m venv .venv
 - Tooling ecosystem (fio, blktrace, bpftrace, etc.)
 
 ## Categories
-- [Kernel storage](docs/categories/kernel-storage.md)
-- [Ceph](docs/categories/ceph.md)
-- [DRBD](docs/categories/drbd.md)
-- [DAOS](docs/categories/daos.md)
-- [NVMe-oF](docs/categories/nvme-of.md)
-- [SPDK](docs/categories/spdk.md)
-- [Filesystems](docs/categories/filesystems.md)
-- [Tools ecosystem](docs/categories/tools-ecosystem.md)
+- [Kernel storage](docs/reference/kernel-storage.md)
+- [Ceph](docs/reference/ceph.md)
+- [DRBD](docs/reference/drbd.md)
+- [DAOS](docs/reference/daos.md)
+- [NVMe-oF](docs/reference/nvme-of.md)
+- [SPDK](docs/reference/spdk.md)
+- [Filesystems](docs/reference/filesystems.md)
+- [Tools ecosystem](docs/reference/tools-ecosystem.md)
 
 ## Curation Criteria
 - Prefer primary sources (specs, official docs, maintainer posts, upstream repos).
@@ -42,4 +42,4 @@ python3 -m venv .venv
 - If there are no significant updates, create the file with a brief note.
 
 ## Latest Updates
-- [2026-03](docs/updates/2026-03.md)
+- [2026-03](docs/_meta/updates/2026-03.md)
