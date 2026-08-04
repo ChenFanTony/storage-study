@@ -2,6 +2,16 @@
 
 Curated summaries and references for Linux storage stack and distributed storage technologies.
 
+**Browse the documentation:** <https://chenfantony.github.io/storage-study/>
+
+The site is built from the Markdown files in `docs/`. To preview it locally:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-docs.txt
+.venv/bin/mkdocs serve
+```
+
 ## Scope
 - Linux kernel storage stack (block layer, device mapper, filesystem internals, io_uring)
 - Distributed storage (Ceph, DRBD, DAOS)
