@@ -1,5 +1,8 @@
 # Day 19: ext4 — JBD2 Crash Recovery (Targeted)
 
+<!-- study-nav -->
+[← Previous: Day 18](day18-xfs-internals-part2.md) | [Next: Day 20 →](day20-btrfs-cow-snapshots.md)
+
 ## Context
 You know ext4 layout and general journaling concepts. This day is targeted:
 focus on exactly what JBD2 guarantees under each journal mode, and the

@@ -1,5 +1,8 @@
 # Day 3: blk-mq — Scheduler Interaction & Plug/Unplug
 
+<!-- study-nav -->
+[← Previous: Day 2](day02-blk-mq-internals.md) | [Next: Day 4 →](day04-writeback-thresholds.md)
+
 ## Learning Objectives
 - Understand the plug/unplug mechanism and when it helps vs hurts
 - Understand how I/O schedulers interact with blk-mq dispatch

@@ -1,5 +1,8 @@
 # Day 24: NUMA Memory Management
 
+<!-- study-nav -->
+[← Previous: Day 23](day23-hugetlb-pages.md) | [Next: Day 25 →](day25-memory-cgroups.md)
+
 ## Learning Objectives
 - Understand NUMA memory policies and when each applies
 - Use numactl and numastat to diagnose NUMA-related storage performance issues

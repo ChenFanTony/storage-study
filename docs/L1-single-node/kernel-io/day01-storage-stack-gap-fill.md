@@ -1,5 +1,8 @@
 # Day 1: Storage Stack Gap-Fill (Half Day)
 
+<!-- study-nav -->
+[Next: Day 2 →](day02-blk-mq-internals.md)
+
 ## Context
 You already know this stack. This is a **directed audit**, not a tutorial.
 Goal: confirm your mental model is complete and current, identify any gaps

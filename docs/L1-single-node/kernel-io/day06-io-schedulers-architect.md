@@ -1,5 +1,8 @@
 # Day 6: I/O Schedulers — Architect's View
 
+<!-- study-nav -->
+[← Previous: Day 5](day05-readahead-tiering.md) | [Next: Day 7 →](day07-week1-review.md)
+
 ## Learning Objectives
 - Understand what each scheduler actually guarantees (not just its name)
 - Measure p99 latency, not just throughput — that's what architects defend

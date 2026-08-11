@@ -1,5 +1,8 @@
 # Day 30: Final Review & Storage Architecture Roadmap
 
+<!-- study-nav -->
+[← Previous: Day 29](day29-performance-tuning-lab.md)
+
 ## Objective
 This is your graduation day. Two deliverables: a complete storage stack
 architecture diagram, and a "Storage Architecture Decision Guide" you

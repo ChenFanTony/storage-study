@@ -1,5 +1,8 @@
 # Day 14: Week 2 Review — Virtual Memory Connective Tissue
 
+<!-- study-nav -->
+[← Previous: Day 13](day13-kmap-ioremap-dma.md) | [Next: Day 15 →](day15-page-cache-internals.md)
+
 ## Learning Objectives
 - Synthesize Days 8–13 into a single end-to-end mental model
 - Trace a file `mmap()` access from userspace instruction to physical page

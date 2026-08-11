@@ -1,5 +1,7 @@
 # Day 13 — PR slow path: initiator side
 
+<!-- study-nav -->
+[← Previous: Day 12](day12.md) | [Next: Day 14 →](day14.md)
 **Week 2**: iSCSI Initiator Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/scsi/sd.c`, `block/blk-ioc.c`, `include/uapi/linux/pr.h`, `block/ioctl.c`

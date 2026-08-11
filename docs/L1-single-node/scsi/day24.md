@@ -1,5 +1,7 @@
 # Day 24 — configfs control plane
 
+<!-- study-nav -->
+[← Previous: Day 23](day23.md) | [Next: Day 25 →](day25.md)
 **Week 4**: Advanced Topics  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/target_core_configfs.c`, `drivers/target/iscsi/iscsi_target_configfs.c`, `drivers/target/target_core_tpg.c`

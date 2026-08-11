@@ -1,5 +1,8 @@
 # Day 27: Persistent Memory / DAX Path
 
+<!-- study-nav -->
+[← Previous: Day 26](day26-zns-zones.md) | [Next: Day 28 →](day28-cgroup-io.md)
+
 ## Learning Objectives
 - Understand the persistent memory programming model and how it differs from block storage
 - Understand how DAX bypasses BOTH the page cache AND the block layer

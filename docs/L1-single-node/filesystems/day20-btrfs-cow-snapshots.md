@@ -1,5 +1,8 @@
 # Day 20: Btrfs — CoW B-tree, Snapshots & Send/Receive
 
+<!-- study-nav -->
+[← Previous: Day 19](day19-ext4-jbd2-recovery.md) | [Next: Day 21 →](day21-week3-review.md)
+
 ## Learning Objectives
 - Understand Btrfs's CoW B-tree as the foundation for all Btrfs features
 - Follow snapshot creation and the subvolume model at source level

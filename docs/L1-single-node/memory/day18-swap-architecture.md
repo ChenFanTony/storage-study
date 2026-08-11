@@ -1,5 +1,8 @@
 # Day 18: Swap — Architecture & Storage Interaction
 
+<!-- study-nav -->
+[← Previous: Day 17](day17-kswapd-lru-reclaim.md) | [Next: Day 19 →](day19-oom-killer.md)
+
 ## Learning Objectives
 - Understand swap slot allocation and swap entry PTEs
 - Trace the swap-out and swap-in paths

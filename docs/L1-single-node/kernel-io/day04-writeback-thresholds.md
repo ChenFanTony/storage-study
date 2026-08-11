@@ -1,5 +1,8 @@
 # Day 4: Page Cache — Writeback Thresholds & Flusher Behavior
 
+<!-- study-nav -->
+[← Previous: Day 3](day03-blk-mq-scheduler-plug.md) | [Next: Day 5 →](day05-readahead-tiering.md)
+
 ## Learning Objectives
 - Understand dirty page accounting and the writeback cliff
 - Follow `balance_dirty_pages()` logic and why it causes latency spikes

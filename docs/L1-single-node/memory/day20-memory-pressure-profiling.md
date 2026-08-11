@@ -1,5 +1,8 @@
 # Day 20: Memory Pressure Profiling — Full Diagnostic Workflow
 
+<!-- study-nav -->
+[← Previous: Day 19](day19-oom-killer.md) | [Next: Day 21 →](day21-week3-review.md)
+
 ## Learning Objectives
 - Master PSI (Pressure Stall Information) as the primary pressure signal
 - Build a complete memory diagnostic runbook

@@ -1,4 +1,7 @@
 # Day 21 — Week 3 Review + Network Performance Tuning Cheatsheet
+
+<!-- study-nav -->
+[← Previous: Day 20](day20_routing_fib.md) | [Next: Day 22 →](day22_skbuff_lifecycle.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 3)
 
 ---

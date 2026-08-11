@@ -1,5 +1,7 @@
 # Day 3 — blk_execute_rq: the slow path
 
+<!-- study-nav -->
+[← Previous: Day 2](day02.md) | [Next: Day 4 →](day04.md)
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `block/blk-exec.c`, `block/blk-mq.c`, `include/linux/blkdev.h`

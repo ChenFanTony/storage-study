@@ -1,5 +1,8 @@
 # Day 5: Read-ahead — Adaptive Algorithm & Tiering Implications
 
+<!-- study-nav -->
+[← Previous: Day 4](day04-writeback-thresholds.md) | [Next: Day 6 →](day06-io-schedulers-architect.md)
+
 ## Learning Objectives
 - Understand the adaptive read-ahead algorithm in `mm/readahead.c`
 - Know the architectural implications of read-ahead with a cache tier (bcache/dm-cache)

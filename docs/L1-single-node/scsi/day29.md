@@ -1,5 +1,7 @@
 # Day 29 — SCSI sense data generation
 
+<!-- study-nav -->
+[← Previous: Day 28](day28.md) | [Next: Day 30 →](day30.md)
 **Week 4**: Advanced Topics  
 **Time**: 1–2 hours  
 **Reference**: `drivers/scsi/scsi_common.c`, `drivers/target/target_core_transport.c`, `drivers/target/target_core_alua.c`

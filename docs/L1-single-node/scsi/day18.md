@@ -1,5 +1,7 @@
 # Day 18 — iSCSI fabric RX thread
 
+<!-- study-nav -->
+[← Previous: Day 17](day17.md) | [Next: Day 19 →](day19.md)
 **Week 3**: LIO Target Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/iscsi/iscsi_target.c`, `drivers/target/iscsi/iscsi_target_nego.c`

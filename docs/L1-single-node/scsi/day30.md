@@ -1,5 +1,7 @@
 # Day 30 — Cold re-read self test
 
+<!-- study-nav -->
+[← Previous: Day 29](day29.md)
 **Week 4**: Advanced Topics  
 **Time**: 1–2 hours  
 **Reference**: All previous days

@@ -1,4 +1,7 @@
 # Day 17 — TCP `TIME_WAIT`, Connection Reuse, and Port Exhaustion
+
+<!-- study-nav -->
+[← Previous: Day 16](day16_multiqueue_rss_rps.md) | [Next: Day 18 →](day18_ktls.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 3)
 
 ---

@@ -1,5 +1,8 @@
 # Day 2: Buddy Allocator — Page-Level Allocation & Fragmentation
 
+<!-- study-nav -->
+[← Previous: Day 1](day01-physical-memory-model.md) | [Next: Day 3 →](day03-slab-slub-allocator.md)
+
 ## Learning Objectives
 - Understand the buddy system: power-of-2 blocks, splitting, coalescing
 - Read `alloc_pages()` call chain in `mm/page_alloc.c`

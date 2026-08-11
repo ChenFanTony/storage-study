@@ -1,5 +1,8 @@
 # Day 19: OOM Killer — When Reclaim Fails
 
+<!-- study-nav -->
+[← Previous: Day 18](day18-swap-architecture.md) | [Next: Day 20 →](day20-memory-pressure-profiling.md)
+
 ## Learning Objectives
 - Understand the OOM kill sequence: how the kernel decides to kill a process
 - Read `oom_badness()` scoring and `oom_score_adj` tuning

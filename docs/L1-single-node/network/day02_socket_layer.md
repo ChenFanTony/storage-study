@@ -1,4 +1,7 @@
 # Day 02 — Socket Layer: `struct sock` and the BSD Socket API
+
+<!-- study-nav -->
+[← Previous: Day 1](day01_network_overview.md) | [Next: Day 3 →](day03_nic_drivers_napi.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 1)
 
 ---

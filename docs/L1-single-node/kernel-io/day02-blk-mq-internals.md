@@ -1,5 +1,8 @@
 # Day 2: blk-mq — Hardware Queues, Tag Sets, Dispatch
 
+<!-- study-nav -->
+[← Previous: Day 1](day01-storage-stack-gap-fill.md) | [Next: Day 3 →](day03-blk-mq-scheduler-plug.md)
+
 ## Learning Objectives
 - Understand blk-mq's two-level queue architecture in depth
 - Follow the exact path from `submit_bio()` to `queue_rq()` in driver

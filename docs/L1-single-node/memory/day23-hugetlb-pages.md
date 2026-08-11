@@ -1,5 +1,8 @@
 # Day 23: HugeTLB Pages — Static Pre-allocated Huge Pages
 
+<!-- study-nav -->
+[← Previous: Day 22](day22-transparent-huge-pages.md) | [Next: Day 24 →](day24-numa-memory-management.md)
+
 ## Learning Objectives
 - Understand HugeTLB as statically reserved huge pages that never fragment
 - Know why SPDK, DPDK, and databases require HugeTLB

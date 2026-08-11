@@ -1,5 +1,8 @@
 # Month 2 Day 2: Raft — Leader Election & Log Replication
 
+<!-- study-nav -->
+[← Previous: Day 1](m2-day01-distributed-concepts.md) | [Next: Day 3 →](m2-day03-raft-snapshots.md)
+
 ## Learning Objectives
 - Understand Raft leader election: RequestVote, term numbers, vote granting rules
 - Follow a write from client to committed log entry at source level

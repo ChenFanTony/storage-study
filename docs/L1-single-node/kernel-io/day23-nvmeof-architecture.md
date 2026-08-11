@@ -1,5 +1,8 @@
 # Day 23: NVMe-oF — Architecture & Transport Comparison
 
+<!-- study-nav -->
+[← Previous: Day 22](day22-nvme-driver.md) | [Next: Day 24 →](day24-nvmeof-failure-odirect.md)
+
 ## Learning Objectives
 - Understand NVMe-oF's architecture: how it extends the NVMe queue model over a fabric
 - Set up NVMe-oF/TCP loopback (host + target on same machine)

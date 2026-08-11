@@ -1,5 +1,8 @@
 # Month 2 Day 5: Paxos Variants & Multi-Paxos
 
+<!-- study-nav -->
+[← Previous: Day 4](m2-day04-raft-failures.md) | [Next: Days 8–14 →](../data-placement/m2-day08-14-erasure-placement.md)
+
 ## Learning Objectives
 - Understand Paxos Phase 1 and Phase 2 precisely
 - Understand Multi-Paxos's optimization for stable leaders

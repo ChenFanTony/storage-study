@@ -1,5 +1,8 @@
 # Day 7: Week 1 Review — Architect Decision Points
 
+<!-- study-nav -->
+[← Previous: Day 6](day06-io-schedulers-architect.md) | [Next: Day 22 →](day22-nvme-driver.md)
+
 ## Objective
 Synthesize Days 1–6 into a defensible reference you can use in real design
 reviews. This is not passive review — you produce a written output today.

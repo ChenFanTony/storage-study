@@ -1,5 +1,8 @@
 # Day 7: Week 1 Review — Physical Memory Connective Tissue
 
+<!-- study-nav -->
+[← Previous: Day 6](day06-memory-debugging-profiling.md) | [Next: Day 8 →](day08-mm-struct-vma.md)
+
 ## Learning Objectives
 - Synthesize Days 1–6 into a single mental model
 - Trace a complete allocation from API call to hardware

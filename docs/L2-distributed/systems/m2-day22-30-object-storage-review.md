@@ -1,5 +1,7 @@
 # Month 2 Days 22–30: Object Storage Architecture & Final Review
 
+<!-- study-nav -->
+[← Previous: Days 15–21](../protocols/m2-day15-21-storage-protocols.md)
 ---
 
 # Day 22: Ceph RADOS Deep Dive

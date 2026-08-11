@@ -1,5 +1,7 @@
 # Day 23 — ALUA
 
+<!-- study-nav -->
+[← Previous: Day 22](day22.md) | [Next: Day 24 →](day24.md)
 **Week 4**: Advanced Topics  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/target_core_alua.c`, `include/target/target_core_base.h`

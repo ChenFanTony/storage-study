@@ -1,5 +1,8 @@
 # Day 12: dm-thin — Thin Provisioning & Metadata
 
+<!-- study-nav -->
+[← Previous: Day 11](day11-dm-cache-architecture.md) | [Next: Day 13 →](day13-tiering-failure-semantics.md)
+
 ## Learning Objectives
 - Understand dm-thin's mapping tree and how space is allocated on demand
 - Follow snapshot COW mechanics at the block level

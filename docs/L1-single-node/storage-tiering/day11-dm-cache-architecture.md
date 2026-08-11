@@ -1,5 +1,8 @@
 # Day 11: dm-cache — Architecture & Policy Plugins
 
+<!-- study-nav -->
+[← Previous: Day 10](day10-bcache-limitations.md) | [Next: Day 12 →](day12-dm-thin-metadata.md)
+
 ## Learning Objectives
 - Understand dm-cache's architecture: cache map, migration engine, policy interface
 - Read and understand `dm-cache-target.c` and `dm-cache-policy-smq.c`

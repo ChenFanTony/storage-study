@@ -1,5 +1,8 @@
 # Day 21: Week 3 Review — Filesystem & Block Stack Architecture Reference
 
+<!-- study-nav -->
+[← Previous: Day 20](day20-btrfs-cow-snapshots.md)
+
 ## Objective
 Synthesize Days 15–20 into a defensible reference for designing the
 filesystem and block-stack layer of a production system. As with Week 1

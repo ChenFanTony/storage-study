@@ -1,5 +1,8 @@
 # Month 2 Day 1: Distributed Storage Concepts — Gap-Fill
 
+<!-- study-nav -->
+[Next: Day 2 →](m2-day02-raft-leader-election.md)
+
 ## Context
 You know single-node storage deeply. This is a directed audit of distributed
 storage fundamentals — not a tutorial, but a precision check on the concepts

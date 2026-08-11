@@ -1,5 +1,8 @@
 # Day 11: Page Tables & TLB Management
 
+<!-- study-nav -->
+[← Previous: Day 10](day10-page-faults-cow.md) | [Next: Day 12 →](day12-mmap-page-cache-bridge.md)
+
 ## Learning Objectives
 - Understand 4-level x86-64 page table walk: PGD → P4D → PUD → PMD → PTE
 - Understand TLB: what it caches, when it's invalidated, cost of shootdown

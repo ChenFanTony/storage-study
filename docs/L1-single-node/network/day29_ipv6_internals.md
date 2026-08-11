@@ -1,4 +1,7 @@
 # Day 29 — IPv6 Internals: Stack Differences, NDP, and `struct ipv6_pinfo`
+
+<!-- study-nav -->
+[← Previous: Day 28](day28_final_review.md) | [Next: Day 30 →](day30_io_uring.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Day 29/30)
 
 ---

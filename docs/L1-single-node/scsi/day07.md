@@ -1,5 +1,7 @@
 # Day 7 — dm-multipath core
 
+<!-- study-nav -->
+[← Previous: Day 6](day06.md) | [Next: Day 8 →](day08.md)
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `drivers/md/dm-mpath.c`, `drivers/md/dm-path-selector.c`

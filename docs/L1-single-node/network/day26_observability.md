@@ -1,4 +1,7 @@
 # Day 26 — Kernel Networking Observability: perf, ftrace, bpftrace
+
+<!-- study-nav -->
+[← Previous: Day 25](day25_dpdk_afxdp.md) | [Next: Day 27 →](day27_bridges_vxlan.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 4)
 
 ---

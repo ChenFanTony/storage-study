@@ -1,5 +1,8 @@
 # Day 10: bcache — Limitations & Where It Breaks Down
 
+<!-- study-nav -->
+[← Previous: Day 9](day09-bcache-failure-semantics.md) | [Next: Day 11 →](day11-dm-cache-architecture.md)
+
 ## Learning Objectives
 - Understand bcache's specific failure modes under real workloads
 - Reproduce btree lock contention at high queue depth

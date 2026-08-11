@@ -1,5 +1,8 @@
 # Day 16: md/RAID — Partial-Stripe Writes, Bitmaps, and the Write Hole
 
+<!-- study-nav -->
+[← Previous: Day 15](day15-dm-crypt.md)
+
 ## Learning Objectives
 - Understand the RAID-5/6 partial-stripe write problem and why it matters more than people think
 - Understand the write hole and the three md mechanisms that close it (raid5-cache, PPL, write-intent bitmap)

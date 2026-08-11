@@ -1,4 +1,7 @@
 # Day 04 — IP Layer: Receive, Routing, and Transmit
+
+<!-- study-nav -->
+[← Previous: Day 3](day03_nic_drivers_napi.md) | [Next: Day 5 →](day05_tcp_receive.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 1)
 
 ---

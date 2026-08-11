@@ -1,5 +1,7 @@
 # Day 14 — dm-multipath PR ops and path management
 
+<!-- study-nav -->
+[← Previous: Day 13](day13.md) | [Next: Day 15 →](day15.md)
 **Week 2**: iSCSI Initiator Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/md/dm-mpath.c`, `drivers/md/dm.c`

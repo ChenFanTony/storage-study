@@ -1,5 +1,8 @@
 # Day 17: kswapd & Memory Reclaim — LRU Lists
 
+<!-- study-nav -->
+[← Previous: Day 16](day16-dirty-pages-writeback.md) | [Next: Day 18 →](day18-swap-architecture.md)
+
 ## Learning Objectives
 - Understand the 4 LRU lists and how pages move between them
 - Trace kswapd wake conditions and reclaim algorithm

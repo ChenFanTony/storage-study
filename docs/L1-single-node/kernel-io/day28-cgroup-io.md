@@ -1,5 +1,8 @@
 # Day 28: cgroup I/O — Weight, Throttle & Latency Target
 
+<!-- study-nav -->
+[← Previous: Day 27](day27-pmem-dax.md) | [Next: Day 29 →](day29-performance-tuning-lab.md)
+
 ## Learning Objectives
 - Understand the three cgroup v2 I/O enforcement mechanisms and their distinct kernel paths
 - Know precisely what `io.max`, `io.weight`, and `io.latency` do and don't guarantee

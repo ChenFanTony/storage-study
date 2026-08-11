@@ -1,4 +1,7 @@
 # Day 10 — `epoll` and the Kernel Event Notification System
+
+<!-- study-nav -->
+[← Previous: Day 9](day09_flow_control.md) | [Next: Day 11 →](day11_udp_raw_sockets.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 2)
 
 ---

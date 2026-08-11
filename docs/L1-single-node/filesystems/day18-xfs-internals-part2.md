@@ -1,5 +1,8 @@
 # Day 18: XFS Internals Part 2 — Log, Delayed Allocation, Reflink
 
+<!-- study-nav -->
+[← Previous: Day 17](day17-xfs-internals-part1.md) | [Next: Day 19 →](day19-ext4-jbd2-recovery.md)
+
 ## Learning Objectives
 - Understand XFS's delayed-logging architecture: CIL, checkpoints, log force
 - Understand delayed allocation and why it produces low fragmentation

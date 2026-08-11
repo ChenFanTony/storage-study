@@ -1,5 +1,8 @@
 # Day 9: bcache — Cache Coherency Under Failure
 
+<!-- study-nav -->
+[← Previous: Day 8](day08-bcache-gc-ssd-wear.md) | [Next: Day 10 →](day10-bcache-limitations.md)
+
 ## Learning Objectives
 - Understand bcache's journal and its role in crash recovery
 - Precisely characterize what data is lost under each failure scenario

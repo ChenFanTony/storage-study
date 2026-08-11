@@ -1,5 +1,8 @@
 # Day 30: Capstone — Memory + Storage Integration
 
+<!-- study-nav -->
+[← Previous: Day 29](day29-mm-performance-tuning.md)
+
 ## Learning Objectives
 - Synthesize all 30 days into four end-to-end integration exercises
 - Demonstrate mastery by diagnosing and fixing real storage-memory interaction problems

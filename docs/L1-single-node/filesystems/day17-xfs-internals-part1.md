@@ -1,5 +1,8 @@
 # Day 17: XFS Internals Part 1 — Allocation Groups and On-Disk Layout
 
+<!-- study-nav -->
+[Next: Day 18 →](day18-xfs-internals-part2.md)
+
 ## Learning Objectives
 - Understand XFS's allocation group (AG) model and why it enables parallelism
 - Know the on-disk headers (superblock, AGF, AGI, AGFL) and what each contains

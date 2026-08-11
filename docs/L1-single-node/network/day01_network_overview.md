@@ -1,4 +1,7 @@
 # Day 01 — Linux Network Stack Overview
+
+<!-- study-nav -->
+[Next: Day 2 →](day02_socket_layer.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 1)
 
 ---

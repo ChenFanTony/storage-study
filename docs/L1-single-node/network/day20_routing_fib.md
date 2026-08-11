@@ -1,4 +1,7 @@
 # Day 20 — Routing Internals: FIB, Policy Routing, and ECMP
+
+<!-- study-nav -->
+[← Previous: Day 19](day19_arp_neighbor.md) | [Next: Day 21 →](day21_week3_review_tuning.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 3)
 
 ---

@@ -1,5 +1,8 @@
 # Day 9: mmap() Internals — From Syscall to VMA
 
+<!-- study-nav -->
+[← Previous: Day 8](day08-mm-struct-vma.md) | [Next: Day 10 →](day10-page-faults-cow.md)
+
 ## Learning Objectives
 - Trace the full `mmap()` call path from userspace to kernel VMA creation
 - Understand why `mmap()` creates no pages (demand paging)

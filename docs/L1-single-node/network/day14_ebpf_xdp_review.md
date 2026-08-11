@@ -1,4 +1,7 @@
 # Day 14 — eBPF/XDP Introduction and Week 2 Review
+
+<!-- study-nav -->
+[← Previous: Day 13](day13_traffic_control.md) | [Next: Day 15 →](day15_zero_copy.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 2)
 
 ---

@@ -1,5 +1,8 @@
 # Day 26: mlock, madvise & Memory Pinning
 
+<!-- study-nav -->
+[← Previous: Day 25](day25-memory-cgroups.md) | [Next: Day 27 →](day27-dax-pmem.md)
+
 ## Learning Objectives
 - Understand mlock: locking pages against reclaim and swap
 - Understand the full MADV_* vocabulary and when each applies

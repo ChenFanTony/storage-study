@@ -1,4 +1,7 @@
 # Day 03 — NIC Drivers, Ring Buffers, and NAPI
+
+<!-- study-nav -->
+[← Previous: Day 2](day02_socket_layer.md) | [Next: Day 4 →](day04_ip_layer.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 1)
 
 ---

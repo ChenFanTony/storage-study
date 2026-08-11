@@ -1,5 +1,7 @@
 # Day 25 — session teardown path
 
+<!-- study-nav -->
+[← Previous: Day 24](day24.md) | [Next: Day 26 →](day26.md)
 **Week 4**: Advanced Topics  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/iscsi/iscsi_target.c`, `drivers/target/target_core_transport.c`

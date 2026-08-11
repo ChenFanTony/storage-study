@@ -1,4 +1,7 @@
 # Day 11 — UDP and Raw Sockets
+
+<!-- study-nav -->
+[← Previous: Day 10](day10_epoll.md) | [Next: Day 12 →](day12_network_namespaces.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 2)
 
 ---

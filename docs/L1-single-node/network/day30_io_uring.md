@@ -1,4 +1,7 @@
 # Day 30 — `io_uring` and Network I/O
+
+<!-- study-nav -->
+[← Previous: Day 29](day29_ipv6_internals.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Day 30/30 — Final)
 
 ---

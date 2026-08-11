@@ -1,5 +1,8 @@
 # Day 15: dm-crypt — IV Modes, Queue Depth, and Performance Overhead
 
+<!-- study-nav -->
+[← Previous: Day 14](day14-week2-review.md) | [Next: Day 16 →](day16-md-raid.md)
+
 ## Learning Objectives
 - Understand dm-crypt's architecture and where in the stack encryption happens
 - Know the IV modes (`plain64`, `essiv`, `random`) and their security/performance trade-offs
