@@ -11,15 +11,34 @@
 
 ---
 
-## 1. Why Architects Need to Understand Read-ahead
+## 1. First Principle: Who Performs Read-ahead?
 
-Read-ahead is not just a performance knob — it directly affects cache tier
-efficiency. Aggressive read-ahead on a random workload:
-- fills your SSD cache with data that will never be re-read
-- evicts hot data from the cache
-- causes HDD thrashing for no benefit
+Linux read-ahead is primarily a **page-cache operation**, not an autonomous
+feature of the generic block layer or bcache. The owner and consumer are
+separate:
 
-This is one of the most common misconfigurations in tiered storage systems.
+```text
+Buffered file read
+  → file/page-cache readahead (`mm/readahead.c`)
+  → filesystem `->readahead()` builds bios marked `REQ_RAHEAD`
+  → `/dev/bcache0` receives those bios
+  → bcache decides whether to cache or bypass the prefetched data
+  → backing HDD/SSD services a miss
+```
+
+The filesystem/page cache predicts future pages. bcache does not inspect an
+ordinary read and independently fetch the following sectors. It sees the bios
+that upper layers already generated and applies cache-admission policy.
+
+A raw block device also has an address-space and `blkdev_readahead()` operation,
+so **buffered** reads of `/dev/bcache0` can use the same page-cache machinery.
+Direct I/O (`O_DIRECT`, commonly `fio --direct=1`) bypasses the page cache and
+therefore bypasses this read-ahead entirely. A direct-I/O application must do
+its own prefetching or asynchronous I/O.
+
+This distinction matters because unused prefetched data can consume page-cache
+memory, backing-device bandwidth, and—depending on bcache policy—SSD cache
+capacity.
 
 ---
 
@@ -91,29 +110,33 @@ you need a large window. If storage is fast (NVMe), a small window suffices.
 
 ---
 
-## 4. Read-ahead & bcache: When It Helps
+## 4. How bcache Handles Read-ahead Bios
 
-**Scenario: Cold HDD-backed bcache, sequential workload (backup, scan)**
+In current bcache, `check_should_bypass()` checks `REQ_RAHEAD` and
+`REQ_BACKGROUND`. The `readahead_cache_policy` setting controls admission:
 
+- `all`: non-metadata read-ahead may populate the SSD cache.
+- `meta-only`: non-metadata read-ahead bypasses the SSD; metadata read-ahead
+  remains cacheable.
+- `sequential_cutoff`: independently detects a long sequential stream and
+  bypasses the SSD after the configured threshold.
+
+```text
+Page cache predicts and submits prefetched pages
+                    ↓ REQ_RAHEAD
+                  bcache
+        ┌───────────┴────────────┐
+        │ cache admission allowed │ → cache fill on a miss
+        │ bypass policy selected  │ → backing device, no SSD fill
+        └─────────────────────────┘
 ```
-Sequential read of 1GB file:
-  Read-ahead submits large requests to bcache device
-  bcache: SSD cache miss (cold) → passes through to HDD
-  HDD: sequential read is efficient (no seek penalty)
-  Data lands in SSD cache AND in page cache
 
-  Next sequential scan of same file:
-  → Page cache serves it (no storage I/O at all)
-  Or if page cache evicted:
-  → bcache SSD cache serves it (fast)
-
-Result: read-ahead + tiering works well here
-```
-
-**Why it helps:**
-- Sequential data that will be re-read benefits from both page cache and SSD caching
-- Large read-ahead reduces HDD seek impact on cold reads
-- bcache's sequential bypass (`sequential_cutoff`) can be disabled for workloads that do re-read sequential data
+For a cold sequential scan, page-cache read-ahead can combine adjacent work and
+keep an HDD busy efficiently. The demanded and prefetched pages enter the page
+cache. They enter the bcache SSD only if bcache's admission and sequential
+bypass policies allow it. If the data will be read again after page-cache
+eviction, caching it on SSD may help; for a one-time scan, bypass is usually
+preferable.
 
 ---
 
@@ -121,21 +144,15 @@ Result: read-ahead + tiering works well here
 
 **Scenario: Random 4K read workload (OLTP database)**
 
-```
-Random read pattern — read-ahead algorithm detects non-sequential:
-  → ra_state resets, read_ahead_kb effectively 0 for random
-  → no readahead
+The adaptive page-cache algorithm normally shrinks or stops read-ahead when
+it cannot establish sequential access. It can still prefetch unused pages for
+short sequential runs, interleaved streams, mmap faults, or a workload whose
+pattern changes after the window grows.
 
-BUT: if read_ahead_kb is forced large, or workload is pseudo-random
-  with some sequential runs mixed in:
-  → read-ahead fires, prefetches 256KB around each random read
-  → only 4KB wanted, 252KB is waste
-
-Waste data enters bcache:
-  → evicts hot random-access data from SSD cache
-  → cache hit rate drops
-  → subsequent random reads miss cache → go to HDD → high latency
-```
+Unused prefetched data always costs page-cache space and I/O bandwidth. It
+pollutes the bcache SSD only when bcache admits the `REQ_RAHEAD` bios. With a
+bypass-oriented readahead policy, the extra I/O can still burden the backing
+HDD, but it does not displace hot SSD-cache data.
 
 **bcache sequential cutoff:**
 ```bash
@@ -166,8 +183,9 @@ cat /sys/block/nvme0n1/queue/read_ahead_kb   # NVMe: maybe 128KB default
 cat /sys/block/sda/queue/read_ahead_kb       # HDD: maybe 128KB
 cat /sys/block/bcache0/queue/read_ahead_kb   # bcache device
 
-# The bcache device's read_ahead_kb is what the filesystem sees
-# The underlying devices' settings also matter for HDD passthrough reads
+# For a filesystem mounted on bcache0, bcache0's value supplies the
+# page-cache limit. Forwarding its bios to sda does NOT run a second
+# page-cache readahead pass, so sda's read_ahead_kb is not applied again.
 ```
 
 **Decision guide:**
@@ -181,50 +199,61 @@ cat /sys/block/bcache0/queue/read_ahead_kb   # bcache device
 | streaming media | HDD | 2048+ | Large buffer needed for smooth delivery |
 
 ```bash
-# Tune at runtime
-echo 0    > /sys/block/bcache0/queue/read_ahead_kb   # disable for pure random
-echo 1024 > /sys/block/sda/queue/read_ahead_kb       # aggressive for sequential HDD
+# Tune the device visible to the filesystem mounted for this test
+echo 0    > /sys/block/bcache0/queue/read_ahead_kb  # disable page-cache RA
+echo 1024 > /sys/block/bcache0/queue/read_ahead_kb  # larger RA window
+
+# Separately inspect bcache admission controls (names depend on kernel/bcache version)
+cat /sys/block/bcache0/bcache/readahead_cache_policy
+cat /sys/block/bcache0/bcache/sequential_cutoff
 ```
 
 ---
 
-## 7. Hands-On: Measuring Read-ahead Impact on Cache Hit Rate
+## 7. Hands-On: Separate Page-cache Read-ahead from bcache Admission
+
+Use a disposable test file on a filesystem mounted on `/dev/bcache0`. Do not
+run this against valuable data, and do not use `--direct=1`: direct I/O would
+bypass the mechanism being tested.
 
 ```bash
-# Test setup: bcache with SSD cache + HDD backing
-# Measure how read_ahead_kb affects cache hit rate under random workload
+# Example only: point this at a disposable file on the bcache-backed filesystem.
+TEST_FILE=/mnt/bcache-test/readahead.bin
 
-# Step 1: Warm the cache with the working set
-fio --name=warmup --filename=/dev/bcache0 --rw=randread --bs=4k \
-    --size=10G --ioengine=libaio --iodepth=32
+# Create the file once, then ensure its dirty data is written.
+fio --name=create --filename="$TEST_FILE" --rw=write --bs=1M \
+    --size=10G --ioengine=sync --direct=0
+sync
 
-# Step 2: Check cache stats
-cat /sys/block/bcache0/bcache/stats_day/cache_hits
-cat /sys/block/bcache0/bcache/stats_day/cache_misses
-
-# Step 3: Run random workload with default read_ahead_kb
-echo 128 > /sys/block/bcache0/queue/read_ahead_kb
-fio --name=randread-ra128 --filename=/dev/bcache0 --rw=randread --bs=4k \
-    --size=10G --ioengine=libaio --iodepth=32 --time_based --runtime=60
-
-cat /sys/block/bcache0/bcache/stats_hour/cache_hits
-cat /sys/block/bcache0/bcache/stats_hour/cache_misses
-
-# Step 4: Repeat with no read-ahead
+# Test A: buffered sequential read with page-cache read-ahead disabled.
 echo 0 > /sys/block/bcache0/queue/read_ahead_kb
-# reset bcache stats: echo 1 > /sys/block/bcache0/bcache/stats_day/reset
-fio --name=randread-ra0 --filename=/dev/bcache0 --rw=randread --bs=4k \
-    --size=10G --ioengine=libaio --iodepth=32 --time_based --runtime=60
+echo 3 > /proc/sys/vm/drop_caches
+fio --name=seq-ra0 --filename="$TEST_FILE" --rw=read --bs=128k \
+    --size=10G --ioengine=sync --direct=0 --invalidate=1
 
-# Compare hit rates — expect ra0 to have HIGHER hit rate for pure random
+# Test B: repeat with a larger page-cache readahead limit.
+echo 1024 > /sys/block/bcache0/queue/read_ahead_kb
+echo 3 > /proc/sys/vm/drop_caches
+fio --name=seq-ra1024 --filename="$TEST_FILE" --rw=read --bs=128k \
+    --size=10G --ioengine=sync --direct=0 --invalidate=1
 ```
+
+Compare throughput, latency, backing-device I/O, and bcache statistics. Run
+multiple alternating trials because the SSD cache is a second cache: dropping
+Linux page caches does **not** clear bcache. To isolate SSD admission, compare
+bcache's readahead policy and `sequential_cutoff` while keeping
+`read_ahead_kb` constant.
+
+A control run with `--direct=1` is also useful: changing `read_ahead_kb` should
+not materially affect that run, because direct I/O bypasses page-cache
+read-ahead. Never reset or invalidate a production cache merely for this test.
 
 ---
 
 ## 8. Read-ahead Source Code Navigation
 
 ```c
-// mm/readahead.c — key functions to read
+// Page-cache decision logic: mm/readahead.c
 
 // 1. Entry point for page cache misses
 void page_cache_ra_unbounded(struct readahead_control *ractl,
@@ -241,9 +270,16 @@ void page_cache_async_ra(struct readahead_control *ractl,
                           struct folio *folio,
                           unsigned long req_size);
 
-// Key struct to understand:
-// include/linux/fs.h: struct file_ra_state
-// — this is the per-open-file readahead state
+// Per-open-file state: include/linux/fs.h: struct file_ra_state
+
+// Raw block-device page-cache implementation: block/fops.c
+// blkdev_readahead() calls mpage_readahead() or iomap_bio_readahead()
+
+// Sysfs limit: block/blk-sysfs.c
+// queue/read_ahead_kb reads/writes disk->bdi->ra_pages
+
+// bcache admission/bypass: drivers/md/bcache/request.c
+// check_should_bypass() checks REQ_RAHEAD and readahead_cache_policy
 ```
 
 ---
@@ -251,20 +287,20 @@ void page_cache_async_ra(struct readahead_control *ractl,
 ## 9. Self-Check Questions
 
 1. What pattern does the kernel use to detect sequential access for read-ahead?
-2. Why can a high `read_ahead_kb` harm a bcache SSD cache hit rate for random workloads?
+2. Which layer originates read-ahead, and what role does bcache play?
 3. What is bcache's `sequential_cutoff` and what problem does it solve?
-4. For a pure OLTP random-read workload on bcache, what `read_ahead_kb` would you set and why?
+4. Why does changing `read_ahead_kb` not tune an `O_DIRECT` database workload?
 5. What is the async readahead trigger point, and why does it exist?
 6. If you have a workload that does sequential reads but will NEVER re-read the data (full table scan), should read-ahead data go into the SSD cache? How would you prevent it?
 
 ## 10. Answers
 
 1. Tracks `prev_pos` per file. If the new request is at `prev_pos + 1` (next page), it's sequential. If offset is random relative to `prev_pos`, `ra_state` resets.
-2. Read-ahead prefetches adjacent pages around each random read. These are unlikely to be re-read, but they enter the SSD cache and evict hot random-access data.
+2. The filesystem/page cache predicts future pages and emits `REQ_RAHEAD` bios. bcache does not originate those reads; it decides whether the resulting data should populate or bypass the SSD cache.
 3. `sequential_cutoff` bypasses the SSD cache for I/O sequences longer than the threshold (default 4MB). Prevents large sequential scans from evicting random-access hot data.
-4. `0` or as low as possible. Random workload has no benefit from read-ahead, only cache pollution.
+4. `O_DIRECT` bypasses the page cache, so it bypasses `mm/readahead.c` and the `bdi->ra_pages` limit exposed as `read_ahead_kb`. Tune the application's own asynchronous prefetch or queue depth instead.
 5. The async trigger is set at a fraction of the current window. When the app reaches that page, the next window is submitted async (no stall). It exists to overlap storage I/O with application consumption, hiding latency.
-6. Set bcache `sequential_cutoff` to a value **smaller than** your scan I/O size — sequential streams above the cutoff bypass the SSD entirely. (If your scans are 8MB reads and cutoff is 4MB, they bypass. If your scans are 1MB reads, you need to lower cutoff below 1MB to make them bypass.) Alternatively, use `fadvise(POSIX_FADV_NOREUSE)` to hint the page cache not to retain these pages, combined with bcache sequential bypass.
+6. Keep page-cache read-ahead if it improves streaming throughput, but configure bcache to bypass non-metadata `REQ_RAHEAD` bios or use an appropriate `sequential_cutoff` so the one-time stream does not displace reusable SSD data. Page-cache retention is a separate concern; application hints such as `POSIX_FADV_DONTNEED` after consumption can release those pages.
 
 ---
 
