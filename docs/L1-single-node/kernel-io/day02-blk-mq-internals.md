@@ -3,6 +3,8 @@
 <!-- study-nav -->
 [← Previous: Day 1](day01-storage-stack-gap-fill.md) | [Next: Day 3 →](day03-blk-mq-scheduler-plug.md)
 
+> **Source baseline:** Linux `v7.2-rc3` (`block/blk-mq.c`); function names and call paths below follow this version.
+
 ## Learning Objectives
 - Understand blk-mq's two-level queue architecture in depth
 - Follow the exact path from `submit_bio()` to `queue_rq()` in driver
@@ -125,37 +127,49 @@ void submit_bio(struct bio *bio)
 ```c
 // block/blk-mq.c
 blk_mq_submit_bio(bio):
-    // 1. Try plug merge (bio queued in current->plug)
-    if (blk_attempt_plug_merge(q, bio, &same_queue_rq))
-        return;
+    // 1. Reuse a tagged request cached by the current plug, if available
+    rq = blk_mq_get_cached_request(plug, q, bio->bi_opf);
 
-    // 2. Try elevator merge (scheduler-managed)
+    // 2. Try plug or elevator merge
     if (blk_mq_attempt_bio_merge(q, bio, nr_segs))
         return;
 
-    // 3. No merge — allocate new request
-    rq = blk_mq_get_request(q, bio, &data);
+    // 3. No cached request and no merge — allocate request and tag(s)
+    if (!rq)
+        rq = blk_mq_get_new_requests(q, plug, bio);
+
+    // 4. Attach the bio after request allocation
+    blk_mq_bio_to_request(rq, bio, nr_segs);
 ```
 
-### Step 3: Tag allocation (`blk_mq_get_request`)
+### Step 3: Request and tag allocation (`blk_mq_get_new_requests` → `__blk_mq_alloc_requests`)
 
 ```c
 // block/blk-mq.c
-blk_mq_get_request():
-    // pick hw ctx for this CPU
-    data->hctx = blk_mq_map_queue(q, bio->bi_opf, data->ctx);
+blk_mq_get_new_requests(q, plug, bio):
+    // initialize allocation data; a plug can request a batch of tags
+    data.cmd_flags = bio->bi_opf;
+    data.nr_tags = plug ? plug->nr_ios : 1;
+    rq = __blk_mq_alloc_requests(&data);
 
-    // allocate tag (may block if queue_depth exhausted)
-    tag = blk_mq_get_tag(&data);
-    rq = data->hctx->tags->static_rqs[tag];
-    rq->tag = tag;
-    // initialize request from bio
-    blk_mq_rq_ctx_init(rq, data, bio, ...);
+__blk_mq_alloc_requests(data):
+    // map the current per-CPU software context to a hardware context
+    data->ctx = blk_mq_get_ctx(q);
+    data->hctx = blk_mq_map_queue(data->cmd_flags, data->ctx);
+
+    // apply scheduler depth limits and try batched allocation when requested
+    blk_mq_limit_depth(data);
+
+    // allocate a driver or scheduler tag; a waiting allocation can sleep
+    tag = blk_mq_get_tag(data);
+    rq = blk_mq_rq_ctx_init(data, blk_mq_tags_from_data(data), tag);
     return rq;
 ```
 
-If `queue_depth` requests are already in flight, `blk_mq_get_tag()` will
-either block (sync I/O) or return BLK_STS_DEV_RESOURCE (async).
+If no tag is available, a normal allocation waits in `blk_mq_get_tag()`.
+An allocation carrying `REQ_NOWAIT` returns `BLK_MQ_NO_TAG`; the submission
+path then completes the bio with a would-block error. This is controlled by
+`REQ_NOWAIT`, not simply by whether the caller uses synchronous or asynchronous I/O.
 
 ### Step 4: I/O scheduler (if not `none`)
 
@@ -166,19 +180,26 @@ e->type->ops.insert_requests(hctx, &rq_list, flags);
 // then releases them for dispatch
 ```
 
-With `none` scheduler: requests go directly to dispatch list. This is why
-`none` is optimal for NVMe — the device has its own internal reordering.
+Without a scheduler, `blk_mq_submit_bio()` normally tries
+`blk_mq_try_issue_directly()`; resource shortages move the request to
+`hctx->dispatch` for a later `blk_mq_run_hw_queue()`. This avoids scheduler
+work while preserving retry handling.
 
 ### Step 5: Dispatch to driver
 
 ```c
 // block/blk-mq.c
+// Fast path used by blk_mq_submit_bio() when no scheduler is required
+blk_mq_try_issue_directly(hctx, rq):
+    ret = __blk_mq_issue_directly(hctx, rq, true);
+    // resource shortage: insert into hctx->dispatch and rerun the queue
+
+// Queued path used for scheduler or dispatch-list requests
 blk_mq_run_hw_queue(hctx, async):
-    __blk_mq_run_hw_queue(hctx):
-        blk_mq_dispatch_rq_list(hctx, &rq_list, 0):
-            // for each request in list:
-            ret = q->mq_ops->queue_rq(hctx, &bd);
-            // driver takes ownership
+    blk_mq_run_dispatch_ops(q,
+        blk_mq_sched_dispatch_requests(hctx));
+            // dispatch ultimately calls q->mq_ops->queue_rq(hctx, &bd)
+            // on success, the driver owns the request
 ```
 
 ### Step 6: Completion
@@ -295,14 +316,14 @@ Focus on these specific functions — read them in order:
 1. blk_mq_submit_bio()          block/blk-mq.c
    — entry point, merge attempt, request alloc
 
-2. blk_mq_get_request()         block/blk-mq.c
-   — tag allocation, hw ctx selection
+2. blk_mq_get_new_requests()    block/blk-mq.c
+   — prepares allocation data and supports plug request caching
 
-3. blk_mq_get_tag()             block/blk-mq-tag.c
-   — sbitmap_queue_get(), what blocks when tags exhausted
+3. __blk_mq_alloc_requests()    block/blk-mq.c
+   — maps ctx to hctx, applies depth limits, allocates and initializes request(s)
 
-4. __blk_mq_run_hw_queue()      block/blk-mq.c
-   — dispatch loop, throttle re-check
+4. blk_mq_get_tag()             block/blk-mq-tag.c
+   — sbitmap_queue_get(), what blocks when tags are exhausted
 
 5. blk_mq_dispatch_rq_list()    block/blk-mq.c
    — calls queue_rq(), handles BLK_STS_DEV_RESOURCE
@@ -336,12 +357,12 @@ Focus on these specific functions — read them in order:
 
 ## 10. Answers
 
-1. Sync I/O: caller blocks in `blk_mq_get_tag()` until a tag is freed by completion. Async (io_uring): returns `BLK_STS_DEV_RESOURCE`, request is requeued.
+1. A normal allocation waits in `blk_mq_get_tag()` until a tag becomes available. With `REQ_NOWAIT`, allocation returns `BLK_MQ_NO_TAG` and `blk_mq_submit_bio()` completes the bio with a would-block error. `BLK_STS_DEV_RESOURCE` instead describes a driver dispatch result and is handled later in the request-dispatch path.
 2. NVMe has its own internal command reordering; scheduler overhead (lock, list operations) adds latency without benefit.
 3. 32 `blk_mq_ctx` (one per CPU). HW queues: depends on device, often 32 for NVMe (one per CPU), but could be fewer.
 4. `nr_requests` is the scheduler's staging queue limit. `queue_depth` is the maximum simultaneously in-flight requests backed by tags. On `none` scheduler they effectively converge.
 5. Cross-NUMA memory access for the tag bitmap, request struct, and completion callback adds latency cycles. The completion IRQ may also fire on a CPU on the remote NUMA node, requiring cross-node wakeups for the waiter.
-6. In `blk_mq_get_request()`, called from `blk_mq_submit_bio()` after merge attempts fail.
+6. After merge attempts fail, `blk_mq_submit_bio()` uses `blk_mq_get_new_requests()` → `__blk_mq_alloc_requests()` → `blk_mq_get_tag()`. The allocator then calls `blk_mq_rq_ctx_init()` for the request represented by that tag. A request cached by the current plug is an exception because it was allocated earlier.
 
 ---
 

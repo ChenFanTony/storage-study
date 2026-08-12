@@ -150,7 +150,7 @@ Answer these quickly. Any "unsure" → add to your study notes for the relevant 
 | Question | Answer / Unsure |
 |----------|----------------|
 | What is a `struct folio` and why replace `struct page`? | A folio is a variable-size unit (1+ contiguous pages) that the page cache and filesystem treat as a single object. Replacing `struct page` reduces per-page bookkeeping, enables large-folio support natively, and reduces TLB / cache-line pressure for big I/Os. |
-| Where exactly in blk-mq does a bio get a tag assigned? | In `blk_mq_get_request()` → `blk_mq_get_tag()`, called from `blk_mq_submit_bio()` after merge attempts fail. The tag is allocated from the per-HW-queue tag bitmap within the device-level `blk_mq_tag_set`. |
+| Where exactly in blk-mq does a bio get a tag assigned? | After merge attempts fail, `blk_mq_submit_bio()` calls `blk_mq_get_new_requests()`, which reaches `__blk_mq_alloc_requests()` → `blk_mq_get_tag()`. The allocator maps the current software context to an `hctx`, obtains a driver or scheduler tag, and initializes the corresponding preallocated `struct request`. A request cached by the current plug may already hold its tag. |
 | What is the difference between `io.max` and `io.latency` in cgroup v2? | `io.max` is a hard bandwidth/IOPS cap on a cgroup, enforced unconditionally. `io.latency` is a latency target: when the protected cgroup's I/O latency rises above the target, lower-priority cgroups get throttled (via blk-iolatency) until it recovers. |
 | bcache operates as a block device — what does its `make_request_fn` do? | Looks up the requested extent in the in-memory btree. On hit, serves from the SSD bucket. On miss, allocates a free bucket, writes data sequentially into it, and inserts a key (or updates an existing one) in the btree. Updates the journal for crash recovery. |
 | What NVMe queue model does virtio-blk approximate? | Multi-queue, but with far fewer HW queues than NVMe — typically 1–4, configured at the hypervisor. Many CPUs share each HW queue. |
@@ -192,5 +192,5 @@ Before Day 2, you should be able to answer:
 ## Tomorrow: Day 2 — blk-mq: Hardware Queues, Tag Sets, Dispatch
 
 We go deep on blk-mq internals: how tag sets are allocated, how software
-queues map to hardware queues, and how `__blk_mq_run_hw_queue()` drives dispatch.
+queues map to hardware queues, and how `blk_mq_run_hw_queue()` and direct issue drive dispatch.
 This is the area most architects get wrong when reasoning about queue depth.

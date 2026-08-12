@@ -87,7 +87,9 @@ Back-merge: new bio appended to the *back* (higher sector) — more common.
 submit_bio()
     → blk_mq_submit_bio()
         → merge attempt (plug / elevator)
-        → blk_mq_get_request()     ← tag allocated here
+        → blk_mq_get_new_requests()
+            → __blk_mq_alloc_requests()
+                → blk_mq_get_tag() ← tag allocated here
         → blk_mq_bio_to_request()  ← bio → request conversion
         │
         ├── [scheduler != none]:
