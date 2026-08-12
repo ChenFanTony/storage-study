@@ -1,7 +1,7 @@
 # Day 16: md/RAID — Partial-Stripe Writes, Bitmaps, and the Write Hole
 
 <!-- study-nav -->
-[← Previous: Day 15](day15-dm-crypt.md)
+[← Previous: Day 15](day15-dm-crypt.md) | [Next: Day 17 →](../filesystems/day17-xfs-internals-part1.md)
 
 ## Learning Objectives
 - Understand the RAID-5/6 partial-stripe write problem and why it matters more than people think
