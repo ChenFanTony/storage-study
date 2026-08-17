@@ -30,6 +30,7 @@ python3 -m venv .venv
 - [L2 — Distributed storage](docs/L2-distributed/consensus/m2-day01-distributed-concepts.md)
   - [Consensus](docs/L2-distributed/consensus/m2-day01-distributed-concepts.md)
   - [Data placement and erasure coding](docs/L2-distributed/data-placement/m2-day08-14-erasure-placement.md)
+  - [Merkle trees and replica repair](docs/L2-distributed/data-placement/merkle-trees.md)
   - [Storage protocols and NVMe-oF](docs/L2-distributed/protocols/m2-day15-21-storage-protocols.md)
   - [Ceph and object storage](docs/L2-distributed/systems/m2-day22-30-object-storage-review.md)
   - [DAOS](docs/L2-distributed/systems/daos-architect-reference.md)

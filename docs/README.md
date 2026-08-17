@@ -39,7 +39,7 @@ Architecture/                  ← design patterns that span all layers
 | Directory | Content |
 |-----------|---------|
 | [L2-distributed/consensus/](L2-distributed/consensus/m2-day01-distributed-concepts.md) | Raft (leader election, log replication, snapshots, production failures), Paxos variants, ZAB (ZooKeeper) |
-| [L2-distributed/data-placement/](L2-distributed/data-placement/m2-day08-14-erasure-placement.md) | Erasure coding (Reed-Solomon, LRC), consistent hashing, CRUSH, rebalancing |
+| [L2-distributed/data-placement/](L2-distributed/data-placement/m2-day08-14-erasure-placement.md) | Erasure coding (Reed-Solomon, LRC), consistent hashing, CRUSH, rebalancing, [Merkle trees](L2-distributed/data-placement/merkle-trees.md) |
 | [L2-distributed/protocols/](L2-distributed/protocols/m2-day15-21-storage-protocols.md) | iSCSI, NFS v4/pNFS, SMB3 multichannel, Fibre Channel/FCoE, NVMe-oF fabric protocols |
 | [L2-distributed/systems/](L2-distributed/systems/m2-day22-30-object-storage-review.md) | Ceph RADOS/BlueStore, MinIO erasure sets, SeaweedFS/Haystack, object storage at scale |
 
