@@ -1,12 +1,14 @@
-# Month 2 Day 1: Distributed Storage Concepts — Gap-Fill
+# Month 2 Day 1: Distributed Storage Foundations & Consensus Map
 
 <!-- study-nav -->
 [Next: Day 2 →](m2-day02-raft-leader-election.md)
 
 ## Context
-You know single-node storage deeply. This is a directed audit of distributed
-storage fundamentals — not a tutorial, but a precision check on the concepts
-that underpin everything in Weeks 1–4. Timebox: 1.5 hours.
+You know single-node storage deeply. Before studying one consensus protocol in
+detail, build a map of the problem space: what replication does, what consensus
+adds, and how Paxos, Multi-Paxos, Raft, Viewstamped Replication, and Zab relate.
+This prevents protocol-specific terms from obscuring the common ideas.
+Timebox: 1.5 hours.
 
 ---
 
@@ -132,79 +134,200 @@ Storage examples:
 
 ---
 
-## 4. The Gap-Fill Worksheet
+## 4. Replication Is Not Consensus
 
-Answer these precisely before proceeding to Day 2.
-If you can't answer precisely, research it now.
+Replication and consensus are related, but they are not synonyms.
 
-| Question | Precise Answer |
-|----------|---------------|
-| What is the difference between linearizability and serializability? | |
-| S3 before 2020 was eventually consistent for some operations. Which ones and why? | |
-| Ceph with default settings: CP or AP? What changes this? | |
-| In Raft, what consistency does a leader read provide? A follower read? | |
-| What is a "stale read" and under what conditions can it happen in a linearizable system? | |
-| What is the difference between "read-your-writes" and linearizability? | |
+```
+Replication:
+  Keep copies of data on multiple servers.
+
+Consensus:
+  Make non-faulty servers agree on one decision despite failures,
+  delays, retries, and competing proposals.
+
+Replicated state machine:
+  Use consensus repeatedly to make every replica apply the same
+  commands in the same order.
+```
+
+Copying a write to three servers is replication. It becomes a consensus
+protocol only when the system also defines which value or order wins during
+concurrency and failure, when a result is final, and how a recovering server
+rejoins without changing an already-decided result.
+
+Leader election alone is also not consensus. Election determines who may
+coordinate decisions; the protocol must still preserve decisions across
+leader changes.
 
 ---
 
-## 5. Replication Terminology
+## 5. From One Decision to a Replicated Log
 
-Precise definitions for Week 1–2:
+This distinction explains why Raft visibly contains log replication while
+basic Paxos appears not to.
+
+```
+Single-decree consensus:
+  slot 7 → choose exactly one value
+
+Replicated-log consensus:
+  slot 1 → SET x=1
+  slot 2 → SET y=2
+  slot 3 → DELETE z
+
+State-machine replication:
+  Every replica applies the decided slots in the same order
+  → every replica reaches the same state.
+```
+
+- Basic Paxos chooses one value for one slot.
+- A sequence of Paxos instances creates a replicated log.
+- Multi-Paxos makes that sequence efficient by using a stable leader.
+- Raft specifies leader election, a contiguous replicated log, commit rules,
+  and recovery as one integrated protocol.
+
+Therefore, the useful comparison is **Raft versus Multi-Paxos**, not Raft
+versus one instance of basic Paxos.
+
+---
+
+## 6. Consensus Algorithm Landscape
+
+Start with the common problem, then learn how each protocol organizes it:
+
+| Protocol | Primary abstraction | Leadership | How it forms an ordered log | Distinctive point |
+|----------|---------------------|------------|-----------------------------|-------------------|
+| Basic Paxos | One chosen value | Proposers compete by ballot | It does not by itself; one instance covers one slot | Minimal safety foundation |
+| Multi-Paxos | Repeated ordered slots | A stable proposer normally acts as leader | Runs Phase 2 for each slot after establishing leadership | Efficient but many operational details are left to implementations |
+| Raft | Contiguous replicated log | Explicit election by term | Leader sends `AppendEntries`; followers accept only matching prefixes | Designed as a complete, understandable protocol |
+| Viewstamped Replication | Replicated operations | Primary chosen for each view | Primary assigns operation numbers and replicas acknowledge them | View change explicitly transfers the safe log |
+| Zab | Atomic broadcast of transactions | Leader chosen for each epoch | Leader establishes a total order and broadcasts transactions | Designed for ZooKeeper's ordering and recovery needs |
+| PBFT family | Byzantine-fault-tolerant decisions | Depends on the protocol/view | Replicas vote through additional phases before ordering requests | Handles malicious/arbitrary faults, unlike the crash-fault protocols above |
+
+Paxos, Multi-Paxos, Raft, Viewstamped Replication, and Zab are usually studied
+under a **crash-fault** model: a server may stop, restart, or become unreachable,
+but it does not deliberately forge protocol messages. Byzantine protocols use
+a stronger failure model and require more replicas and communication.
+
+### Relationship map
+
+```
+Consensus
+├── One decision
+│   └── Basic Paxos
+├── Ordered decisions / replicated state machine
+│   ├── Multi-Paxos
+│   ├── Raft
+│   ├── Viewstamped Replication
+│   └── Zab (atomic broadcast)
+└── Byzantine-fault consensus
+    └── PBFT and descendants
+```
+
+These protocols provide comparable safety outcomes in overlapping failure
+models, but they are not the same algorithm. Their leader-change rules, log
+shape, message flow, and amount of specification differ.
+
+---
+
+## 7. Shared Vocabulary Across Protocols
+
+Names differ, but the underlying roles are often comparable:
+
+| General idea | Raft | Multi-Paxos | Viewstamped Replication | Zab |
+|--------------|------|-------------|--------------------------|-----|
+| Leadership generation | Term | Ballot/proposal number | View | Epoch |
+| Ordered position | Log index | Slot | Operation number | Transaction ID/counter |
+| Normal replication | `AppendEntries` | `Accept` for a slot | `Prepare`/`PrepareOK` | Broadcast proposal/ack |
+| Leader-change mechanism | `RequestVote` plus log check | Phase 1 plus recovery | View change | Discovery and synchronization |
+| Finality | Entry committed | Value chosen | Operation committed | Transaction committed |
+
+Important: these are conceptual correspondences, not identical RPCs. For
+example, Raft's `RequestVote` does not perform the same recovery work as Paxos
+Phase 1. Raft restricts who can win; a Multi-Paxos leader discovers accepted
+values and completes or repairs slots.
+
+Common terms used throughout this week:
 
 ```
 Leader / Primary:
-  The single replica that accepts writes (in leader-based replication).
-  Ensures single serialization point.
+  The replica coordinating ordering during a leadership generation.
 
-Follower / Secondary / Replica:
-  Receives replicated writes from leader.
-  May or may not serve reads (configurable in Raft).
+Follower / Backup / Acceptor:
+  A server that persists and acknowledges protocol state. Exact powers
+  depend on the algorithm.
 
 Quorum:
-  Minimum number of replicas that must acknowledge an operation
-  for it to be considered committed.
-  Write quorum W + Read quorum R > N (total replicas) ensures overlap.
-  Standard: W = R = majority = (N/2 + 1)
+  A set large enough to intersect another relevant quorum. Majority
+  quorums are common: floor(N/2) + 1.
 
-Epoch / Term:
-  A logical time period during which one leader is valid.
-  In Raft: "term". In Zab: "epoch". In Paxos: "ballot number".
-  Monotonically increasing; used to reject stale messages.
+Term / Ballot / View / Epoch:
+  A monotonically ordered leadership generation used to reject stale work.
 
-Log Index / LSN:
-  Position in the replicated log. Each entry has a unique (term, index) pair.
-  Used for log matching and recovery.
+Log index / Slot / Operation number:
+  A position in the ordered command history.
 
-Commit Index:
-  The highest log index known to be committed (replicated to majority).
-  Entries at or below commit index are durable.
+Committed / Chosen / Decided:
+  The protocol's point of no return: future valid leaders must preserve
+  the result. "Stored on one replica" is not the same as committed.
 ```
 
 ---
 
-## 6. Self-Check
+## 8. Recommended Learning Order
 
-Before Day 2, answer without looking anything up:
+```
+1. Consistency, failure models, quorum intersection
+2. Replication versus consensus
+3. Single decision versus a sequence of log slots
+4. Algorithm landscape and terminology mapping          ← today
+5. Raft election, replication, and recovery              ← Days 2–4
+6. Basic Paxos, Multi-Paxos, VR, and Zab comparison       ← Days 5–6
+7. Choose a protocol from workload and failure needs      ← Day 7
+```
 
-1. A client writes to a Raft leader. The leader crashes after sending the write to 2 of 4 followers (quorum = 3). Is the write committed? What happens on leader re-election?
+Raft is studied in detail first because its specification exposes the complete
+replicated-log lifecycle clearly. Paxos then reveals the smaller consensus
+primitive and how Multi-Paxos builds a similar service from repeated slots.
+The overview comes first so this teaching order is not mistaken for a taxonomy.
 
-2. DynamoDB uses eventual consistency by default. A client writes key K then immediately reads K. Is the read guaranteed to return the new value? What must the client do to guarantee it?
+---
 
-3. Ceph by default uses primary-copy replication. Is this linearizable? What could break linearizability?
+## 9. Gap-Fill Worksheet
 
-## 7. Answers
+Answer these before proceeding to Day 2:
 
-1. Not committed — only 2 of 4 followers received it, quorum is 3. On leader re-election, the new leader will not have this entry in its committed log. If the crashed leader restarts, its uncommitted entry may be overwritten if the new leader's log diverges. The write is lost from the client's perspective (no acknowledgment was sent, since the leader crashed before confirming to client).
+| Question | Precise Answer |
+|----------|----------------|
+| What is the difference between replication and consensus? | |
+| What is the difference between single-decree Paxos and Multi-Paxos? | |
+| Why is Raft usually compared with Multi-Paxos rather than basic Paxos? | |
+| What do a Raft log index and a Multi-Paxos slot represent? | |
+| Why is electing a leader insufficient to preserve committed data? | |
+| Which failure assumption separates Raft/Paxos from PBFT-style protocols? | |
 
-2. Not guaranteed with default eventual consistency. The read may go to a different replica that hasn't received the write yet. To guarantee read-your-writes: use `ConsistentRead=True` in DynamoDB (strong consistency), or use the same session/token mechanism for causal consistency.
+---
 
-3. Ceph's primary-copy is linearizable for the single PG (placement group) level — the primary serializes all reads and writes. What could break it: reading from a replica (not primary) that hasn't received the latest write yet; split-brain during network partition if fence/epoch mechanism fails; stale reads from a primary that lost quorum but doesn't know it yet (solved by epoch/lease mechanism).
+## 10. Answers
+
+1. Replication creates multiple copies. Consensus supplies rules that make
+   replicas choose one safe result or order despite concurrency and failures.
+2. Single-decree Paxos chooses one value. Multi-Paxos uses ordered Paxos slots
+   plus stable leadership to implement an efficient stream of decisions.
+3. Raft and Multi-Paxos both implement a replicated command log. One basic
+   Paxos instance decides only one value for one slot.
+4. Both identify one position in the ordered command history.
+5. A new leader must preserve decisions made before it was elected. That
+   requires log/accepted-value eligibility and recovery rules, not merely a
+   mechanism for selecting a live server.
+6. Raft and ordinary Paxos assume crash faults. PBFT-style protocols also
+   account for Byzantine servers that behave arbitrarily or maliciously.
 
 ---
 
 ## Tomorrow: Day 2 — Raft: Leader Election & Log Replication
 
-We read Ongaro's dissertation Chapters 3–4 and trace a write from client
-to committed log entry, including what happens during leader election
-with in-flight writes.
+With the algorithm map established, we read Ongaro's dissertation Chapters
+3–4 and trace a write from client to committed log entry, including what
+happens during leader election with in-flight writes.
