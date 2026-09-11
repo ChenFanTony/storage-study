@@ -1,7 +1,7 @@
 # Day 8: Process Address Space — mm_struct & VMAs
 
 <!-- study-nav -->
-[← Previous: Day 7](day07-week1-review.md) | [Next: Day 9 →](day09-mmap-internals.md)
+[← Previous: Day 7](day07-week1-review.md) | [Next: Day 9 — mmap() Internals: From Syscall to VMA →](day09-mmap-internals.md)
 
 ## Learning Objectives
 - Understand `struct mm_struct` as the complete virtual address space descriptor

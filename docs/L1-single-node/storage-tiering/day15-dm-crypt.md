@@ -1,7 +1,7 @@
 # Day 15: dm-crypt — IV Modes, Queue Depth, and Performance Overhead
 
 <!-- study-nav -->
-[← Previous: Day 14](day14-week2-review.md) | [Next: Day 16 →](day16-md-raid.md)
+[← Previous: Day 14](day14-week2-review.md) | [Next: Day 16 — md/RAID: Partial-Stripe Writes, Bitmaps, and the Write Hole →](day16-md-raid.md)
 
 ## Learning Objectives
 - Understand dm-crypt's architecture and where in the stack encryption happens

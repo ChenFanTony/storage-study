@@ -1,7 +1,7 @@
 # Day 27 — Bridges, VXLAN, and Overlay Networks
 
 <!-- study-nav -->
-[← Previous: Day 26](day26_observability.md) | [Next: Day 28 →](day28_final_review.md)
+[← Previous: Day 26](day26_observability.md) | [Next: Day 28 — Final Review: The Complete Mental Model →](day28_final_review.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 4)
 
 ---

@@ -1,7 +1,7 @@
 # Day 24: NVMe-oF Failure Handling, Multipathing & O_DIRECT Gap-Fill
 
 <!-- study-nav -->
-[← Previous: Day 23](day23-nvmeof-architecture.md) | [Next: Day 25 →](day25-io-uring-deep-dive.md)
+[← Previous: Day 23](day23-nvmeof-architecture.md) | [Next: Day 25 — io_uring: Fixed Buffers, Registered Files & NVMe Passthrough →](day25-io-uring-deep-dive.md)
 
 ## Context
 Two topics today: NVMe-oF failure handling (new material) and a targeted

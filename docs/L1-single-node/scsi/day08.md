@@ -1,7 +1,7 @@
 # Day 8 — libiscsi session and connection structs
 
 <!-- study-nav -->
-[← Previous: Day 7](day07.md) | [Next: Day 9 →](day09.md)
+[← Previous: Day 7](day07.md) | [Next: Day 9 — iscsi_queuecommand path →](day09.md)
 **Week 2**: iSCSI Initiator Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/scsi/libiscsi.c`, `include/scsi/libiscsi.h`

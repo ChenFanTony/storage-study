@@ -1,7 +1,7 @@
 # Month 2 Day 4: Raft — Production Failure Modes
 
 <!-- study-nav -->
-[← Previous: Day 3](m2-day03-raft-snapshots.md) | [Next: Days 5–7 →](m2-day05-07-paxos-zab-review.md)
+[← Previous: Day 3](m2-day03-raft-snapshots.md) | [Next: Days 5–7 — Paxos, Viewstamped Replication, Zab & Review →](m2-day05-07-paxos-zab-review.md)
 
 ## Learning Objectives
 - Know the 5 most common Raft production failure patterns

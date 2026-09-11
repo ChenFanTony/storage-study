@@ -1,7 +1,7 @@
 # Day 08 — Socket Buffers and Memory Pressure
 
 <!-- study-nav -->
-[← Previous: Day 7](day07_netfilter_review.md) | [Next: Day 9 →](day09_flow_control.md)
+[← Previous: Day 7](day07_netfilter_review.md) | [Next: Day 9 — TCP Flow Control and Zero-Window Probes →](day09_flow_control.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 2)
 
 ---

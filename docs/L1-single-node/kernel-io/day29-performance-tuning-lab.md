@@ -1,7 +1,7 @@
 # Day 29: Full-Stack Performance Tuning Lab
 
 <!-- study-nav -->
-[← Previous: Day 28](day28-cgroup-io.md) | [Next: Day 30 →](day30-final-review.md)
+[← Previous: Day 28](day28-cgroup-io.md) | [Next: Day 30 — Final Review & Storage Architecture Roadmap →](day30-final-review.md)
 
 ## Objective
 Integrate everything from Weeks 1–4 into a complete, documented tuning

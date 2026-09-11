@@ -1,7 +1,7 @@
 # Day 25: io_uring — Fixed Buffers, Registered Files & NVMe Passthrough
 
 <!-- study-nav -->
-[← Previous: Day 24](day24-nvmeof-failure-odirect.md) | [Next: Day 26 →](day26-zns-zones.md)
+[← Previous: Day 24](day24-nvmeof-failure-odirect.md) | [Next: Day 26 — ZNS: Zone Types, Write Pointer & Zone Append →](day26-zns-zones.md)
 
 ## Learning Objectives
 - Understand io_uring's SQ/CQ ring mechanics at source level

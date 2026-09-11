@@ -1,7 +1,7 @@
 # Day 29: MM Performance Tuning Reference Card
 
 <!-- study-nav -->
-[← Previous: Day 28](day28-userfaultfd-hotplug.md) | [Next: Day 30 →](day30-capstone-integration.md)
+[← Previous: Day 28](day28-userfaultfd-hotplug.md) | [Next: Day 30 — Capstone: Memory + Storage Integration →](day30-capstone-integration.md)
 
 ## Learning Objectives
 - Build a complete, justified sysctl reference for production MM tuning

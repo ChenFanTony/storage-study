@@ -1,7 +1,7 @@
 # Day 27: DAX & PMEM — Memory-Mapped Persistent Storage
 
 <!-- study-nav -->
-[← Previous: Day 26](day26-mlock-madvise-pinning.md) | [Next: Day 28 →](day28-userfaultfd-hotplug.md)
+[← Previous: Day 26](day26-mlock-madvise-pinning.md) | [Next: Day 28 — userfaultfd & Memory Hot-plug →](day28-userfaultfd-hotplug.md)
 
 ## Learning Objectives
 - Understand DAX: filesystem direct access bypassing page cache

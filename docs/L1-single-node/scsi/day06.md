@@ -1,7 +1,7 @@
 # Day 6 — SCSI error handler
 
 <!-- study-nav -->
-[← Previous: Day 5](day05.md) | [Next: Day 7 →](day07.md)
+[← Previous: Day 5](day05.md) | [Next: Day 7 — dm-multipath core →](day07.md)
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `drivers/scsi/scsi_error.c`

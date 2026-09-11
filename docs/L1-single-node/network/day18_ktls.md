@@ -1,7 +1,7 @@
 # Day 18 — TLS in the Kernel: kTLS and NIC TLS Offload
 
 <!-- study-nav -->
-[← Previous: Day 17](day17_time_wait.md) | [Next: Day 19 →](day19_arp_neighbor.md)
+[← Previous: Day 17](day17_time_wait.md) | [Next: Day 19 — ARP, the Neighbor Subsystem, and the Link Layer →](day19_arp_neighbor.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 3)
 
 ---

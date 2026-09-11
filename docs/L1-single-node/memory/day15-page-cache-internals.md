@@ -1,7 +1,7 @@
 # Day 15: Page Cache Internals — struct folio & address_space
 
 <!-- study-nav -->
-[← Previous: Day 14](day14-week2-review.md) | [Next: Day 16 →](day16-dirty-pages-writeback.md)
+[← Previous: Day 14](day14-week2-review.md) | [Next: Day 16 — Dirty Pages & Writeback: The Full Pipeline →](day16-dirty-pages-writeback.md)
 
 ## Learning Objectives
 - Understand struct folio as the modern page cache unit

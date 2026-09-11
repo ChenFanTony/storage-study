@@ -1,7 +1,7 @@
 # Day 19 — ARP, the Neighbor Subsystem, and the Link Layer
 
 <!-- study-nav -->
-[← Previous: Day 18](day18_ktls.md) | [Next: Day 20 →](day20_routing_fib.md)
+[← Previous: Day 18](day18_ktls.md) | [Next: Day 20 — Routing Internals: FIB, Policy Routing, and ECMP →](day20_routing_fib.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 3)
 
 ---

@@ -1,7 +1,7 @@
 # Day 13: Kernel Mappings — kmap, ioremap & DMA
 
 <!-- study-nav -->
-[← Previous: Day 12](day12-mmap-page-cache-bridge.md) | [Next: Day 14 →](day14-week2-review.md)
+[← Previous: Day 12](day12-mmap-page-cache-bridge.md) | [Next: Day 14 — Week 2 Review: Virtual Memory Connective Tissue →](day14-week2-review.md)
 
 ## Learning Objectives
 - Understand kmap/kmap_atomic for accessing struct page content in kernel

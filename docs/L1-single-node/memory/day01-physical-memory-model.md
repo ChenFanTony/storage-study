@@ -1,7 +1,7 @@
 # Day 1: Physical Memory Model — Nodes, Zones, Pages
 
 <!-- study-nav -->
-[Next: Day 2 →](day02-buddy-allocator.md)
+[Next: Day 2 — Buddy Allocator: Page-Level Allocation & Fragmentation →](day02-buddy-allocator.md)
 
 ## Learning Objectives
 - Understand how the Linux kernel models physical RAM: NUMA nodes → zones → pages

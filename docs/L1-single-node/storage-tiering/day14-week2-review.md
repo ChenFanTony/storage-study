@@ -1,7 +1,7 @@
 # Day 14: Week 2 Review — Tiering Architecture Decisions
 
 <!-- study-nav -->
-[← Previous: Day 13](day13-tiering-failure-semantics.md) | [Next: Day 15 →](day15-dm-crypt.md)
+[← Previous: Day 13](day13-tiering-failure-semantics.md) | [Next: Day 15 — dm-crypt: IV Modes, Queue Depth, and Performance Overhead →](day15-dm-crypt.md)
 
 ## Objective
 Produce a written "Tiering Architecture Decision Guide" you would actually

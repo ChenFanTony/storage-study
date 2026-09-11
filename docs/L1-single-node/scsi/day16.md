@@ -1,7 +1,7 @@
 # Day 16 — target_core_transport submit path
 
 <!-- study-nav -->
-[← Previous: Day 15](day15.md) | [Next: Day 17 →](day17.md)
+[← Previous: Day 15](day15.md) | [Next: Day 17 — target_core_transport completion path →](day17.md)
 **Week 3**: LIO Target Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/target_core_transport.c`

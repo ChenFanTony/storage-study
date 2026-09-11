@@ -1,7 +1,7 @@
 # Month 2 Day 8: Erasure Coding — Reed-Solomon Math
 
 <!-- study-nav -->
-[← Previous: Days 5–7](../consensus/m2-day05-07-paxos-zab-review.md) | [Next: Days 15–21 →](../protocols/m2-day15-21-storage-protocols.md)
+[← Previous: Days 5–7](../consensus/m2-day05-07-paxos-zab-review.md) | [Next: Days 15–21 — Storage Network Protocols →](../protocols/m2-day15-21-storage-protocols.md)
 
 ## Learning Objectives
 - Understand Galois Field GF(2^8) arithmetic and why it's used

@@ -1,7 +1,7 @@
 # Day 22 — `sk_buff` Lifecycle: Allocation, Cloning, Fragmentation, and Freeing
 
 <!-- study-nav -->
-[← Previous: Day 21](day21_week3_review_tuning.md) | [Next: Day 23 →](day23_softirq_napi.md)
+[← Previous: Day 21](day21_week3_review_tuning.md) | [Next: Day 23 — Softirq and NAPI In Depth: The Linux Packet I/O Engine →](day23_softirq_napi.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 4)
 
 ---

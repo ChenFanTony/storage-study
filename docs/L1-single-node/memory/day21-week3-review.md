@@ -1,7 +1,7 @@
 # Day 21: Week 3 Review — Reclaim Connective Tissue
 
 <!-- study-nav -->
-[← Previous: Day 20](day20-memory-pressure-profiling.md) | [Next: Day 22 →](day22-transparent-huge-pages.md)
+[← Previous: Day 20](day20-memory-pressure-profiling.md) | [Next: Day 22 — Transparent Huge Pages (THP) →](day22-transparent-huge-pages.md)
 
 ## Learning Objectives
 - Synthesize Days 15–20: complete dirty page lifecycle

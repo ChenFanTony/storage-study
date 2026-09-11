@@ -1,7 +1,7 @@
 # Day 19 — iSCSI fabric TX thread and Data-Out
 
 <!-- study-nav -->
-[← Previous: Day 18](day18.md) | [Next: Day 20 →](day20.md)
+[← Previous: Day 18](day18.md) | [Next: Day 20 — LIO Persistent Reservations →](day20.md)
 **Week 3**: LIO Target Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/iscsi/iscsi_target.c`, `drivers/target/iscsi/iscsi_target_util.c`

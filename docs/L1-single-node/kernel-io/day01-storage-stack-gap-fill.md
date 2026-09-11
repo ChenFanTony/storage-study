@@ -1,7 +1,7 @@
 # Day 1: Storage Stack Gap-Fill (Half Day)
 
 <!-- study-nav -->
-[Next: Day 2 →](day02-blk-mq-internals.md)
+[Next: Day 2 — blk-mq: Hardware Queues, Tag Sets, Dispatch →](day02-blk-mq-internals.md)
 
 ## Context
 You already know this stack. This is a **directed audit**, not a tutorial.

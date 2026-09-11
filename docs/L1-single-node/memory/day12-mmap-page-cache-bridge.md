@@ -1,7 +1,7 @@
 # Day 12: Memory-Mapped Files & the Page Cache Bridge
 
 <!-- study-nav -->
-[← Previous: Day 11](day11-page-tables-tlb.md) | [Next: Day 13 →](day13-kmap-ioremap-dma.md)
+[← Previous: Day 11](day11-page-tables-tlb.md) | [Next: Day 13 — Kernel Mappings: kmap, ioremap & DMA →](day13-kmap-ioremap-dma.md)
 
 ## Learning Objectives
 - Understand that `mmap(file)` and `read(file)` share the same physical pages

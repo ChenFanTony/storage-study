@@ -1,7 +1,7 @@
 # Day 13 — Traffic Control and the `qdisc` Layer
 
 <!-- study-nav -->
-[← Previous: Day 12](day12_network_namespaces.md) | [Next: Day 14 →](day14_ebpf_xdp_review.md)
+[← Previous: Day 12](day12_network_namespaces.md) | [Next: Day 14 — eBPF/XDP Introduction and Week 2 Review →](day14_ebpf_xdp_review.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 2)
 
 ---

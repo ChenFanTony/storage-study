@@ -1,7 +1,7 @@
 # Day 25 — Kernel Bypass: DPDK Concepts and AF_XDP
 
 <!-- study-nav -->
-[← Previous: Day 24](day24_tsq_pacing.md) | [Next: Day 26 →](day26_observability.md)
+[← Previous: Day 24](day24_tsq_pacing.md) | [Next: Day 26 — Kernel Networking Observability: perf, ftrace, bpftrace →](day26_observability.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 4)
 
 ---

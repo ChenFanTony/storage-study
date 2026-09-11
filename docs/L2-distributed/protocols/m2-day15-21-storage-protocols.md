@@ -1,7 +1,7 @@
 # Month 2 Days 15–21: Storage Network Protocols
 
 <!-- study-nav -->
-[← Previous: Days 8–14](../data-placement/m2-day08-14-erasure-placement.md) | [Next: Days 22–30 →](../systems/m2-day22-30-object-storage-review.md)
+[← Previous: Days 8–14](../data-placement/m2-day08-14-erasure-placement.md) | [Next: Days 22–30 — Object Storage Architecture & Final Review →](../systems/m2-day22-30-object-storage-review.md)
 ---
 
 # Day 15: iSCSI Protocol Internals

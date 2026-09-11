@@ -1,7 +1,7 @@
 # Day 4: GFP Flags & Allocation Context
 
 <!-- study-nav -->
-[← Previous: Day 3](day03-slab-slub-allocator.md) | [Next: Day 5 →](day05-vmalloc-mempool-ioremap.md)
+[← Previous: Day 3](day03-slab-slub-allocator.md) | [Next: Day 5 — vmalloc, ioremap & Memory Pools →](day05-vmalloc-mempool-ioremap.md)
 
 ## Learning Objectives
 - Master every significant GFP_* flag and when to use it

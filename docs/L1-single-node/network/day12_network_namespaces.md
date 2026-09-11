@@ -1,7 +1,7 @@
 # Day 12 — Network Namespaces and `veth` Pairs
 
 <!-- study-nav -->
-[← Previous: Day 11](day11_udp_raw_sockets.md) | [Next: Day 13 →](day13_traffic_control.md)
+[← Previous: Day 11](day11_udp_raw_sockets.md) | [Next: Day 13 — Traffic Control and the `qdisc` Layer →](day13_traffic_control.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 2)
 
 ---

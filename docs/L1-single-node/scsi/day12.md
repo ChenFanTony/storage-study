@@ -1,7 +1,7 @@
 # Day 12 — session failure and EH interaction
 
 <!-- study-nav -->
-[← Previous: Day 11](day11.md) | [Next: Day 13 →](day13.md)
+[← Previous: Day 11](day11.md) | [Next: Day 13 — PR slow path: initiator side →](day13.md)
 **Week 2**: iSCSI Initiator Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/scsi/libiscsi.c`, `drivers/scsi/scsi_transport_iscsi.c`

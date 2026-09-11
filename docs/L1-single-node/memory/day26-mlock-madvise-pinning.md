@@ -1,7 +1,7 @@
 # Day 26: mlock, madvise & Memory Pinning
 
 <!-- study-nav -->
-[← Previous: Day 25](day25-memory-cgroups.md) | [Next: Day 27 →](day27-dax-pmem.md)
+[← Previous: Day 25](day25-memory-cgroups.md) | [Next: Day 27 — DAX & PMEM: Memory-Mapped Persistent Storage →](day27-dax-pmem.md)
 
 ## Learning Objectives
 - Understand mlock: locking pages against reclaim and swap

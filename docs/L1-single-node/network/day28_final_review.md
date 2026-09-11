@@ -1,7 +1,7 @@
 # Day 28 — Final Review: The Complete Mental Model
 
 <!-- study-nav -->
-[← Previous: Day 27](day27_bridges_vxlan.md) | [Next: Day 29 →](day29_ipv6_internals.md)
+[← Previous: Day 27](day27_bridges_vxlan.md) | [Next: Day 29 — IPv6 Internals: Stack Differences, NDP, and `struct ipv6_pinfo` →](day29_ipv6_internals.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 4 — Final Day)
 
 ---

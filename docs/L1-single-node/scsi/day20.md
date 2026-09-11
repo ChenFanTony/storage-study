@@ -1,7 +1,7 @@
 # Day 20 — LIO Persistent Reservations
 
 <!-- study-nav -->
-[← Previous: Day 19](day19.md) | [Next: Day 21 →](day21.md)
+[← Previous: Day 19](day19.md) | [Next: Day 21 — LIO backends: iblock, fileio, ramdisk, pscsi →](day21.md)
 **Week 3**: LIO Target Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/target_core_pr.c`, `include/target/target_core_base.h`

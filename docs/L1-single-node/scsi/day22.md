@@ -1,7 +1,7 @@
 # Day 22 — Task Management Functions
 
 <!-- study-nav -->
-[← Previous: Day 21](day21.md) | [Next: Day 23 →](day23.md)
+[← Previous: Day 21](day21.md) | [Next: Day 23 — ALUA →](day23.md)
 **Week 4**: Advanced Topics  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/target_core_tmr.c`, `drivers/target/iscsi/iscsi_target.c`

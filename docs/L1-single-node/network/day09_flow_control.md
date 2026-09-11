@@ -1,7 +1,7 @@
 # Day 09 — TCP Flow Control and Zero-Window Probes
 
 <!-- study-nav -->
-[← Previous: Day 8](day08_socket_buffers.md) | [Next: Day 10 →](day10_epoll.md)
+[← Previous: Day 8](day08_socket_buffers.md) | [Next: Day 10 — `epoll` and the Kernel Event Notification System →](day10_epoll.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 2)
 
 ---

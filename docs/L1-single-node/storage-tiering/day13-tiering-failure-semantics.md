@@ -1,7 +1,7 @@
 # Day 13: Tiering Failure Semantics — Full Analysis
 
 <!-- study-nav -->
-[← Previous: Day 12](day12-dm-thin-metadata.md) | [Next: Day 14 →](day14-week2-review.md)
+[← Previous: Day 12](day12-dm-thin-metadata.md) | [Next: Day 14 — Week 2 Review: Tiering Architecture Decisions →](day14-week2-review.md)
 
 ## Learning Objectives
 - Build a complete, precise failure matrix across all tiering modes

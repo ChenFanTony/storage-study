@@ -1,7 +1,7 @@
 # Day 22: Transparent Huge Pages (THP)
 
 <!-- study-nav -->
-[← Previous: Day 21](day21-week3-review.md) | [Next: Day 23 →](day23-hugetlb-pages.md)
+[← Previous: Day 21](day21-week3-review.md) | [Next: Day 23 — HugeTLB Pages: Static Pre-allocated Huge Pages →](day23-hugetlb-pages.md)
 
 ## Learning Objectives
 - Understand THP: 2MB anonymous pages managed transparently

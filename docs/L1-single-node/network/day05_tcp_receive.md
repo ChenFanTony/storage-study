@@ -1,7 +1,7 @@
 # Day 05 — TCP: Receive Path and State Machine
 
 <!-- study-nav -->
-[← Previous: Day 4](day04_ip_layer.md) | [Next: Day 6 →](day06_tcp_transmit.md)
+[← Previous: Day 4](day04_ip_layer.md) | [Next: Day 6 — TCP: Transmit Path and Congestion Control →](day06_tcp_transmit.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 1)
 
 ---

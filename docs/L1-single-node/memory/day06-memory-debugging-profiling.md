@@ -1,7 +1,7 @@
 # Day 6: Memory Debugging & Profiling Tools
 
 <!-- study-nav -->
-[← Previous: Day 5](day05-vmalloc-mempool-ioremap.md) | [Next: Day 7 →](day07-week1-review.md)
+[← Previous: Day 5](day05-vmalloc-mempool-ioremap.md) | [Next: Day 7 — Week 1 Review: Physical Memory Connective Tissue →](day07-week1-review.md)
 
 ## Learning Objectives
 - Build a systematic memory diagnostic workflow for production systems

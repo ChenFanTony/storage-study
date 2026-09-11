@@ -1,7 +1,7 @@
 # Day 24 — TCP Small Queues (TSQ) and Pacing
 
 <!-- study-nav -->
-[← Previous: Day 23](day23_softirq_napi.md) | [Next: Day 25 →](day25_dpdk_afxdp.md)
+[← Previous: Day 23](day23_softirq_napi.md) | [Next: Day 25 — Kernel Bypass: DPDK Concepts and AF_XDP →](day25_dpdk_afxdp.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 4)
 
 ---

@@ -1,7 +1,7 @@
 # Day 25: Memory cgroups — Container Storage Performance
 
 <!-- study-nav -->
-[← Previous: Day 24](day24-numa-memory-management.md) | [Next: Day 26 →](day26-mlock-madvise-pinning.md)
+[← Previous: Day 24](day24-numa-memory-management.md) | [Next: Day 26 — mlock, madvise & Memory Pinning →](day26-mlock-madvise-pinning.md)
 
 ## Learning Objectives
 - Understand cgroup v2 memory controller: limits, protection, soft limits

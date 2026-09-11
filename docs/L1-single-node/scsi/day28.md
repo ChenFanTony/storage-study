@@ -1,7 +1,7 @@
 # Day 28 — ERL1 and ERL2 error recovery
 
 <!-- study-nav -->
-[← Previous: Day 27](day27.md) | [Next: Day 29 →](day29.md)
+[← Previous: Day 27](day27.md) | [Next: Day 29 — SCSI sense data generation →](day29.md)
 **Week 4**: Advanced Topics  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/iscsi/iscsi_target_erl1.c`, `iscsi_target_erl2.c`, `drivers/scsi/libiscsi.c`

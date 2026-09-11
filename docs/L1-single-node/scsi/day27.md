@@ -1,7 +1,7 @@
 # Day 27 — iSCSI login sequence
 
 <!-- study-nav -->
-[← Previous: Day 26](day26.md) | [Next: Day 28 →](day28.md)
+[← Previous: Day 26](day26.md) | [Next: Day 28 — ERL1 and ERL2 error recovery →](day28.md)
 **Week 4**: Advanced Topics  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/iscsi/iscsi_target_login.c`, `drivers/target/iscsi/iscsi_target_nego.c`

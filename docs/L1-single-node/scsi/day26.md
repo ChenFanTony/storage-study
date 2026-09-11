@@ -1,7 +1,7 @@
 # Day 26 — NVMe-oF target fabric comparison
 
 <!-- study-nav -->
-[← Previous: Day 25](day25.md) | [Next: Day 27 →](day27.md)
+[← Previous: Day 25](day25.md) | [Next: Day 27 — iSCSI login sequence →](day27.md)
 **Week 4**: Advanced Topics  
 **Time**: 1–2 hours  
 **Reference**: `drivers/nvme/target/`, `drivers/nvme/host/`

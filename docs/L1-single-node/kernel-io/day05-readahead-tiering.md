@@ -1,7 +1,7 @@
 # Day 5: Read-ahead — Adaptive Algorithm & Tiering Implications
 
 <!-- study-nav -->
-[← Previous: Day 4](day04-writeback-thresholds.md) | [Next: Day 6 →](day06-io-schedulers-architect.md)
+[← Previous: Day 4](day04-writeback-thresholds.md) | [Next: Day 6 — I/O Schedulers: Architect's View →](day06-io-schedulers-architect.md)
 
 ## Learning Objectives
 - Understand the adaptive read-ahead algorithm in `mm/readahead.c`

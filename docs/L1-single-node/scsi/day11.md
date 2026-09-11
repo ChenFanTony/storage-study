@@ -1,7 +1,7 @@
 # Day 11 — iscsi_tcp RX path
 
 <!-- study-nav -->
-[← Previous: Day 10](day10.md) | [Next: Day 12 →](day12.md)
+[← Previous: Day 10](day10.md) | [Next: Day 12 — session failure and EH interaction →](day12.md)
 **Week 2**: iSCSI Initiator Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/scsi/iscsi_tcp.c`, `drivers/scsi/libiscsi.c`, `drivers/scsi/libiscsi_tcp.c`

@@ -1,7 +1,7 @@
 # Month 2 Day 3: Raft — Log Compaction, Snapshots & Membership Changes
 
 <!-- study-nav -->
-[← Previous: Day 2](m2-day02-raft-leader-election.md) | [Next: Day 4 →](m2-day04-raft-failures.md)
+[← Previous: Day 2](m2-day02-raft-leader-election.md) | [Next: Day 4 — Raft: Production Failure Modes →](m2-day04-raft-failures.md)
 
 ## Learning Objectives
 - Understand why log compaction is necessary and when it triggers

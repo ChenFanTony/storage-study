@@ -1,7 +1,7 @@
 # Day 22: NVMe Driver — Queue Pairs, Multi-Namespace & Passthrough
 
 <!-- study-nav -->
-[← Previous: Day 21](../filesystems/day21-week3-review.md) | [Next: Day 23 →](day23-nvmeof-architecture.md)
+[← Previous: Day 21](../filesystems/day21-week3-review.md) | [Next: Day 23 — NVMe-oF: Architecture & Transport Comparison →](day23-nvmeof-architecture.md)
 
 ## Learning Objectives
 - Understand NVMe's queue pair model at source level (`drivers/nvme/host/pci.c`)

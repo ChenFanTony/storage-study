@@ -1,7 +1,7 @@
 # Day 26: ZNS — Zone Types, Write Pointer & Zone Append
 
 <!-- study-nav -->
-[← Previous: Day 25](day25-io-uring-deep-dive.md) | [Next: Day 27 →](day27-pmem-dax.md)
+[← Previous: Day 25](day25-io-uring-deep-dive.md) | [Next: Day 27 — Persistent Memory / DAX Path →](day27-pmem-dax.md)
 
 ## Learning Objectives
 - Understand the ZNS zone model and the problem it solves

@@ -1,7 +1,7 @@
 # Day 2 — blk-mq core dispatch
 
 <!-- study-nav -->
-[← Previous: Day 1](day01.md) | [Next: Day 3 →](day03.md)
+[← Previous: Day 1](day01.md) | [Next: Day 3 — blk_execute_rq: the slow path →](day03.md)
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `block/blk-mq.c`, `block/blk-mq.h`, `block/blk-mq-tag.c`

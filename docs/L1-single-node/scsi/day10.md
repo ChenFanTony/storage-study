@@ -1,7 +1,7 @@
 # Day 10 — iscsi_tcp TX path
 
 <!-- study-nav -->
-[← Previous: Day 9](day09.md) | [Next: Day 11 →](day11.md)
+[← Previous: Day 9](day09.md) | [Next: Day 11 — iscsi_tcp RX path →](day11.md)
 **Week 2**: iSCSI Initiator Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/scsi/iscsi_tcp.c`, `drivers/scsi/libiscsi_tcp.c`

@@ -1,7 +1,7 @@
 # Month 2 Day 1: Distributed Storage Foundations & Consensus Map
 
 <!-- study-nav -->
-[Next: Day 2 →](m2-day02-raft-leader-election.md)
+[Next: Day 2 — Raft: Leader Election & Log Replication →](m2-day02-raft-leader-election.md)
 
 ## Context
 You know single-node storage deeply. Before studying one consensus protocol in

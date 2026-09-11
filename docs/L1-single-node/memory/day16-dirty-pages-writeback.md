@@ -1,7 +1,7 @@
 # Day 16: Dirty Pages & Writeback — The Full Pipeline
 
 <!-- study-nav -->
-[← Previous: Day 15](day15-page-cache-internals.md) | [Next: Day 17 →](day17-kswapd-lru-reclaim.md)
+[← Previous: Day 15](day15-page-cache-internals.md) | [Next: Day 17 — kswapd & Memory Reclaim: LRU Lists →](day17-kswapd-lru-reclaim.md)
 
 ## Learning Objectives
 - Trace the complete dirty page lifecycle: write() → dirty → writeback → clean

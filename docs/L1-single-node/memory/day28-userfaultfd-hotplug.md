@@ -1,7 +1,7 @@
 # Day 28: userfaultfd & Memory Hot-plug
 
 <!-- study-nav -->
-[← Previous: Day 27](day27-dax-pmem.md) | [Next: Day 29 →](day29-mm-performance-tuning.md)
+[← Previous: Day 27](day27-dax-pmem.md) | [Next: Day 29 — MM Performance Tuning Reference Card →](day29-mm-performance-tuning.md)
 
 ## Learning Objectives
 - Understand userfaultfd: user-space page fault handling

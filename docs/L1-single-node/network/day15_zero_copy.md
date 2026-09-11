@@ -1,7 +1,7 @@
 # Day 15 — Zero-Copy Networking: `sendfile`, `splice`, `MSG_ZEROCOPY`
 
 <!-- study-nav -->
-[← Previous: Day 14](day14_ebpf_xdp_review.md) | [Next: Day 16 →](day16_multiqueue_rss_rps.md)
+[← Previous: Day 14](day14_ebpf_xdp_review.md) | [Next: Day 16 — Multi-Queue NICs: RSS, RPS, RFS, and XPS →](day16_multiqueue_rss_rps.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 3)
 
 ---

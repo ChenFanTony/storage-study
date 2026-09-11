@@ -1,7 +1,7 @@
 # Day 23 — Softirq and NAPI In Depth: The Linux Packet I/O Engine
 
 <!-- study-nav -->
-[← Previous: Day 22](day22_skbuff_lifecycle.md) | [Next: Day 24 →](day24_tsq_pacing.md)
+[← Previous: Day 22](day22_skbuff_lifecycle.md) | [Next: Day 24 — TCP Small Queues (TSQ) and Pacing →](day24_tsq_pacing.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 4)
 
 ---

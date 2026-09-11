@@ -1,7 +1,7 @@
 # Day 23: NVMe-oF — Architecture & Transport Comparison
 
 <!-- study-nav -->
-[← Previous: Day 22](day22-nvme-driver.md) | [Next: Day 24 →](day24-nvmeof-failure-odirect.md)
+[← Previous: Day 22](day22-nvme-driver.md) | [Next: Day 24 — NVMe-oF Failure Handling, Multipathing & O_DIRECT Gap-Fill →](day24-nvmeof-failure-odirect.md)
 
 ## Learning Objectives
 - Understand NVMe-oF's architecture: how it extends the NVMe queue model over a fabric

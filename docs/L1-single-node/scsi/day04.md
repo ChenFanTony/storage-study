@@ -1,7 +1,7 @@
 # Day 4 — SCSI mid layer: queueing
 
 <!-- study-nav -->
-[← Previous: Day 3](day03.md) | [Next: Day 5 →](day05.md)
+[← Previous: Day 3](day03.md) | [Next: Day 5 — SCSI completion and disposition →](day05.md)
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `drivers/scsi/scsi_lib.c`, `include/scsi/scsi_cmnd.h`, `drivers/scsi/scsi.c`

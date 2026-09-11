@@ -1,7 +1,7 @@
 # Day 8: bcache Internals — Bucket GC & SSD Wear
 
 <!-- study-nav -->
-[← Previous: Day 7](../kernel-io/day07-week1-review.md) | [Next: Day 9 →](day09-bcache-failure-semantics.md)
+[← Previous: Day 7](../kernel-io/day07-week1-review.md) | [Next: Day 9 — bcache: Cache Coherency Under Failure →](day09-bcache-failure-semantics.md)
 
 ## Learning Objectives
 - Understand bcache's bucket-based allocation model in depth

@@ -1,7 +1,7 @@
 # Day 16 — Multi-Queue NICs: RSS, RPS, RFS, and XPS
 
 <!-- study-nav -->
-[← Previous: Day 15](day15_zero_copy.md) | [Next: Day 17 →](day17_time_wait.md)
+[← Previous: Day 15](day15_zero_copy.md) | [Next: Day 17 — TCP `TIME_WAIT`, Connection Reuse, and Port Exhaustion →](day17_time_wait.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 3)
 
 ---

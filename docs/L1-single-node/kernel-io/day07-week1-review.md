@@ -1,7 +1,7 @@
 # Day 7: Week 1 Review — Architect Decision Points
 
 <!-- study-nav -->
-[← Previous: Day 6](day06-io-schedulers-architect.md) | [Next: Day 8 →](../storage-tiering/day08-bcache-gc-ssd-wear.md)
+[← Previous: Day 6](day06-io-schedulers-architect.md) | [Next: Day 8 — bcache Internals: Bucket GC & SSD Wear →](../storage-tiering/day08-bcache-gc-ssd-wear.md)
 
 ## Objective
 Synthesize Days 1–6 into a defensible reference you can use in real design

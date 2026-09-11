@@ -1,7 +1,7 @@
 # Day 17 — target_core_transport completion path
 
 <!-- study-nav -->
-[← Previous: Day 16](day16.md) | [Next: Day 18 →](day18.md)
+[← Previous: Day 16](day16.md) | [Next: Day 18 — iSCSI fabric RX thread →](day18.md)
 **Week 3**: LIO Target Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/target_core_transport.c`

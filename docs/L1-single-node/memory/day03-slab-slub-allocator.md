@@ -1,7 +1,7 @@
 # Day 3: Slab/Slub Allocator — Object-Level Allocation
 
 <!-- study-nav -->
-[← Previous: Day 2](day02-buddy-allocator.md) | [Next: Day 4 →](day04-gfp-flags.md)
+[← Previous: Day 2](day02-buddy-allocator.md) | [Next: Day 4 — GFP Flags & Allocation Context →](day04-gfp-flags.md)
 
 ## Learning Objectives
 - Understand how slub manages fixed-size object caches on top of buddy pages

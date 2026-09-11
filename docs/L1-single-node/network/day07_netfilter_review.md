@@ -1,7 +1,7 @@
 # Day 07 — Netfilter, iptables Hooks, and Week 1 Review
 
 <!-- study-nav -->
-[← Previous: Day 6](day06_tcp_transmit.md) | [Next: Day 8 →](day08_socket_buffers.md)
+[← Previous: Day 6](day06_tcp_transmit.md) | [Next: Day 8 — Socket Buffers and Memory Pressure →](day08_socket_buffers.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 1)
 
 ---

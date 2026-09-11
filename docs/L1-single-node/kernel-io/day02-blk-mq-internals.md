@@ -1,7 +1,7 @@
 # Day 2: blk-mq — Hardware Queues, Tag Sets, Dispatch
 
 <!-- study-nav -->
-[← Previous: Day 1](day01-storage-stack-gap-fill.md) | [Next: Day 3 →](day03-blk-mq-scheduler-plug.md)
+[← Previous: Day 1](day01-storage-stack-gap-fill.md) | [Next: Day 3 — blk-mq: Scheduler Interaction & Plug/Unplug →](day03-blk-mq-scheduler-plug.md)
 
 > **Source baseline:** Linux `v7.2-rc3` (`block/blk-mq.c`); function names and call paths below follow this version.
 

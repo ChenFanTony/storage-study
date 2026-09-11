@@ -1,7 +1,7 @@
 # Day 1 — bio and request structs
 
 <!-- study-nav -->
-[Next: Day 2 →](day02.md)
+[Next: Day 2 — blk-mq core dispatch →](day02.md)
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `include/linux/blk_types.h`, `include/linux/blkdev.h`, `block/bio.c`

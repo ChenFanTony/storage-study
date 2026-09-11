@@ -1,7 +1,7 @@
 # Day 06 — TCP: Transmit Path and Congestion Control
 
 <!-- study-nav -->
-[← Previous: Day 5](day05_tcp_receive.md) | [Next: Day 7 →](day07_netfilter_review.md)
+[← Previous: Day 5](day05_tcp_receive.md) | [Next: Day 7 — Netfilter, iptables Hooks, and Week 1 Review →](day07_netfilter_review.md)
 > **Time:** 1–2 hours | **Track:** Linux Networking (Week 1)
 
 ---

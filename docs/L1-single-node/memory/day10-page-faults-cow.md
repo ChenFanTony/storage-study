@@ -1,7 +1,7 @@
 # Day 10: Page Faults — Demand Paging & COW
 
 <!-- study-nav -->
-[← Previous: Day 9](day09-mmap-internals.md) | [Next: Day 11 →](day11-page-tables-tlb.md)
+[← Previous: Day 9](day09-mmap-internals.md) | [Next: Day 11 — Page Tables & TLB Management →](day11-page-tables-tlb.md)
 
 ## Learning Objectives
 - Trace the page fault handler from CPU exception to resolved page

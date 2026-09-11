@@ -1,7 +1,7 @@
 # Day 21 — LIO backends: iblock, fileio, ramdisk, pscsi
 
 <!-- study-nav -->
-[← Previous: Day 20](day20.md) | [Next: Day 22 →](day22.md)
+[← Previous: Day 20](day20.md) | [Next: Day 22 — Task Management Functions →](day22.md)
 **Week 3**: LIO Target Kernel Code  
 **Time**: 1–2 hours  
 **Reference**: `drivers/target/target_core_iblock.c`, `target_core_file.c`, `target_core_rd.c`, `target_core_pscsi.c`

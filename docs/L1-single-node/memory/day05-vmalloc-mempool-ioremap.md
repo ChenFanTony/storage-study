@@ -1,7 +1,7 @@
 # Day 5: vmalloc, ioremap & Memory Pools
 
 <!-- study-nav -->
-[← Previous: Day 4](day04-gfp-flags.md) | [Next: Day 6 →](day06-memory-debugging-profiling.md)
+[← Previous: Day 4](day04-gfp-flags.md) | [Next: Day 6 — Memory Debugging & Profiling Tools →](day06-memory-debugging-profiling.md)
 
 ## Learning Objectives
 - Understand when to use vmalloc vs kmalloc and the tradeoffs

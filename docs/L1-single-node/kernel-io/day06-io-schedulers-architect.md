@@ -1,7 +1,7 @@
 # Day 6: I/O Schedulers — Architect's View
 
 <!-- study-nav -->
-[← Previous: Day 5](day05-readahead-tiering.md) | [Next: Day 7 →](day07-week1-review.md)
+[← Previous: Day 5](day05-readahead-tiering.md) | [Next: Day 7 — Week 1 Review: Architect Decision Points →](day07-week1-review.md)
 
 ## Learning Objectives
 - Understand what each scheduler actually guarantees (not just its name)

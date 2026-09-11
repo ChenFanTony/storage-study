@@ -1,7 +1,7 @@
 # Day 4: Page Cache — Writeback Thresholds & Flusher Behavior
 
 <!-- study-nav -->
-[← Previous: Day 3](day03-blk-mq-scheduler-plug.md) | [Next: Day 5 →](day05-readahead-tiering.md)
+[← Previous: Day 3](day03-blk-mq-scheduler-plug.md) | [Next: Day 5 — Read-ahead: Adaptive Algorithm & Tiering Implications →](day05-readahead-tiering.md)
 
 ## Learning Objectives
 - Understand dirty page accounting and the writeback cliff

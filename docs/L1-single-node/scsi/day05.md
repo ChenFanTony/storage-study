@@ -1,7 +1,7 @@
 # Day 5 — SCSI completion and disposition
 
 <!-- study-nav -->
-[← Previous: Day 4](day04.md) | [Next: Day 6 →](day06.md)
+[← Previous: Day 4](day04.md) | [Next: Day 6 — SCSI error handler →](day06.md)
 **Week 1**: Block Layer — blk-mq and SCSI Mid Layer  
 **Time**: 1–2 hours  
 **Reference**: `drivers/scsi/scsi_lib.c`, `drivers/scsi/scsi_error.c`
