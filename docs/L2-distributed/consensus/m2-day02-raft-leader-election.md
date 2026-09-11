@@ -134,6 +134,50 @@ Follower commit:
   Apply committed entries to state machine
 ```
 
+### Majority commit does not mean every follower has applied it
+
+A leader needs a quorum, not every server, before it can commit and reply.
+Even a follower that already stored the entry may not yet know that the leader
+has committed it; followers learn the new `leaderCommit` value from a later
+`AppendEntries` RPC or heartbeat.
+
+```
+3-node cluster; follower F2 is delayed:
+
+  t=1  Leader and F1 store X=2             → majority has the entry
+  t=2  Leader commits and applies X=2
+       Leader replies success to client
+  t=3  F1 may not know the entry is committed yet
+       F2 may not have the entry at all
+       A local state-machine read on F1/F2 may still return X=1
+  t=4  Next AppendEntries carries leaderCommit
+       Followers commit and apply X=2
+```
+
+The successful response guarantees that the entry is committed and will be
+preserved by future valid leaders. It does **not** mean that every follower's
+state machine is current at that instant.
+
+### Follower reads in raw Raft and etcd
+
+Raft's replication safety does not make an unrestricted follower-local read
+linearizable. The service built on Raft must choose and implement its read
+semantics:
+
+| Read path | Can it return an older value after a completed write? | Why |
+|-----------|------------------------------------------------------|-----|
+| Raw local read from a Raft follower | Yes | The follower's log, commit index, or applied state may lag |
+| etcd `Range`/`get` (default) | No | etcd performs a linearizable read and waits for the required consensus revision to be applied |
+| etcd `Range`/`get` with `serializable=true` | Yes | The contacted member serves its local state without a linearizable quorum check |
+
+In etcd, `serializable` names the faster member-local read mode; it does not
+include linearizability's real-time ordering guarantee. A default read sent to
+a follower is therefore different from directly reading that follower's local
+state.
+
+References: [etcd v3 API: Range](https://etcd.io/docs/v3.6/learning/api/#range-api)
+and [etcd API guarantees](https://etcd.io/docs/v3.6/learning/api_guarantees/).
+
 ---
 
 ## 5. Log Matching Property
@@ -279,9 +323,14 @@ tar xzf etcd-v3.5.9-linux-amd64.tar.gz
 # Check status
 ./etcdctl --endpoints=127.0.0.1:2379 endpoint status --write-out=table
 
-# Write and observe replication
+# Write and compare the two follower read modes
 ./etcdctl --endpoints=127.0.0.1:2379 put /test/key1 "value1"
-./etcdctl --endpoints=127.0.0.1:2381 get /test/key1   # reads from follower
+
+# Default Range is linearizable even through a follower endpoint
+./etcdctl --endpoints=127.0.0.1:2381 get /test/key1
+
+# Serializable Range reads that member's local state and may be stale
+./etcdctl --endpoints=127.0.0.1:2381 get /test/key1 --consistency=s
 
 # Force leader election (kill current leader)
 # Find leader:
@@ -304,6 +353,7 @@ tar xzf etcd-v3.5.9-linux-amd64.tar.gz
 3. Why does Raft require a leader to only commit entries from its current term? What failure does this prevent?
 4. A client sends a write to the leader. The leader appends to its log and sends AppendEntries to followers, then crashes before any follower responds. What happened to the write?
 5. In a 5-node cluster, the minimum quorum for commit is 3. Two followers are partitioned from the leader. Can the cluster still accept writes?
+6. After an etcd write returns successfully, can a serializable read sent to a lagging follower return the old value? What about a default read sent to that follower?
 
 ## 10. Answers
 
@@ -312,6 +362,7 @@ tar xzf etcd-v3.5.9-linux-amd64.tar.gz
 3. Raft §5.4.2: committing entries from previous terms is unsafe. Example: entry from term 2 is replicated to majority, but a new leader from term 3 could overwrite it before committing (if the new leader doesn't have it). By only committing entries from the current term, the new leader can only commit entries it knows are fully replicated under its own leadership, guaranteeing safety.
 4. The write is lost from the client's perspective — the client received no acknowledgment (leader crashed). The entry may or may not survive depending on which follower becomes the new leader. If a follower with the entry becomes leader, it may eventually be committed; if a follower without it becomes leader, the entry will be overwritten. The client must retry with an idempotency token.
 5. Yes — the leader + 2 connected followers = 3 nodes = quorum. The leader can still commit entries. The 2 partitioned followers cannot accept writes (they're not the leader), and they fall behind. When the partition heals, they receive missing entries via AppendEntries and catch up.
+6. Yes. A serializable etcd read is served from the contacted member's local applied state, which may lag the committed cluster state. A default etcd read is linearizable: etcd coordinates with the consensus state and waits until the required revision has been applied, so a read begun after the write completed cannot return the older value.
 
 ---
 
