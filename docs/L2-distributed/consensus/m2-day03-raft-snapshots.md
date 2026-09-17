@@ -29,94 +29,287 @@ Solution: Snapshot
 
 ## 2. Snapshot Protocol
 
-```
-Each server independently decides when to snapshot:
-  - When log grows beyond threshold (e.g., 100MB)
-  - No coordination required — each server snapshots independently
+A Raft snapshot is a checkpoint of the **applied state machine**, not merely a
+copy of some log entries. It replaces a committed log prefix while preserving
+the information Raft needs to reason about the boundary.
 
-Snapshot contents:
-  - Last included index: highest log index covered by snapshot
-  - Last included term: term of that entry
-  - State machine state: complete state at that point
+### 2.1 The mental model
 
-After snapshot:
-  - Delete log entries up to last included index
-  - Keep snapshot file on disk
-
-Log structure after snapshot:
-  [snapshot: covers index 0-1000] [log entries: 1001, 1002, 1003, ...]
-```
-
-### Snapshot transfer to lagging followers
+Suppose entries through index 1000 are committed and applied:
 
 ```
-Scenario: follower is far behind (crashed for days, just rejoined)
-  Leader's log: entries 5001..5100 (entries 0-5000 discarded, snapshot exists)
-  Follower's log: entries 0..100 (needs 101..5000 which leader doesn't have)
+Before compaction:
 
-Solution: leader sends snapshot to follower (InstallSnapshot RPC)
+Raft log:
+  [1][2][3] ... [999][1000][1001][1002]
+                         ↑
+                  lastApplied = 1000
 
-InstallSnapshot RPC arguments:
-  term              — leader's current term
-  leaderId
-  lastIncludedIndex — snapshot covers up to this index
-  lastIncludedTerm  — term of last included entry
-  offset            — byte offset of chunk (for large snapshots)
-  data              — raw bytes of snapshot chunk
-  done              — true if last chunk
-
-Follower actions on receiving InstallSnapshot:
-  1. If term < currentTerm: reject
-  2. If snapshot is already in follower's log: just discard up to that point
-  3. Otherwise: save snapshot, discard entire log, reset state machine
-  4. Reply with current term
-
-Performance concern:
-  Snapshot transfer can be large (gigabytes for large state machines)
-  Uses chunked transfer — leader sends multiple InstallSnapshot RPCs
-  Follower applies snapshot atomically (all chunks received, then apply)
+State machine:
+  x = 10
+  y = 20
+  ...
 ```
+
+The member serializes the state produced by entries 1–1000 and records which
+log entry produced that state:
+
+```
+Snapshot:
+  lastIncludedIndex = 1000
+  lastIncludedTerm  = 7
+  state             = complete state machine after entry 1000
+  configuration     = cluster membership at that point
+
+After compaction:
+
+  [snapshot through (index=1000, term=7)] [1001][1002][1003]...
+```
+
+The pair `(lastIncludedIndex, lastIncludedTerm)` acts like a virtual log entry
+at the snapshot boundary. Raft still needs it for log-matching checks even
+though the physical entries before that point have been deleted.
+
+### 2.2 Snapshot safety invariant
+
+A snapshot may include only entries that are both:
+
+1. **Committed** — future valid leaders must preserve them.
+2. **Applied** — their effects are already present in the captured state
+   machine.
+
+An uncommitted or unapplied entry must never be represented in the snapshot.
+Snapshotting does not create a new consensus decision; it only changes the
+local representation of decisions already made by Raft.
+
+Each member chooses when to snapshot independently. Members can therefore have
+snapshots at different indices without affecting protocol safety.
+
+### 2.3 Safe creation and compaction order
+
+A member creates a snapshot in this order:
+
+```
+1. Choose snapshot index i, where i <= lastApplied
+2. Capture state machine state exactly through i
+3. Record lastIncludedIndex=i, lastIncludedTerm=log[i].term,
+   and the membership configuration
+4. Write snapshot to a temporary file
+5. Flush data and metadata; verify checksum if supported
+6. Atomically publish the snapshot
+7. Only now compact log entries covered by the durable snapshot
+8. Retain entries after i for writes that occurred while snapshotting
+```
+
+The ordering is a crash-safety requirement:
+
+| Crash point | Recovery result |
+|-------------|-----------------|
+| Before snapshot is durable | Ignore the partial snapshot; old log still exists |
+| After snapshot is durable but before compaction | Load the snapshot; duplicate old log entries are harmless |
+| After compaction | Safe because the durable snapshot replaces the deleted prefix |
+
+Deleting the log first is unsafe: a crash during snapshot creation could leave
+neither the old log nor a complete snapshot.
+
+Implementations often retain a catch-up window of entries covered by the
+snapshot. This uses extra space but lets a briefly delayed follower receive
+ordinary `AppendEntries` rather than a large snapshot.
+
+### 2.4 Writes can continue during snapshot creation
+
+The state machine checkpoint must correspond to one precise applied index, but
+the cluster does not have to stop accepting writes:
+
+```
+snapshot captures state through index 1000
+                         |
+                         v
+snapshot worker:  [state at 1000] ------------------> durable snapshot
+Raft continues:                       [1001][1002][1003]...
+```
+
+Copy-on-write or MVCC-capable storage engines can hold a stable read view while
+new commands continue to apply. Entries after the chosen snapshot index remain
+in the log and are replayed after restoring the snapshot.
+
+### 2.5 Restart recovery
+
+When a member restarts:
+
+```
+1. Load the newest complete, valid snapshot
+2. Restore the state machine and membership configuration
+3. Restore the snapshot boundary (lastIncludedIndex, lastIncludedTerm)
+4. Set lastApplied and commitIndex to at least lastIncludedIndex
+5. Replay committed log entries after the snapshot index
+6. Resume normal AppendEntries processing
+```
+
+For example, loading a snapshot through 5000 and replaying entries 5001–5100
+is equivalent to replaying entries 1–5100 from an empty state machine.
+
+### 2.6 When the leader sends a snapshot
+
+The leader normally catches up a follower by decrementing that follower's
+`nextIndex` and retrying `AppendEntries`. A snapshot becomes necessary when:
+
+```
+nextIndex[follower] < leader.firstRetainedLogIndex
+```
+
+Example:
+
+```
+Leader snapshot:      through index 5000
+Leader retained log:  5001..5100
+Follower log:         0..100
+
+Follower needs 101..5000, but the leader has compacted those entries.
+AppendEntries cannot fill the gap.
+```
+
+The recovery path becomes:
+
+```
+Leader                                      Follower
+  |                                             |
+  |----------- InstallSnapshot ---------------->|
+  |       state through index 5000              |
+  |                                             | receive into temporary storage
+  |                                             | verify and atomically install
+  |<---------------- success -------------------|
+  |                                             |
+  |----------- AppendEntries ------------------>|
+  |             entries 5001 onward             |
+```
+
+The extended Raft protocol describes these `InstallSnapshot` fields:
+
+```
+term              — leader's current term
+leaderId          — identifies the current leader
+lastIncludedIndex — highest log index represented by the snapshot
+lastIncludedTerm  — term of the boundary entry
+offset            — chunk offset for a large snapshot
+data              — snapshot chunk
+done              — whether this is the final chunk
+```
+
+Concrete Raft libraries may use a different transport or stream the database
+outside the core Raft message, but the safety information is the same.
+
+### 2.7 Installing a snapshot on a follower
+
+A follower must not expose a partially received snapshot. It writes chunks to
+temporary storage, verifies the completed image, then installs it atomically.
+
+The follower processes a completed snapshot as follows:
+
+```
+1. Reject it if message.term < currentTerm
+2. Step down if message.term is newer
+3. Ignore it if lastIncludedIndex <= commitIndex (snapshot is stale)
+4. Atomically replace the state machine with the snapshot state
+5. Restore membership and advance commitIndex/lastApplied to the snapshot index
+6. Reconcile the local log at the snapshot boundary:
+
+   If local log contains (lastIncludedIndex, lastIncludedTerm):
+     discard the prefix through lastIncludedIndex
+     retain the suffix after it
+
+   Otherwise:
+     discard the local log
+     begin again at the snapshot boundary
+
+7. Acknowledge installation
+8. Receive subsequent entries with AppendEntries
+```
+
+Keeping a suffix is safe only when the boundary entry matches. By Raft's Log
+Matching Property, equal index and term imply that the preceding history is
+the same. Later uncommitted suffix entries can still be repaired by normal
+`AppendEntries` conflict handling.
+
+Snapshot installation does not require a new quorum decision: the snapshot
+already represents a committed prefix. A snapshot may also be behind the
+leader's current commit index; the follower catches up with retained entries
+after installation.
+
+### 2.8 Performance tradeoffs
+
+| Snapshot policy | Benefit | Cost |
+|-----------------|---------|------|
+| Frequent snapshots | Short recovery replay, smaller log | More checkpoint I/O and CPU |
+| Infrequent snapshots | Less checkpoint overhead | Larger log, longer restart and memory pressure |
+| Large retained catch-up window | Fewer snapshot transfers to mildly slow followers | More log storage |
+| Small retained catch-up window | Less retained log | More large transfers |
+
+The right threshold depends on state size, write rate, disk bandwidth, follower
+latency, and acceptable restart time.
 
 ---
 
-## 3. etcd Snapshot Source
+## 3. How etcd Maps These Ideas
+
+etcd v3 separates several pieces that a simplified Raft diagram often draws as
+one snapshot:
+
+| etcd artifact | Purpose |
+|---------------|---------|
+| `member/snap/db` | bbolt state machine containing applied KV data and its consistent Raft index |
+| WAL files | Recent Raft entries, hard state, checksums, and snapshot markers needed for restart |
+| Transferred `*.snap.db` | Full backend checkpoint received when a follower is too far behind |
+| `etcdctl snapshot save` output | Operator-managed point-in-time backup for disaster recovery |
+
+The internal compaction flow is conceptually:
 
 ```go
-// etcd/server/etcdserver/server.go
+// Conceptual flow; exact function names vary by etcd version.
+if appliedIndex-lastSnapshotIndex >= snapshotCount {
+    // Metadata says which committed/applied prefix the backend represents.
+    raftSnapshot := createSnapshot(appliedIndex, appliedTerm, confState)
 
-// Trigger snapshot when log exceeds threshold
-func (s *EtcdServer) snapshot(snapi uint64, confState raftpb.ConfState) {
-    // 1. Get state machine snapshot (V3 store)
-    d, err := s.v3backend.Snapshot()
+    persistSnapshotMarker(raftSnapshot) // make recovery boundary durable first
 
-    // 2. Create Raft snapshot metadata
-    snap, err := s.r.raftStorage.CreateSnapshot(snapi, &confState, d)
-
-    // 3. Save to disk
-    s.r.storage.SaveSnap(snap)
-
-    // 4. Compact log up to snapshot index
-    s.r.raftStorage.Compact(snapi - s.Cfg.SnapshotCatchUpEntries)
-    // SnapshotCatchUpEntries: keep some entries after snapshot
-    // so fast followers don't need full snapshot transfer
+    compactIndex := appliedIndex - snapshotCatchUpEntries
+    compactRaftLog(compactIndex)        // retain a follower catch-up window
 }
 
-// etcd/raft/raft.go: maybeSendSnapshot
-// Leader detects follower needs snapshot when:
-// nextIndex[follower] <= log.firstIndex() (leader doesn't have those entries)
-func (r *raft) maybeSendSnapshot(to uint64, pr *tracker.Progress) bool {
-    if pr.State != tracker.StateProbe {
-        return false
-    }
-    snapshot := r.RaftLog.snapshot  // load from storage
-    // Send InstallSnapshot RPC to follower
-    r.send(pb.Message{
-        To:       to,
-        Type:     pb.MsgSnap,
-        Snapshot: snapshot,
-    })
+// If a follower asks for an index older than the retained log:
+if nextIndex[follower] < firstRetainedIndex {
+    sendSnapshot(follower, backendCheckpoint, raftSnapshot.Metadata)
 }
 ```
+
+The `--snapshot-count` setting controls approximately how many applied
+transactions trigger internal snapshot/compaction work.
+`--snapshot-catchup-entries` controls the retained log window used to help
+slow followers catch up without transferring the full backend.
+
+### Internal snapshot versus backup
+
+These operations have different purposes:
+
+```
+Internal Raft snapshot/compaction:
+  - automatic member housekeeping
+  - bounds retained Raft history
+  - supports member restart and lagging-follower recovery
+  - not intended as an operator's portable backup
+
+etcdctl snapshot save backup.db:
+  - downloads a point-in-time copy of the backend database
+  - intended for disaster recovery
+  - does NOT force the server's internal Raft snapshot threshold
+  - does NOT directly trigger Raft log compaction
+```
+
+References:
+
+- [etcd persistent storage files](https://etcd.io/docs/v3.7/learning/persistent-storage-files/)
+- [etcd database snapshot procedure](https://etcd.io/docs/v3.7/tasks/operator/how-to-save-database/)
+- [etcd server configuration fields](https://pkg.go.dev/go.etcd.io/etcd/server/v3/embed#Config)
 
 ---
 
@@ -178,12 +371,20 @@ Simpler alternative (etcd v3.4+): single-server membership changes
     --initial-cluster "node1=http://127.0.0.1:2380,...,node4=http://127.0.0.1:2386" \
     --initial-cluster-state existing
 
-# Observe: node4 receives snapshot from leader (check logs for "sent snapshot")
+# If node4 is behind the leader's retained log, observe an internal
+# snapshot transfer in the server logs. Otherwise it catches up by log replay.
 
-# Force a snapshot on the leader
-./etcdctl --endpoints=127.0.0.1:2379 snapshot save /tmp/etcd-snapshot.db
-# Check snapshot size
-ls -lh /tmp/etcd-snapshot.db
+# Create an operator backup. This does NOT force internal Raft compaction.
+./etcdctl --endpoints=127.0.0.1:2379 snapshot save /tmp/etcd-backup.db
+
+# Validate and inspect the backup
+./etcdutl --write-out=table snapshot status /tmp/etcd-backup.db
+ls -lh /tmp/etcd-backup.db
+
+# To observe internal snapshotting in a disposable lab, start members with
+# small thresholds, generate enough writes, and inspect the server logs:
+#   --snapshot-count=1000
+#   --snapshot-catchup-entries=100
 
 # Remove a member
 ./etcdctl --endpoints=127.0.0.1:2379 member remove <member-id>
@@ -196,16 +397,20 @@ ls -lh /tmp/etcd-snapshot.db
 1. Why can't the leader just replay all log entries to a lagging follower instead of sending a snapshot?
 2. What is the danger of switching directly from old to new cluster configuration without joint consensus?
 3. etcd keeps `SnapshotCatchUpEntries` log entries after a snapshot. Why?
-4. A follower receives an InstallSnapshot RPC. Its local log has entries that conflict with the snapshot. What should it do?
+4. A follower receives an InstallSnapshot RPC. When may it retain the log suffix after the snapshot index, and when must it discard the local log?
 5. During joint consensus, how many votes are needed to elect a leader for a 3→5 node cluster change?
+6. Why must a member persist a snapshot before deleting the log entries it covers?
+7. What is the difference between an internal etcd Raft snapshot and `etcdctl snapshot save`?
 
 ## 7. Answers
 
 1. The leader may have already compacted (deleted) the old log entries. If a follower is 5 million entries behind and the leader only keeps 100K entries, there's no log to send. The snapshot is the only way to bring the follower to a consistent state.
 2. Without joint consensus: some servers switch to the new config while others haven't yet. The old and new configs can form independent majorities simultaneously (split brain). Two leaders emerge — both accept writes, logs diverge, data corruption results.
 3. Fast-moving followers don't need a full snapshot transfer if they're only slightly behind. Keeping some entries after the snapshot lets the leader send individual AppendEntries to followers that are close behind, avoiding expensive snapshot transfers for followers that just had a brief hiccup.
-4. Discard the entire local log. The snapshot represents a complete, committed state. Any local entries that conflict with the snapshot are by definition uncommitted (since the snapshot reached consensus) and must be discarded. The follower resets to the snapshot state and waits for subsequent AppendEntries.
+4. If the follower has an entry at `lastIncludedIndex` with the same `lastIncludedTerm`, Log Matching proves the prefix agrees, so it may discard that prefix and retain the suffix. If the boundary entry is missing or has a different term, the follower cannot prove continuity and must discard its local log, install the snapshot, and receive later entries again.
 5. Joint config requires majority of both: old {A,B,C} = 2, new {A,B,C,D,E} = 3. A leader must get votes from at least 2 members of {A,B,C} AND at least 3 members of {A,B,C,D,E}. In practice: getting 3 votes from {A,B,C,D,E} automatically satisfies the old majority if those 3 include at least 2 from {A,B,C} — which is almost always the case.
+6. If the member deletes the log first and crashes before the snapshot is durable, it loses both representations of the committed prefix. Persisting and atomically publishing the snapshot first makes every crash point recoverable; leftover duplicate log entries can be discarded later.
+7. An internal snapshot is automatic protocol housekeeping used to compact Raft history and recover members. `etcdctl snapshot save` downloads a point-in-time backend database for operator-managed disaster recovery; it does not force the internal snapshot threshold or directly compact the Raft log.
 
 ---
 

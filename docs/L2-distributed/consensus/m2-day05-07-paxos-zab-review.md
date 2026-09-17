@@ -90,6 +90,61 @@ This is exactly Raft's steady-state behavior:
   Raft log index: Paxos slot number
 ```
 
+### What `slot_i` Means
+
+`slot_i` means **slot i**, the i-th position in the replicated command log.
+It identifies where a value belongs; it is not part of the value itself. The
+closest Raft equivalent is log index `i`.
+
+```text
+Multi-Paxos slot 1  -> SET x = 10
+Multi-Paxos slot 2  -> SET y = 20
+Multi-Paxos slot 3  -> DELETE z
+
+Raft log[1]         -> SET x = 10
+Raft log[2]         -> SET y = 20
+Raft log[3]         -> DELETE z
+```
+
+Therefore, the fields in `Accept(N, V, slot_i)` mean:
+
+| Field | Meaning |
+|-------|---------|
+| `N` | The proposal or ballot number identifying the leader's round |
+| `V` | The client command or other value being proposed |
+| `slot_i` | The ordered log position in which `V` should be chosen |
+
+Each slot is conceptually an independent Paxos instance. Basic Paxos chooses
+one value for one instance; Multi-Paxos runs that decision repeatedly for
+slots 1, 2, 3, and so on, while reusing a stable leader and ballot across the
+slots.
+
+Multiple proposals can compete for the same slot:
+
+```text
+Accept(7, SET x=1, slot_5)
+Accept(8, SET x=2, slot_5)
+```
+
+These are not two log entries. They are competing ballots for log position 5.
+Paxos guarantees that at most one value can be chosen for `slot_5`. If
+`SET x=1` was already chosen, a later proposer must preserve that value rather
+than replace it with `SET x=2`.
+
+Different slots are separate instances, so they may be accepted or chosen out
+of order:
+
+```text
+slot 5 -> chosen
+slot 6 -> not chosen yet     <- log hole
+slot 7 -> chosen
+```
+
+A replica must wait to apply slot 7 until slot 6 is filled because every state
+machine must execute commands in the same slot order. This is a key difference
+from Raft: Raft's `AppendEntries` prefix check naturally builds a contiguous
+log, whereas a Multi-Paxos implementation must detect and repair holes.
+
 ---
 
 ## 3. Paxos Made Live: Google's Experience
