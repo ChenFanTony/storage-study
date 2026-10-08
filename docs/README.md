@@ -72,7 +72,10 @@ Architecture/                  ← design patterns that span all layers
 ## Reference
 
 Quick-lookup summaries for specific systems and tools.
-[reference/](reference/kernel-storage.md) — Ceph, DAOS, DRBD, NVMe-oF, SPDK, filesystems, tools ecosystem
+[reference/](reference/kernel-storage.md) —
+[Ceph](reference/ceph.md), [CephFS](reference/cephfs.md),
+[Ceph Object Storage](reference/ceph-object-storage.md), DAOS, DRBD, NVMe-oF,
+SPDK, filesystems, and the tools ecosystem
 
 ---
 

@@ -23,12 +23,24 @@ is either complete or does not exist."
 | [memory-hierarchy-reference.md](memory-hierarchy-reference.md) | HBM → DRAM → NVMe → object storage tier stack | Spill/prefetch policy, bandwidth math |
 | [3fs-reference.md](3fs-reference.md) | 3FS (Fire-Flyer FS) — DeepSeek's AI-native distributed filesystem | CRAQ protocol, usrbio RDMA bypass |
 
+## Shared Ceph References
+
+Ceph commonly provides the shared-storage tier beneath the AI-specific
+pipelines described here:
+
+| Reference | Use in AI infrastructure |
+|-----------|--------------------------|
+| [Ceph service map](../reference/ceph.md) | Decide among CephFS, RGW/S3, RBD, and native RADOS |
+| [CephFS](../reference/cephfs.md) | Shared POSIX datasets, distributed checkpoints, and model files |
+| [Ceph Object Storage](../reference/ceph-object-storage.md) | S3 data lakes, immutable shards, artifact bundles, and lifecycle management |
+
 ## Prerequisite Map
 
 ```
 L1: NVMe/block I/O      → memory-hierarchy, kv-cache (NVMe offload path)
 L1: page cache / VFS    → kv-cache (PagedAttention analogy)
 L2: DAOS / object store → checkpoint (shard writes), training-data (dataset store)
+L2: Ceph RADOS          → CephFS and RGW shared-storage services
 L2: RDMA / CaRT         → kv-disaggregation (RDMA zero-copy KV transfer)
 L2: consensus / 2PC     → checkpoint (distributed consistency)
 ```
