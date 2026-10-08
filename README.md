@@ -45,6 +45,7 @@ python3 -m venv .venv
 
 ## Curated Topic Indexes
 
+- [SPDK](docs/categories/spdk.md)
 - [Devices](docs/categories/devices.md)
 - [Filesystems](docs/categories/filesystems.md)
 
