@@ -43,6 +43,11 @@ python3 -m venv .venv
   - [Cache design](docs/architecture/cache-design/cache-design-patterns.md)
   - [I/O latency and SPDK](docs/architecture/io-latency-cost-model.md)
 
+## Curated Topic Indexes
+
+- [Devices](docs/categories/devices.md)
+- [Filesystems](docs/categories/filesystems.md)
+
 ## Curation Criteria
 - Prefer primary sources (specs, official docs, maintainer posts, upstream repos).
 - Avoid marketing-only links.
@@ -54,7 +59,9 @@ python3 -m venv .venv
 
 ## Update Cadence
 - Publish monthly updates by the 5th of the following month.
-- If there are no significant updates, create the file with a brief note.
+- Publish weekly category updates every Tuesday when relevant.
+- If there are no significant updates, publish a brief note.
 
 ## Latest Updates
-- [2026-03](docs/_meta/updates/2026-03.md)
+- [Monthly: 2026-03](docs/_meta/updates/2026-03.md)
+- [Weekly: 2026-W14](docs/updates/2026-W14.md)
