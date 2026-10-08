@@ -26,6 +26,7 @@ python3 -m venv .venv
   - [Memory](docs/L1-single-node/memory/day01-physical-memory-model.md)
   - [Networking](docs/L1-single-node/network/day01_network_overview.md)
   - [SCSI](docs/L1-single-node/scsi/day01.md)
+  - [SPDK 30-day study](docs/L1-single-node/spdk/study-index.md)
   - [Storage tiering](docs/L1-single-node/storage-tiering/day08-bcache-gc-ssd-wear.md)
 - [L2 — Distributed storage](docs/L2-distributed/consensus/m2-day01-distributed-concepts.md)
   - [Consensus](docs/L2-distributed/consensus/m2-day01-distributed-concepts.md)

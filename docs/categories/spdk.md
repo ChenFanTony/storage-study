@@ -6,6 +6,7 @@ Study-focused navigation for SPDK (Storage Performance Development Kit), includi
 
 | Page | Description |
 |------|-------------|
+| [30-Day SPDK Study Notes](../L1-single-node/spdk/study-index.md) | Day-by-day private study summary, code-reading guides, NVMf labs, and progress tracker |
 | [Learning Path](./spdk/learning-path.md) | Recommended beginner → advanced study sequence |
 | [Overview](./spdk/overview.md) | What SPDK is, where it fits, and core architecture |
 | [Build and Environment](./spdk/build-and-env.md) | Build prerequisites, setup, and runtime basics |

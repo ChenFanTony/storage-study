@@ -29,6 +29,7 @@ Architecture/                  ← design patterns that span all layers
 | [L1-single-node/memory/](L1-single-node/memory/day01-physical-memory-model.md) | Physical memory model, buddy/SLAB/SLUB, vmalloc, mmap, page faults/CoW, page cache, writeback, kswapd, OOM, THP, HugePages, NUMA, DAX | 30 |
 | [L1-single-node/network/](L1-single-node/network/day01_network_overview.md) | Socket layer, NIC/NAPI, IP, TCP rx/tx, netfilter, epoll, zero-copy, multiqueue/RSS/RPS, eBPF/XDP, DPDK/AF_XDP, kTLS, sk_buff, bridges/VXLAN | 30 |
 | [L1-single-node/scsi/](L1-single-node/scsi/day01.md) | SCSI subsystem: command lifecycle, error handling, multipath, transport layers | 30 |
+| [L1-single-node/spdk/](L1-single-node/spdk/study-index.md) | SPDK framework, reactors and pollers, bdev, NVMe-oF target, persistent reservations, namespace visibility, debugging, and performance labs | 30 |
 
 ---
 

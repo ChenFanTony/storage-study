@@ -2,6 +2,10 @@
 
 A study-oriented sequence for learning SPDK from fundamentals to practical integration.
 
+For the complete hands-on curriculum, use the
+[30-day SPDK study notes](../../L1-single-node/spdk/study-index.md). The shorter
+sequence below groups the material by topic for reference use.
+
 ## Sequence
 
 1. [Overview](./overview.md)
