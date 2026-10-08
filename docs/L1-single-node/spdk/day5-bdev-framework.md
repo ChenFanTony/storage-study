@@ -248,3 +248,9 @@ NVMf target
 Day 6: read `lib/bdev/bdev.c` and `lib/thread/thread.c` with architecture in mind.
 Find the 10 most important structs and functions. Write them down with a one-line
 explanation of each.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 4 — I/O channels: per-thread device context without shared locks](day4-io-channel.md) | [SPDK study index](study-index.md) | [Next: Day 6 — Core code reading: thread, bdev, and NVMf structure ownership →](day6-core-code.md)

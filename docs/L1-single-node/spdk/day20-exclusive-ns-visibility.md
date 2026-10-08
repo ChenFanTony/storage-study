@@ -238,3 +238,9 @@ sudo kill $(pgrep nvmf_tgt)
 
 Day 21: Week 3 review. Write the lab-verified nvmet vs SPDK comparison document,
 cross-referencing everything you built in Days 15–20.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 19 — Namespace visibility: mask and grant namespaces per host](day19-ns-visibility.md) | [SPDK study index](study-index.md) | [Next: Day 21 — Week 3 review: consolidate multi-host, PR, and visibility behavior →](day21-week3-review.md)

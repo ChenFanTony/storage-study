@@ -132,3 +132,9 @@ Week 4 is debugging, performance, and contribution readiness. Before starting:
 Week 4, Day 22: read `lib/nvmf/tcp.c`. Understand the transport layer — queue pair
 handling, request receive, buffer lifecycle. This is the entry point for all the
 command flows you traced in Week 2.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 20 — Exclusive visibility: give two hosts separate namespaces](day20-exclusive-ns-visibility.md) | [SPDK study index](study-index.md) | [Next: Day 22 — TCP transport deep read: QPs, PDUs, buffers, and completion flow →](day22-tcp-transport.md)

@@ -238,3 +238,9 @@ After reading, write down for each area:
 
 Day 12: deep read of `lib/nvmf/subsystem.c`. This is where namespace add/remove,
 host visibility, and PR state updates actually live.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 10 — Host ACLs: default deny, allow-any, and per-host access](day10-host-acls.md) | [SPDK study index](study-index.md) | [Next: Day 12 — subsystem.c deep read: namespaces, visibility, and reservation updates →](day12-subsystem-deep-read.md)

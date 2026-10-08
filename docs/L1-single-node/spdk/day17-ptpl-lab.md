@@ -256,3 +256,9 @@ namespace-add time. The target does not auto-discover PTPL files.
 
 Day 18: write the updated PR conclusion. Cross-reference your lab results from Days
 15–17 against `spdk-pr-conclusion.md` and record any differences or surprises.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 16 — Persistent Reservations lab: register, reserve, conflict, and preempt](day16-pr-lab.md) | [SPDK study index](study-index.md) | [Next: Day 18 — PR verification: reconcile code conclusions with lab evidence →](day18-pr-conclusion-verification.md)

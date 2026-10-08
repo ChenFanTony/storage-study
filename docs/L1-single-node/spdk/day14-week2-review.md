@@ -172,3 +172,9 @@ You need the following to be solid before starting:
 
 Week 3, Day 15: multi-host lab. One subsystem, one namespace, two hosts connected
 simultaneously. Verify both see the same NSID and are in the same PR domain.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 13 — End-to-end I/O trace: follow one request through code and threads](day13-io-trace.md) | [SPDK study index](study-index.md) | [Next: Day 15 — Multi-host shared namespace: establish one reservation domain →](day15-multi-host-shared-ns.md)

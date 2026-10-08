@@ -289,3 +289,9 @@ host ACL — that is what PR is for.
 Day 11: deep read of `lib/nvmf/ctrlr.c`. You have now used the target from the outside.
 Day 11 opens the box and traces exactly what happens inside when a host connects and
 when a command arrives.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 9 — AIO-backed bdev: use a file or block device for persistent storage](day9-aio-bdev.md) | [SPDK study index](study-index.md) | [Next: Day 11 — ctrlr.c deep read: connection, dispatch, lookup, and conflict checks →](day11-ctrlr-deep-read.md)

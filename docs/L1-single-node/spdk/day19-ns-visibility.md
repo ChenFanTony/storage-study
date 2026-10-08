@@ -216,3 +216,9 @@ or is there a delay? What happens to I/O in flight when visibility is revoked?
 
 Day 20: build the two-host exclusive namespace lab. Host A sees only NSID 1,
 Host B sees only NSID 2, both from the same subsystem.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 18 — PR verification: reconcile code conclusions with lab evidence](day18-pr-conclusion-verification.md) | [SPDK study index](study-index.md) | [Next: Day 20 — Exclusive visibility: give two hosts separate namespaces →](day20-exclusive-ns-visibility.md)

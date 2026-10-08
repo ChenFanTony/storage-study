@@ -236,3 +236,9 @@ This shows:
 Day 28: failure path lab. Intentionally break things and observe how SPDK handles
 them: live namespace removal, host disconnect mid-I/O, target restart under load,
 PTPL behavior under failure.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 26 — First contribution: turn a small verified gap into a patch](day26-first-contribution.md) | [SPDK study index](study-index.md) | [Next: Day 28 — Failure paths: remove namespaces, disconnect hosts, and restart targets →](day28-failure-paths.md)

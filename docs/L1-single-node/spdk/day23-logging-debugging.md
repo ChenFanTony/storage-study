@@ -284,3 +284,9 @@ After the debugging session, write down:
 
 Day 24: run the SPDK test suite relevant to NVMf. Read `test/nvmf/target/ns_masking.sh`
 and understand how SPDK's own tests verify the behaviors you exercised manually.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 22 — TCP transport deep read: QPs, PDUs, buffers, and completion flow](day22-tcp-transport.md) | [SPDK study index](study-index.md) | [Next: Day 24 — SPDK tests: study namespace-masking and reservation coverage →](day24-tests.md)

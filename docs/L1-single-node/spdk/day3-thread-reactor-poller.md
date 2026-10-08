@@ -228,3 +228,9 @@ or one poller call.
 
 Day 4: `io_channel`. This is the per-thread resource model that sits between SPDK threads
 and bdev backends. It is how each thread gets its own private I/O context without locking.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 2 — Application framework: startup, subsystem initialization, and RPC readiness](day2-app-framework.md) | [SPDK study index](study-index.md) | [Next: Day 4 — I/O channels: per-thread device context without shared locks →](day4-io-channel.md)

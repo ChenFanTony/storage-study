@@ -209,3 +209,9 @@ sudo kill $(pgrep nvmf_tgt)
 
 Day 10: host ACLs. Right now the subsystem uses `-a` (allow_any_host). Day 10 tests
 what happens without it and how per-host allow lists work.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 8 — Basic TCP target: export a malloc bdev to a Linux initiator](day8-basic-tcp-target.md) | [SPDK study index](study-index.md) | [Next: Day 10 — Host ACLs: default deny, allow-any, and per-host access →](day10-host-acls.md)

@@ -222,3 +222,9 @@ After reading:
 
 Day 26: make a real code contribution. Use the gap identified today to write a new
 test case, fix a documentation mismatch, or add a validation check.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 24 — SPDK tests: study namespace-masking and reservation coverage](day24-tests.md) | [SPDK study index](study-index.md) | [Next: Day 26 — First contribution: turn a small verified gap into a patch →](day26-first-contribution.md)

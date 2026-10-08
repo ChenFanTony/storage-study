@@ -256,3 +256,9 @@ After the trace exercise, write down:
 Day 14: review week. Write your own comparison of SPDK `ctrlr.c` dispatch vs Linux
 `nvmet` dispatch. Explain in plain language why message passing is used at the subsystem
 boundary instead of a mutex.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 12 — subsystem.c deep read: namespaces, visibility, and reservation updates](day12-subsystem-deep-read.md) | [SPDK study index](study-index.md) | [Next: Day 14 — Week 2 review: connect target mechanics, dispatch, and message passing →](day14-week2-review.md)

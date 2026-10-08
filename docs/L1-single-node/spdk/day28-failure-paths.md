@@ -253,3 +253,9 @@ you improve in Day 26 type contributions.
 
 Day 29: build a reusable lab guide that documents everything you have learned in
 reproducible script form. This is your personal reference for future SPDK work.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 27 — Performance baseline: measure bdev and end-to-end NVMf behavior](day27-performance-baseline.md) | [SPDK study index](study-index.md) | [Next: Day 29 — Reusable lab guide: package repeatable topology scripts →](day29-lab-guide.md)

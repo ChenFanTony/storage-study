@@ -232,3 +232,9 @@ After reading, record:
 
 Day 23: logging and debugging. Now that you know the code, learn to make it talk —
 enable debug logs, attach gdb, and trace a live request through the functions you read.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 21 — Week 3 review: consolidate multi-host, PR, and visibility behavior](day21-week3-review.md) | [SPDK study index](study-index.md) | [Next: Day 23 — Logging and debugging: use log flags and gdb on live requests →](day23-logging-debugging.md)

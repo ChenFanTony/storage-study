@@ -184,3 +184,9 @@ private resources. SPDK does it at the `spdk_thread` level instead of the CPU le
 
 Day 5: the bdev framework. Now that you understand threads and channels, the bdev open /
 descriptor / claim / I/O submit model will all fit together cleanly.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 3 — Thread/reactor/poller: scheduling, ownership, and message passing](day3-thread-reactor-poller.md) | [SPDK study index](study-index.md) | [Next: Day 5 — bdev framework: descriptors, claims, and asynchronous I/O →](day5-bdev-framework.md)

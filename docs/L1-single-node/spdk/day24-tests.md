@@ -229,3 +229,9 @@ After reading and running tests:
 Day 25: deep read of one unit test file. Pick `test/unit/lib/nvmf/subsystem.c` and
 understand how SPDK developers encode correctness — mock setup, test structure, and
 assertion patterns.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 23 — Logging and debugging: use log flags and gdb on live requests](day23-logging-debugging.md) | [SPDK study index](study-index.md) | [Next: Day 25 — Unit-test deep read: CUnit, mocks, stubs, and assertions →](day25-unit-test-deep-read.md)

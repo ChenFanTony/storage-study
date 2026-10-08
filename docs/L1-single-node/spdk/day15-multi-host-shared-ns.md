@@ -187,3 +187,9 @@ sudo kill $(pgrep nvmf_tgt)
 
 Day 16: PR lab. Keep both hosts connected from today's setup. Register from Host A,
 reserve, then observe conflict behavior from Host B.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 14 — Week 2 review: connect target mechanics, dispatch, and message passing](day14-week2-review.md) | [SPDK study index](study-index.md) | [Next: Day 16 — Persistent Reservations lab: register, reserve, conflict, and preempt →](day16-pr-lab.md)

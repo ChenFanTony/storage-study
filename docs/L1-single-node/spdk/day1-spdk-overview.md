@@ -239,3 +239,9 @@ via messages rather than locks.
 Day 2: application framework. Learn how `spdk_app_start` initializes subsystems in
 order, how the RPC socket becomes available, and what the startup sequence of
 `nvmf_tgt` looks like from process launch to RPC-ready state.
+
+---
+
+## Next
+
+[SPDK study index](study-index.md) | [Next: Day 2 — Application framework: startup, subsystem initialization, and RPC readiness →](day2-app-framework.md)

@@ -270,3 +270,9 @@ After reading, write down:
 
 Day 13: trace one I/O request end to end using both your notes and a running target.
 Combine the call chains from Day 11 and Day 12 into one unified flow diagram.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 11 — ctrlr.c deep read: connection, dispatch, lookup, and conflict checks](day11-ctrlr-deep-read.md) | [SPDK study index](study-index.md) | [Next: Day 13 — End-to-end I/O trace: follow one request through code and threads →](day13-io-trace.md)

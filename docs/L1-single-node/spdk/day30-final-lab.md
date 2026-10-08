@@ -232,3 +232,9 @@ You have completed the 30-day plan. Suggested directions from here:
 - build a real multi-host storage configuration for your team
 - benchmark SPDK NVMe passthrough vs AIO at your workloads
 - profile the target under load and find the bottleneck
+
+---
+
+## Previous / Index
+
+[← Previous: Day 29 — Reusable lab guide: package repeatable topology scripts](day29-lab-guide.md) | [SPDK study index](study-index.md)

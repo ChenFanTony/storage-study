@@ -258,3 +258,9 @@ You have completed the 7-day architecture mini plan. Move to the revised 30-day 
 Next: Week 2 of the 30-day plan — NVMf target mechanics. Start by running a TCP target,
 exporting a real bdev, and connecting a Linux initiator. The architecture is in your head.
 Now make it work in the lab.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 6 — Core code reading: thread, bdev, and NVMf structure ownership](day6-core-code.md) | [SPDK study index](study-index.md) | [Next: Day 7 deep dive — Function-level I/O and reservation call chains →](day7-nvmf-on-spdk-deep.md)

@@ -196,3 +196,9 @@ Fill in 9 more from what you found.
 Day 7: connect the framework to NVMf. Read `lib/nvmf/ctrlr.c` and `lib/nvmf/subsystem.c`
 lightly. The goal is to answer: how does an NVMf request move from transport receive to
 bdev submit and back?
+
+---
+
+## Previous / Next
+
+[← Previous: Day 5 — bdev framework: descriptors, claims, and asynchronous I/O](day5-bdev-framework.md) | [SPDK study index](study-index.md) | [Next: Day 7 — NVMf integration: request flow across reactors, pollers, and bdev →](day7-nvmf-on-spdk.md)

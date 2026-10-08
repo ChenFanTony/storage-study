@@ -337,3 +337,9 @@ sudo gdb -p $(pgrep nvmf_tgt)
 
 Day 30: final lab. From scratch, no notes, reproduce all topologies and explain PR
 behavior clearly. This is the test of whether the 30 days worked.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 28 — Failure paths: remove namespaces, disconnect hosts, and restart targets](day28-failure-paths.md) | [SPDK study index](study-index.md) | [Next: Day 30 — Final lab: reproduce the full curriculum from memory →](day30-final-lab.md)

@@ -210,3 +210,9 @@ fio --filename=/dev/nvme0n1 --rw=write --bs=4k --numjobs=1 \
 
 Day 19: namespace visibility masking. Create namespaces with `--no-auto-visible` and
 use `nvmf_ns_add_host` / `nvmf_ns_remove_host` to control which host sees which NSID.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 17 — PTPL lab: preserve reservation state across target restarts](day17-ptpl-lab.md) | [SPDK study index](study-index.md) | [Next: Day 19 — Namespace visibility: mask and grant namespaces per host →](day19-ns-visibility.md)

@@ -163,3 +163,9 @@ Why this matters for NVMf:
 
 Day 3: the reactor, SPDK thread, and poller model. This is what the app thread actually
 is, and how all work in SPDK gets scheduled.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 1 — SPDK overview: userspace polling, bdev, and the storage stack](day1-spdk-overview.md) | [SPDK study index](study-index.md) | [Next: Day 3 — Thread/reactor/poller: scheduling, ownership, and message passing →](day3-thread-reactor-poller.md)

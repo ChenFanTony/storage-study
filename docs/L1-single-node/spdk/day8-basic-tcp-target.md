@@ -264,3 +264,9 @@ After completing the lab, write down:
 
 Day 9: replace Malloc0 with a real block device using the AIO bdev. Same RPC flow,
 real storage behind it.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 7 deep dive — Function-level I/O and reservation call chains](day7-nvmf-on-spdk-deep.md) | [SPDK study index](study-index.md) | [Next: Day 9 — AIO-backed bdev: use a file or block device for persistent storage →](day9-aio-bdev.md)

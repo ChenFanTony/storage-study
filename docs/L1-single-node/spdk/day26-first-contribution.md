@@ -204,3 +204,9 @@ After completing the contribution:
 Day 27: performance baseline. Measure IOPS and latency for your AIO-backed namespace
 using `bdevperf` and a Linux nvme initiator. Establish numbers you can compare against
 after making changes.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 25 — Unit-test deep read: CUnit, mocks, stubs, and assertions](day25-unit-test-deep-read.md) | [SPDK study index](study-index.md) | [Next: Day 27 — Performance baseline: measure bdev and end-to-end NVMf behavior →](day27-performance-baseline.md)

@@ -431,3 +431,9 @@ This is why namespace removal is asynchronous and goes through the subsystem sta
 5. Namespace add calls `spdk_bdev_module_claim_bdev` — this is the exclusivity gate.
 6. PTPL is loaded once at `spdk_nvmf_subsystem_add_ns_ext` time, not synced at runtime.
 7. Namespace remove requires draining all QP channels via cross-thread messages before the bdev claim is released.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 7 — NVMf integration: request flow across reactors, pollers, and bdev](day7-nvmf-on-spdk.md) | [SPDK study index](study-index.md) | [Next: Day 8 — Basic TCP target: export a malloc bdev to a Linux initiator →](day8-basic-tcp-target.md)

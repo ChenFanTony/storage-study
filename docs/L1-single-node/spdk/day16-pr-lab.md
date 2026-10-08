@@ -242,3 +242,9 @@ This connects the lab evidence to the implementation.
 Day 17: PTPL lab. Keep the setup from today but add a PTPL file to the namespace.
 Exercise: acquire a reservation, restart the target, re-add the namespace with the
 same PTPL file, verify the reservation survives.
+
+---
+
+## Previous / Next
+
+[← Previous: Day 15 — Multi-host shared namespace: establish one reservation domain](day15-multi-host-shared-ns.md) | [SPDK study index](study-index.md) | [Next: Day 17 — PTPL lab: preserve reservation state across target restarts →](day17-ptpl-lab.md)
