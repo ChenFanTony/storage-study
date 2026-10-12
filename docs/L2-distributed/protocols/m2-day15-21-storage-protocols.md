@@ -384,6 +384,8 @@ FC replacement trajectory:
 - Understand object versioning, lifecycle, and metadata architecture
 - Read MinIO source for key operations
 
+Detailed follow-on: [Object Storage — Ten-Day Learning Path](../object-storage/README.md).
+
 ---
 
 ## 1. S3 Consistency Model (Post-2020)
@@ -401,10 +403,11 @@ After December 2020: S3 provides strong consistency for all operations
 Implementation: S3 uses a metadata index with linearizable reads
   (AWS hasn't published implementation details publicly)
 
-Key remaining caveat: S3 is NOT serializable for conditional operations
-  PutIfAbsent: no native CAS (compare-and-swap) — not supported
-  AWSs workaround: DynamoDB for conditional storage metadata
-  Alternative: use S3 object versioning + ETag for optimistic concurrency
+Key boundary: strong consistency does not provide multi-key transactions
+  Single-key create-if-absent: PUT with If-None-Match: *
+  Single-key compare-and-replace: PUT with If-Match: <current ETag>
+  Failed precondition: 412; a concurrent DELETE can also produce 409
+  Multi-key invariants still need an application protocol or transactional store
 ```
 
 ---
@@ -412,13 +415,13 @@ Key remaining caveat: S3 is NOT serializable for conditional operations
 ## 2. Multipart Upload
 
 ```
-Required for objects > 5GB (S3 limit for single PUT)
+Required for objects > 5 GiB (S3 limit for single PUT)
 Recommended for objects > 100MB (better performance, resume on failure)
 
 Protocol:
   1. CreateMultipartUpload → returns UploadId
   2. UploadPart(UploadId, PartNumber, data) for each part
-     Parts: 1..10000, each 5MB–5GB
+     Parts: 1..10000, normally 5 MiB–5 GiB; the last may be smaller
   3. CompleteMultipartUpload(UploadId, {partNumber: ETag} list)
      → Object is atomically committed
   4. OR AbortMultipartUpload → delete all parts
@@ -426,7 +429,7 @@ Protocol:
 Benefits:
   - Parallel uploads (upload multiple parts simultaneously)
   - Resume on failure (restart only failed parts)
-  - Large object support (up to 5TB total)
+  - Large object support (up to 5 TiB total)
 
 Cost trap: incomplete multipart uploads consume storage
   Set lifecycle rule to abort incomplete MPUs after N days
@@ -453,14 +456,14 @@ func (er erasureObjects) PutObject(ctx context.Context, bucket, object string,
         go writeDataShard(disk, uploadID, data)
     }
 
-    // 3. Wait for k+m shards to succeed (quorum)
-    // MinIO uses RS(k, m) where k+m = erasure set size (default 8+8=16)
+    // 3. Apply the configured data/parity layout in the selected erasure set
+    // 4. Require the implementation's write quorum; geometry varies by deployment
 
-    // 4. Write metadata (xl.meta) to all drives
+    // 5. Write metadata (xl.meta) to the participating drives
     // xl.meta contains: ETag, size, erasure info, checksums
     writeMetadata(uploadID, objectInfo)
 
-    // 5. Atomic rename: uploadID → object name
+    // 6. Publish the temporary upload as the destination object
     renameData(uploadID, bucket+"/"+object)
 }
 ```
@@ -469,14 +472,14 @@ func (er erasureObjects) PutObject(ctx context.Context, bucket, object string,
 
 ## 4. Self-Check
 
-1. S3 provides strong consistency since 2020. Does this mean S3 supports atomic compare-and-swap (put-if-absent)?
+1. Does S3 strong consistency provide single-key conditional creation or a general multi-key transaction?
 2. What is the minimum part size for S3 multipart upload, and why does the last part have a different minimum?
 3. A MinIO erasure set has 16 drives (k=8, m=8). How many drives can fail before data is lost?
 
 ## 5. Answers
 
-1. No. S3 strong consistency means read-after-write and list-after-write are consistent. It does not provide CAS — there's no API to say "PUT this object only if it doesn't exist." Workarounds: use S3 object versioning with conditional headers (If-None-Match), or use DynamoDB for coordination metadata with S3 for data.
-2. Minimum part size: 5MB (except last part, which can be any size ≥ 1 byte). The last part is special because you can't know the final part size in advance. The 5MB minimum for non-last parts prevents extremely fragmented MPUs that would degrade performance and inflate metadata.
+1. It supports per-key conditional writes: `If-None-Match: *` implements create-if-absent, while `If-Match` compares the current ETag. These do not provide a transaction spanning several keys; use an application commit protocol or transactional coordination service for that scope.
+2. Minimum part size: 5 MiB (except the last part, which may be smaller). The last part is special because the final object length may not divide evenly. The minimum for non-last parts prevents extremely fragmented uploads and inflated metadata.
 3. m=8 drive failures can be tolerated. The RS(8,8) code can reconstruct all k=8 data shards from any 8 of the 16 total shards. Losing 9 or more drives in the same erasure set would result in data loss.
 
 ---

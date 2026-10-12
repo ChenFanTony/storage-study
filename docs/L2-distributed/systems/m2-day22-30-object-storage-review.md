@@ -1,5 +1,10 @@
 # Month 2 Days 22–30: Object Storage Architecture & Final Review
 
+This bundled review is complemented by the
+[ten-day object-storage learning path](../object-storage/README.md), which
+covers S3 semantics, metadata, security, operations, disaster recovery, and AI
+workload patterns in separate navigable pages.
+
 <!-- study-nav -->
 [← Previous: Days 15–21](../protocols/m2-day15-21-storage-protocols.md)
 ---

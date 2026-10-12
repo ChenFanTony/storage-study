@@ -5,7 +5,8 @@ durable state in RADOS. It is a strong fit for immutable training shards, model
 artifacts, and checkpoint bundles that do not require a mounted POSIX
 namespace.
 
-Related: [Ceph reference index](ceph.md), [CephFS](cephfs.md), and
+Related: [object-storage learning path](../L2-distributed/object-storage/README.md),
+[Ceph reference index](ceph.md), [CephFS](cephfs.md), and
 [AI training data pipelines](../L3-ai-storage/training-data-reference.md).
 
 ---

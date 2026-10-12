@@ -33,6 +33,7 @@ python3 -m venv .venv
   - [Data placement and erasure coding](docs/L2-distributed/data-placement/m2-day08-14-erasure-placement.md)
   - [Merkle trees and replica repair](docs/L2-distributed/data-placement/merkle-trees.md)
   - [Storage protocols and NVMe-oF](docs/L2-distributed/protocols/m2-day15-21-storage-protocols.md)
+  - [Object storage 10-day study](docs/L2-distributed/object-storage/README.md)
   - [Ceph and object storage](docs/L2-distributed/systems/m2-day22-30-object-storage-review.md)
     - [Ceph service reference](docs/reference/ceph.md)
     - [CephFS for AI storage](docs/reference/cephfs.md)

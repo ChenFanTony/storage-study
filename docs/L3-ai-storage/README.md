@@ -4,6 +4,10 @@ This track covers storage architecture for AI/ML infrastructure. It sits above L
 but draws on all of them: local NVMe (L1), distributed object storage (L2), and adds the
 AI-specific data access patterns that neither covers.
 
+Use the [object-storage learning path](../L2-distributed/object-storage/README.md)
+for the S3 semantics, durability, security, and operational foundation assumed
+by the AI dataset and checkpoint material.
+
 ## Why AI Storage Is a Separate Domain
 
 Traditional storage is measured by IOPS, throughput, and latency to a block or file.
