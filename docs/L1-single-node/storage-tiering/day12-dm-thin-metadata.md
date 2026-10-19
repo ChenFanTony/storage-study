@@ -1,5 +1,10 @@
 # Day 12: dm-thin — Thin Provisioning & Metadata
 
+For the complete treatment of Device Mapper and thin snapshots, use the
+[Device Mapper ten-day learning path](../device-mapper/README.md). It separates
+classic dm-snapshot from dm-thin, adds LVM snapshot labs, and covers pool
+exhaustion, monitoring, and metadata recovery in dedicated lessons.
+
 <!-- study-nav -->
 [← Previous: Day 11](day11-dm-cache-architecture.md) | [Next: Day 13 — Tiering Failure Semantics: Full Analysis →](day13-tiering-failure-semantics.md)
 

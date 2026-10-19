@@ -24,6 +24,7 @@ Architecture/                  ← design patterns that span all layers
 | Directory | Content | Days |
 |-----------|---------|------|
 | [L1-single-node/kernel-io/](L1-single-node/kernel-io/day01-storage-stack-gap-fill.md) | blk-mq, io_uring, I/O schedulers, NVMe driver, NVMe-oF host, ZNS, pmem/DAX, cgroup I/O, performance tuning | 30 |
+| [L1-single-node/device-mapper/](L1-single-node/device-mapper/README.md) | Device Mapper core and tables, classic versus thin snapshots, dm-thin CoW, LVM labs, ENOSPC, monitoring, metadata repair, and failure testing | 10 |
 | [L1-single-node/storage-tiering/](L1-single-node/storage-tiering/day08-bcache-gc-ssd-wear.md) | bcache (GC, failure semantics, limits), dm-cache (SMQ), dm-thin (metadata, snapshots), dm-crypt, md/RAID | 9 |
 | [L1-single-node/filesystems/](L1-single-node/filesystems/day17-xfs-internals-part1.md) | XFS (AG model, delayed alloc, reflink), ext4/JBD2 (crash recovery), Btrfs (CoW B-tree, send/receive) | 5 |
 | [L1-single-node/memory/](L1-single-node/memory/day01-physical-memory-model.md) | Physical memory model, buddy/SLAB/SLUB, vmalloc, mmap, page faults/CoW, page cache, writeback, kswapd, OOM, THP, HugePages, NUMA, DAX | 30 |

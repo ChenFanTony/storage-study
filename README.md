@@ -22,6 +22,7 @@ python3 -m venv .venv
 
 - [L1 — Single-node internals](docs/L1-single-node/kernel-io/day01-storage-stack-gap-fill.md)
   - [Kernel I/O](docs/L1-single-node/kernel-io/day01-storage-stack-gap-fill.md)
+  - [Device Mapper 10-day study](docs/L1-single-node/device-mapper/README.md)
   - [Filesystems](docs/L1-single-node/filesystems/filesystem-comparison-ext4-xfs-btrfs.md)
   - [Memory](docs/L1-single-node/memory/day01-physical-memory-model.md)
   - [Networking](docs/L1-single-node/network/day01_network_overview.md)
