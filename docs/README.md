@@ -3,6 +3,16 @@
 Structured curriculum from kernel I/O internals to cluster fleet operations.
 Each layer builds on the previous. Study in order for the first pass; use as reference after.
 
+## Search the knowledge base
+
+Use **Search** in the header (the magnifying glass on mobile), or press **S**
+to search page titles, headings, and content. Select a result to jump to the
+matching section with the search terms highlighted.
+
+Try [SPDK](?q=SPDK), [device mapper](?q=device%20mapper),
+or [Ceph](?q=Ceph). Use the share icon in the search box to copy a link
+to your search results.
+
 ---
 
 ## Layer Map

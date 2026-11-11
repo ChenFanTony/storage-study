@@ -14,6 +14,7 @@ theme:
     - navigation.sections
     - navigation.top
     - search.highlight
+    - search.share
     - search.suggest
   palette:
     - media: "(prefers-color-scheme: light)"

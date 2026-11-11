@@ -12,6 +12,21 @@ python3 -m venv .venv
 .venv/bin/mkdocs serve
 ```
 
+## Search and GitHub Pages publishing
+
+The MkDocs site includes full-text search in the header, with suggestions,
+highlighted matches, and shareable search links. Press **S** to open search;
+on mobile, tap the magnifying glass.
+
+To publish the searchable site, open the repository's
+[Pages settings](https://github.com/ChenFanTony/storage-study/settings/pages)
+and set **Build and deployment → Source** to **GitHub Actions**. Publishing
+directly from a branch uses Jekyll and does not load the MkDocs search.
+
+The [Documentation workflow](https://github.com/ChenFanTony/storage-study/actions/workflows/docs.yml)
+builds and deploys changes pushed to `main`. After switching the Pages source,
+run that workflow on `main` to publish the site for the first time.
+
 ## Scope
 - Linux kernel storage stack (block layer, device mapper, filesystem internals, io_uring)
 - Distributed storage (Ceph, DRBD, DAOS)

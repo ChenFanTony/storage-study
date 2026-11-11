@@ -47,7 +47,7 @@ failure labs should never be tried first on production data.
 
 ## Related material
 
-- [S3 API and consistency overview](../protocols/m2-day15-21-storage-protocols.md#day-20-object-storage--s3-api--consistency-model)
+- [S3 API and consistency overview](../protocols/m2-day15-21-storage-protocols.md#day-20-object-storage-s3-api-consistency-model)
 - [Ceph RADOS, BlueStore, MinIO, and SeaweedFS review](../systems/m2-day22-30-object-storage-review.md)
 - [Ceph Object Gateway reference](../../reference/ceph-object-storage.md)
 - [Erasure coding and placement](../data-placement/m2-day08-14-erasure-placement.md)
