@@ -4,6 +4,10 @@ This track covers storage architecture for AI/ML infrastructure. It sits above L
 but draws on all of them: local NVMe (L1), distributed object storage (L2), and adds the
 AI-specific data access patterns that neither covers.
 
+Start with the [L2 distributed-storage map](../L2-distributed/README.md) if
+Ceph, DAOS, and object-storage terms are unfamiliar. The other L3 branch is
+[cluster scheduling and fleet operations](../L3-cluster-scheduling/README.md).
+
 Use the [object-storage learning path](../L2-distributed/object-storage/README.md)
 for the S3 semantics, durability, security, and operational foundation assumed
 by the AI dataset and checkpoint material.

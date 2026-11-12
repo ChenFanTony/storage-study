@@ -35,7 +35,7 @@ run that workflow on `main` to publish the site for the first time.
 
 ## Learning Layers
 
-- [L1 — Single-node internals](docs/L1-single-node/kernel-io/day01-storage-stack-gap-fill.md)
+- [L1 — Single-node internals](docs/L1-single-node/README.md)
   - [Kernel I/O](docs/L1-single-node/kernel-io/day01-storage-stack-gap-fill.md)
   - [Device Mapper 10-day study](docs/L1-single-node/device-mapper/README.md)
   - [Filesystems](docs/L1-single-node/filesystems/filesystem-comparison-ext4-xfs-btrfs.md)
@@ -44,7 +44,7 @@ run that workflow on `main` to publish the site for the first time.
   - [SCSI](docs/L1-single-node/scsi/day01.md)
   - [SPDK 30-day study](docs/L1-single-node/spdk/study-index.md)
   - [Storage tiering](docs/L1-single-node/storage-tiering/day08-bcache-gc-ssd-wear.md)
-- [L2 — Distributed storage](docs/L2-distributed/consensus/m2-day01-distributed-concepts.md)
+- [L2 — Distributed storage](docs/L2-distributed/README.md)
   - [Consensus](docs/L2-distributed/consensus/m2-day01-distributed-concepts.md)
   - [Data placement and erasure coding](docs/L2-distributed/data-placement/m2-day08-14-erasure-placement.md)
   - [Merkle trees and replica repair](docs/L2-distributed/data-placement/merkle-trees.md)
@@ -55,6 +55,7 @@ run that workflow on `main` to publish the site for the first time.
     - [CephFS for AI storage](docs/reference/cephfs.md)
     - [Ceph Object Storage (RGW/S3)](docs/reference/ceph-object-storage.md)
   - [DAOS](docs/L2-distributed/systems/daos-architect-reference.md)
+  - [DRBD](docs/reference/drbd.md)
 - [L3 — AI storage](docs/L3-ai-storage/README.md)
 - [L3 — Cluster scheduling](docs/L3-cluster-scheduling/README.md)
 - [Architecture and design patterns](docs/architecture/all-flash-architecture.md)

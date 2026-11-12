@@ -12,6 +12,7 @@ theme:
     - content.action.edit
     - navigation.indexes
     - navigation.sections
+    - navigation.tabs
     - navigation.top
     - search.highlight
     - search.share
@@ -46,6 +47,53 @@ markdown_extensions:
 
 plugins:
   - search
+
+# Curated entry points keep the sidebar short. Individual lessons remain
+# available through each track index and the site search.
+nav:
+  - Home: README.md
+  - L1 · Single node:
+      - Overview: L1-single-node/README.md
+      - Kernel I/O: L1-single-node/kernel-io/day01-storage-stack-gap-fill.md
+      - Memory: L1-single-node/memory/day01-physical-memory-model.md
+      - Device Mapper: L1-single-node/device-mapper/README.md
+      - Filesystems: L1-single-node/filesystems/filesystem-comparison-ext4-xfs-btrfs.md
+      - SCSI: L1-single-node/scsi/day01.md
+      - Networking: L1-single-node/network/day01_network_overview.md
+      - SPDK: L1-single-node/spdk/study-index.md
+      - Storage tiering: L1-single-node/storage-tiering/day08-bcache-gc-ssd-wear.md
+  - L2 · Distributed:
+      - Overview: L2-distributed/README.md
+      - Consensus: L2-distributed/consensus/m2-day01-distributed-concepts.md
+      - Placement and repair: L2-distributed/data-placement/m2-day08-14-erasure-placement.md
+      - Protocols: L2-distributed/protocols/m2-day15-21-storage-protocols.md
+      - Object storage: L2-distributed/object-storage/README.md
+      - Ceph and other object stores: L2-distributed/systems/m2-day22-30-object-storage-review.md
+      - DRBD: reference/drbd.md
+      - DAOS: L2-distributed/systems/daos-architect-reference.md
+  - L3 · Applications:
+      - AI storage: L3-ai-storage/README.md
+      - Cluster operations: L3-cluster-scheduling/README.md
+  - Reference:
+      - System guides:
+          - Ceph services: reference/ceph.md
+          - CephFS: reference/cephfs.md
+          - Ceph object storage: reference/ceph-object-storage.md
+          - DAOS quick guide: reference/daos.md
+          - SPDK: reference/spdk.md
+          - NVMe-oF: reference/nvme-of.md
+      - Local storage:
+          - Kernel storage: reference/kernel-storage.md
+          - Filesystems: reference/filesystems.md
+          - Tools: reference/tools-ecosystem.md
+      - Design patterns:
+          - All-flash architecture: architecture/all-flash-architecture.md
+          - Cache design: architecture/cache-design/cache-design-patterns.md
+          - I/O latency: architecture/io-latency-cost-model.md
+      - Topic indexes:
+          - Devices: categories/devices.md
+          - Filesystems: categories/filesystems.md
+          - SPDK: categories/spdk.md
 
 exclude_docs: |
   _meta/

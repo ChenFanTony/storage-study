@@ -4,6 +4,10 @@
 **Prerequisite:** L1 (single-node internals) + L2 (distributed algorithms & systems)
 **Goal:** Operate, schedule, and manage a storage cluster at fleet scale — the layer between distributed algorithms and production reality
 
+Use the [L2 distributed-storage map](../L2-distributed/README.md) for the
+systems behind this planned curriculum. The parallel L3 branch covers
+[AI storage workloads](../L3-ai-storage/README.md).
+
 ---
 
 ## What This Track Covers
